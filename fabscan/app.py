@@ -20,7 +20,7 @@ ImagePoint = Tuple[float, float]
 
 
 class FabScanApp(tk.Tk):
-    """FabScan Ver. 0.1.6 desktop app.
+    """FabScan Ver. 0.1.9 desktop app.
 
     This intentionally favors simple and debuggable over pretty. The goal is to
     prove the photo/scan -> contours -> scaled DXF workflow, with manual contour
@@ -32,7 +32,7 @@ class FabScanApp(tk.Tk):
         self.settings = load_settings()
         self._settings_save_job: Optional[str] = None
 
-        self.title("FabScan Ver. 0.1.6 - Contour List Cleanup")
+        self.title("FabScan Ver. 0.1.9 - X/Y Sanity Check")
         try:
             self.geometry(str(self.settings.get("window_geometry", "1280x820")))
         except tk.TclError:
@@ -62,6 +62,9 @@ class FabScanApp(tk.Tk):
         self.simplify_var = tk.DoubleVar(value=float(self.settings.get("simplify_percent", 0.05)))
         self.invert_var = tk.BooleanVar(value=bool(self.settings.get("invert", False)))
         self.show_threshold_var = tk.BooleanVar(value=bool(self.settings.get("show_threshold", False)))
+        self.sanity_expected_width_var = tk.DoubleVar(value=float(self.settings.get("sanity_expected_width_inches", 0.0)))
+        self.sanity_expected_height_var = tk.DoubleVar(value=float(self.settings.get("sanity_expected_height_inches", 0.0)))
+        self.sanity_tolerance_var = tk.DoubleVar(value=float(self.settings.get("sanity_tolerance_inches", 0.010)))
         self.export_origin_var = tk.StringVar(value=origin_label)
         self.export_margin_var = tk.DoubleVar(value=float(self.settings.get("export_margin_inches", 0.0)))
 
@@ -102,9 +105,10 @@ class FabScanApp(tk.Tk):
             command=self.redraw_preview,
         ).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(toolbar, text="Tip: select a contour in the list or click its edge; press T to toggle.").pack(
-            side=tk.LEFT, padx=(18, 0)
-        )
+        ttk.Label(
+            toolbar,
+            text="Tip: set scale from a known CNC/part dimension, then use X/Y sanity check to verify the other axis.",
+        ).pack(side=tk.LEFT, padx=(18, 0))
 
         controls = ttk.LabelFrame(self, text="Image Cleanup", padding=8)
         controls.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
@@ -123,6 +127,7 @@ class FabScanApp(tk.Tk):
         self.canvas.bind("<Configure>", lambda _event: self.redraw_preview())
         self.bind("t", lambda _event: self.toggle_selected_contour())
         self.bind("T", lambda _event: self.toggle_selected_contour())
+        self.bind("<Escape>", lambda _event: self.cancel_modes())
 
         side_container = ttk.Frame(main, padding=(8, 0, 0, 0), width=360)
         side_container.pack(side=tk.RIGHT, fill=tk.Y)
@@ -220,6 +225,38 @@ class FabScanApp(tk.Tk):
         self.measurement_text.pack(fill=tk.X, expand=False, pady=(4, 0))
         self.measurement_text.configure(state=tk.DISABLED)
 
+        sanity_frame = ttk.LabelFrame(side, text="X/Y Sanity Check", padding=6)
+        sanity_frame.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+
+        sanity_grid = ttk.Frame(sanity_frame)
+        sanity_grid.pack(fill=tk.X)
+
+        ttk.Label(sanity_grid, text="Expected W in").grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
+        expected_w_entry = ttk.Entry(sanity_grid, textvariable=self.sanity_expected_width_var, width=10)
+        expected_w_entry.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+
+        ttk.Label(sanity_grid, text="Expected H in").grid(row=0, column=1, sticky=tk.W, padx=4)
+        expected_h_entry = ttk.Entry(sanity_grid, textvariable=self.sanity_expected_height_var, width=10)
+        expected_h_entry.grid(row=1, column=1, sticky="ew", padx=4)
+
+        ttk.Label(sanity_grid, text="Tol +/- in").grid(row=0, column=2, sticky=tk.W, padx=(4, 0))
+        tolerance_entry = ttk.Entry(sanity_grid, textvariable=self.sanity_tolerance_var, width=10)
+        tolerance_entry.grid(row=1, column=2, sticky="ew", padx=(4, 0))
+
+        sanity_grid.columnconfigure(0, weight=1)
+        sanity_grid.columnconfigure(1, weight=1)
+        sanity_grid.columnconfigure(2, weight=1)
+
+        for entry in (expected_w_entry, expected_h_entry, tolerance_entry):
+            entry.bind("<Return>", lambda _event: self.update_measurements())
+            entry.bind("<FocusOut>", lambda _event: self.update_measurements())
+
+        ttk.Label(
+            sanity_frame,
+            text="Compares the enabled contour bounding box against known CNC/part dimensions. It does not change scale.",
+            wraplength=300,
+        ).pack(anchor=tk.W, pady=(6, 0))
+
         export_frame = ttk.LabelFrame(side, text="DXF Export", padding=6)
         export_frame.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
 
@@ -263,7 +300,8 @@ class FabScanApp(tk.Tk):
         )
         self.set_measurements(
             "No contours yet.\n\n"
-            "After Find Contours, select a contour to see its bounding box and scaled size."
+            "After Find Contours, select a contour to see its bounding box and scaled size.\n"
+            "After scale is set, enter expected X/Y dimensions for a sanity check."
         )
         self.refresh_contour_list()
 
@@ -333,6 +371,9 @@ class FabScanApp(tk.Tk):
             self.simplify_var,
             self.invert_var,
             self.show_threshold_var,
+            self.sanity_expected_width_var,
+            self.sanity_expected_height_var,
+            self.sanity_tolerance_var,
             self.export_origin_var,
             self.export_margin_var,
             self.contour_filter_var,
@@ -365,6 +406,9 @@ class FabScanApp(tk.Tk):
             "simplify_percent": self.safe_float_from_var(self.simplify_var, 0.05),
             "invert": bool(self.invert_var.get()),
             "show_threshold": bool(self.show_threshold_var.get()),
+            "sanity_expected_width_inches": self.safe_float_from_var(self.sanity_expected_width_var, 0.0),
+            "sanity_expected_height_inches": self.safe_float_from_var(self.sanity_expected_height_var, 0.0),
+            "sanity_tolerance_inches": self.safe_float_from_var(self.sanity_tolerance_var, 0.010),
             "export_origin_label": str(self.export_origin_var.get()),
             "export_margin_inches": self.safe_float_from_var(self.export_margin_var, 0.0),
             "contour_filter_label": str(self.contour_filter_var.get()),
@@ -446,6 +490,17 @@ class FabScanApp(tk.Tk):
         self.set_status(f"Loaded:\n{self.image_path.name}\n\nImage size: {w} x {h} px")
         self.refresh_contour_list()
         self.update_measurements()
+        self.redraw_preview()
+
+    def cancel_modes(self) -> None:
+        """Cancel scale-picking mode."""
+
+        if not self.scale_mode:
+            return
+
+        self.scale_mode = False
+        self.scale_points = []
+        self.append_status("\nCurrent pick mode cancelled.")
         self.redraw_preview()
 
     def process_image_if_loaded(self) -> None:
@@ -538,6 +593,14 @@ class FabScanApp(tk.Tk):
             return 0.0
         return max(0.0, margin)
 
+    def get_sanity_values(self) -> tuple[float, float, float]:
+        """Return expected width, expected height, and tolerance in inches."""
+
+        expected_width = max(0.0, self.safe_float_from_var(self.sanity_expected_width_var, 0.0))
+        expected_height = max(0.0, self.safe_float_from_var(self.sanity_expected_height_var, 0.0))
+        tolerance = max(0.0, self.safe_float_from_var(self.sanity_tolerance_var, 0.010))
+        return expected_width, expected_height, tolerance
+
     def update_export_options_display(self) -> None:
         self.update_processing_status()
         self.update_measurements()
@@ -548,7 +611,8 @@ class FabScanApp(tk.Tk):
         if self.processed is None or not self.processed.contours:
             self.set_measurements(
                 "No contours yet.\n\n"
-                "After Find Contours, select a contour to see its bounding box and scaled size."
+                "After Find Contours, select a contour to see its bounding box and scaled size.\n"
+                "After scale is set, enter expected X/Y dimensions for a sanity check."
             )
             return
 
@@ -586,6 +650,38 @@ class FabScanApp(tk.Tk):
             _min_x, _min_y, _max_x, _max_y, width_px, height_px = enabled_bbox
             lines.append(f"Size: {self.format_px(width_px)} x {self.format_px(height_px)}")
             lines.append(f"Size: {self.format_inches(width_px)} x {self.format_inches(height_px)}")
+
+        lines.append("")
+        lines.append("X/Y sanity check:")
+        if enabled_bbox is None:
+            lines.append("No enabled contours")
+        elif self.scale_result is None:
+            lines.append("Set scale first")
+        else:
+            _min_x, _min_y, _max_x, _max_y, width_px, height_px = enabled_bbox
+            measured_width = width_px * self.scale_result.inches_per_pixel
+            measured_height = height_px * self.scale_result.inches_per_pixel
+            expected_width, expected_height, tolerance = self.get_sanity_values()
+            lines.append(f"Measured: {measured_width:.4f} x {measured_height:.4f} in")
+            if expected_width <= 0 and expected_height <= 0:
+                lines.append("Enter expected W/H to compare")
+            else:
+                if expected_width > 0:
+                    error_x = measured_width - expected_width
+                    status_x = "OK" if abs(error_x) <= tolerance else "CHECK"
+                    lines.append(f"X expected: {expected_width:.4f} in")
+                    lines.append(f"X error: {error_x:+.4f} in [{status_x}]")
+                else:
+                    lines.append("X expected: not set")
+
+                if expected_height > 0:
+                    error_y = measured_height - expected_height
+                    status_y = "OK" if abs(error_y) <= tolerance else "CHECK"
+                    lines.append(f"Y expected: {expected_height:.4f} in")
+                    lines.append(f"Y error: {error_y:+.4f} in [{status_y}]")
+                else:
+                    lines.append("Y expected: not set")
+                lines.append(f"Tolerance: ±{tolerance:.4f} in")
 
         lines.append("")
         lines.append("DXF output bbox:")
