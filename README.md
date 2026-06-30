@@ -1,46 +1,79 @@
-# FabScan v0.3.5 - Assisted Trace Tools
+# FabScan v0.4.0 - Controlled X/Y Motion
 
-FabScan v0.3.5 adds basic helper tools for cleaning up manually captured CNC trace geometry.
+FabScan v0.4.0 adds the first controlled motion workflow for LinuxCNC.
 
-## What this version changes
+This is intentionally conservative:
 
-Adds an **Assisted Trace Tools** section to the LinuxCNC / Manual Trace panel:
+- X/Y only
+- one point-to-point move at a time
+- G1 feed move, not rapid-only motion
+- no Z motion
+- no torch/plasma commands
+- no program start
+- no automatic trace following
+- explicit enable checkbox required each session
+- confirmation dialog before each controlled move
+- STOP Move button sends a LinuxCNC abort command
 
-- `Line Endpoints` — reduces the active trace to a straight line from its first point to its last point.
-- `Rect 2 Pts` — turns the first two active trace points into an axis-aligned rectangle using those points as opposite corners.
-- `Circle Fit` — fits a circle through the active trace points and replaces the active trace with sampled circle points.
-- `Arc Last 3` — replaces the last three points in the active trace with a sampled arc through those points.
-- `Curve pts` — controls the detail used for generated circles and arcs.
+## Controlled Motion panel
 
-These tools modify the **active trace only**. Other trace groups are left alone.
+The new panel is named:
 
-## Why this exists
+```text
+Controlled Motion - X/Y Point Move
+```
 
-Manual CNC tracing is useful, but raw point chains are not always the clean geometry you want in CAD/SheetCam.
+It includes:
 
-Examples:
+```text
+Enable controlled moves
+Target X
+Target Y
+Feed/min
+Use Current
+Use Selected Pt
+Move to Target
+STOP Move
+```
 
-- Touch two opposite corners and use `Rect 2 Pts` for a square or rectangular profile.
-- Touch several points around a hole and use `Circle Fit`.
-- Touch the start, midpoint, and end of a radius and use `Arc Last 3`.
-- Touch a few points along an edge and use `Line Endpoints` to force it straight.
+## Basic workflow
 
-FabScan still exports simple DXF polylines. SheetCam can continue to do detail reduction and arc fitting after import.
+1. Start LinuxCNC/QtPlasmaC normally.
+2. Home the machine.
+3. Keep the torch/plasma disabled while testing.
+4. Refresh LinuxCNC in FabScan.
+5. Enable controlled moves.
+6. Set a small feed/min value.
+7. Set a target using either:
+   - `Use Current`, then edit X/Y manually, or
+   - select a captured trace point and click `Use Selected Pt`.
+8. Click `Move to Target`.
+9. Confirm the move.
+10. Use the physical E-stop if anything unexpected happens. `STOP Move` is only a software abort.
+
+## Coordinate behavior
+
+Controlled moves use the current FabScan coordinate source:
+
+- `Work coordinates` sends a normal absolute work-coordinate `G90 G1 X... Y... F...` move.
+- `Machine coordinates` sends a machine-coordinate `G90 G53 G1 X... Y... F...` move.
+
+For normal tracing, `Work coordinates` is usually the preferred mode.
+
+## Safety checks
+
+FabScan refuses controlled moves unless LinuxCNC is:
+
+- connected
+- task state ON
+- interpreter IDLE
+- task mode MANUAL or MDI
+- X/Y/Z homed
+
+FabScan also limits controlled move feed to 120 units/minute.
 
 ## Notes
 
-- `Rect 2 Pts` and `Circle Fit` automatically enable `Closed` trace mode.
-- `Arc Last 3` is intended for radius cleanup inside the active trace. It preserves any points before the last three points.
-- If you are exporting an open arc by itself, uncheck `Closed` before exporting.
-- Jogging remains guarded X/Y incremental only. No continuous jog, no Z jog, no torch commands, no MDI, and no program start.
+This version does not follow an entire contour automatically. It only moves to one X/Y target at a time.
 
-## Suggested test
-
-1. Start LinuxCNC/QtPlasmaC normally.
-2. Open FabScan and verify LinuxCNC is connected in `MANUAL` mode.
-3. Capture two opposite corners of a rectangle.
-4. Click `Rect 2 Pts`.
-5. Use `Start New`.
-6. Capture 3 or more points around a circle/hole.
-7. Click `Circle Fit`.
-8. Export Manual Trace DXF and import into SheetCam/CAD.
+The next likely step is an assisted point-to-point workflow, such as `Move to Next Trace Point`, after this version is proven stable.

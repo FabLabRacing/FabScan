@@ -26,8 +26,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.3.5"
-APP_TITLE = f"FabScan v{APP_VERSION} - Assisted Trace Tools"
+APP_VERSION = "0.4.0"
+APP_TITLE = f"FabScan v{APP_VERSION} - Controlled X/Y Motion"
 
 
 class FabScanApp(tk.Tk):
@@ -63,6 +63,8 @@ class FabScanApp(tk.Tk):
         self.linuxcnc_auto_refresh_job: Optional[str] = None
         self.jog_busy = False
         self.jog_release_job: Optional[str] = None
+        self.motion_busy = False
+        self.motion_monitor_job: Optional[str] = None
         self.trace_groups: list[list[tuple[float, float, float]]] = [[]]
         self.active_trace_index = 0
 
@@ -101,6 +103,11 @@ class FabScanApp(tk.Tk):
         self.jog_controls_enabled_var = tk.BooleanVar(value=False)
         self.jog_step_var = tk.DoubleVar(value=float(self.settings.get("jog_step", 0.010)))
         self.jog_feed_var = tk.DoubleVar(value=float(self.settings.get("jog_feed_units_per_min", 10.0)))
+        self.controlled_motion_enabled_var = tk.BooleanVar(value=False)
+        self.motion_target_x_var = tk.DoubleVar(value=0.0)
+        self.motion_target_y_var = tk.DoubleVar(value=0.0)
+        self.motion_feed_var = tk.DoubleVar(value=float(self.settings.get("controlled_motion_feed_units_per_min", 20.0)))
+        self.motion_status_var = tk.StringVar(value="Controlled motion disabled")
         self.trace_fit_segments_var = tk.IntVar(value=int(self.settings.get("trace_fit_segments", 72)))
         self.jog_status_var = tk.StringVar(value="Jog disabled")
         self.linuxcnc_status_var = tk.StringVar(value="Not polled")
@@ -537,6 +544,52 @@ class FabScanApp(tk.Tk):
             wraplength=300,
         ).pack(anchor=tk.W, pady=(2, 0))
 
+        motion_frame = ttk.LabelFrame(trace_frame, text="Controlled Motion - X/Y Point Move", padding=6)
+        motion_frame.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Checkbutton(
+            motion_frame,
+            text="Enable controlled moves",
+            variable=self.controlled_motion_enabled_var,
+            command=self.on_controlled_motion_enabled_changed,
+        ).pack(anchor=tk.W)
+
+        motion_grid = ttk.Frame(motion_frame)
+        motion_grid.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(motion_grid, text="Target X").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(motion_grid, textvariable=self.motion_target_x_var, width=10).grid(row=0, column=1, sticky=tk.EW, padx=(4, 8))
+        ttk.Label(motion_grid, text="Target Y").grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(motion_grid, textvariable=self.motion_target_y_var, width=10).grid(row=0, column=3, sticky=tk.EW, padx=(4, 0))
+        ttk.Label(motion_grid, text="Feed/min").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Entry(motion_grid, textvariable=self.motion_feed_var, width=10).grid(row=1, column=1, sticky=tk.EW, padx=(4, 8), pady=(4, 0))
+        motion_grid.columnconfigure(1, weight=1)
+        motion_grid.columnconfigure(3, weight=1)
+
+        motion_target_row = ttk.Frame(motion_frame)
+        motion_target_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(motion_target_row, text="Use Current", command=self.set_motion_target_from_current).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Button(motion_target_row, text="Use Selected Pt", command=self.set_motion_target_from_selected_trace_point).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=3
+        )
+
+        motion_command_row = ttk.Frame(motion_frame)
+        motion_command_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(motion_command_row, text="Move to Target", command=self.controlled_move_to_target).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Button(motion_command_row, text="STOP Move", command=self.abort_controlled_motion).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
+        )
+
+        ttk.Label(motion_frame, textvariable=self.motion_status_var, wraplength=300).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(
+            motion_frame,
+            text="One guarded G1 move to X/Y only. No Z and no torch. This is not a replacement for E-stop.",
+            wraplength=300,
+        ).pack(anchor=tk.W, pady=(2, 0))
+
         capture_row = ttk.Frame(trace_frame)
         capture_row.pack(fill=tk.X, pady=(6, 0))
         ttk.Button(capture_row, text="Capture Point", command=self.capture_trace_point).pack(
@@ -641,7 +694,7 @@ class FabScanApp(tk.Tk):
 
         ttk.Label(
             trace_frame,
-            text="v0.3.5: Assisted Trace Tools can clean the active manual trace into endpoints, rectangles, fitted circles, or sampled 3-point arcs. Jog remains guarded X/Y incremental only.",
+            text="v0.4.0: Controlled Motion can send one guarded X/Y point move to a typed or selected target. Jog remains guarded X/Y incremental only.",
             wraplength=300,
         ).pack(anchor=tk.W, pady=(6, 0))
 
@@ -861,6 +914,179 @@ class FabScanApp(tk.Tk):
         if bool(self.jog_controls_enabled_var.get()):
             self.jog_status_var.set("Jog ready")
         self.refresh_linuxcnc_status(show_errors=False)
+
+    def on_controlled_motion_enabled_changed(self) -> None:
+        """Require explicit acknowledgement before FabScan can send G-code motion."""
+
+        if bool(self.controlled_motion_enabled_var.get()):
+            accepted = messagebox.askyesno(
+                "Enable FabScan controlled motion?",
+                "FabScan will be allowed to send one X/Y G1 move to LinuxCNC using the target fields.\n\n"
+                "This can move the table farther than a jog step. Use only with the torch disabled, "
+                "the table clear, and your hand near E-stop.\n\n"
+                "FabScan will still refuse motion unless LinuxCNC is ON, IDLE, homed, and in MANUAL or MDI mode.\n\n"
+                "Enable controlled X/Y moves for this session?",
+                parent=self,
+            )
+            if not accepted:
+                self.controlled_motion_enabled_var.set(False)
+                self.motion_status_var.set("Controlled motion disabled")
+                return
+            self.motion_status_var.set("Controlled motion enabled: X/Y G1 only")
+            self.append_status("\nFabScan controlled X/Y motion enabled for this session.")
+        else:
+            self.motion_status_var.set("Controlled motion disabled")
+            self.append_status("\nFabScan controlled motion disabled.")
+        self.queue_save_settings()
+
+    def set_motion_target_from_current(self) -> None:
+        """Copy the current LinuxCNC position into the controlled-motion target."""
+
+        self.refresh_linuxcnc_status(show_errors=False)
+        status = self.latest_linuxcnc_status
+        if status is None or not status.connected:
+            messagebox.showinfo(
+                "No LinuxCNC position",
+                (status.error if status is not None else None)
+                or "Could not read LinuxCNC position. Start LinuxCNC and try Refresh Position.",
+                parent=self,
+            )
+            return
+
+        x, y, _z = self.get_active_linuxcnc_position(status)
+        self.motion_target_x_var.set(float(x))
+        self.motion_target_y_var.set(float(y))
+        self.motion_status_var.set(f"Target set from current position: X{x:.4f} Y{y:.4f}")
+        self.queue_save_settings()
+
+    def get_selected_trace_point(self) -> Optional[tuple[int, int, tuple[float, float, float]]]:
+        """Return selected trace point as (trace_index, point_index, point)."""
+
+        if not hasattr(self, "trace_tree"):
+            return None
+        selection = self.trace_tree.selection()
+        if not selection:
+            return None
+        iid = str(selection[0])
+        try:
+            trace_text, point_text = iid.split(":", 1)
+            trace_index = int(trace_text)
+            point_index = int(point_text)
+            point = self.trace_groups[trace_index][point_index]
+        except Exception:  # noqa: BLE001
+            return None
+        return trace_index, point_index, point
+
+    def set_motion_target_from_selected_trace_point(self) -> None:
+        """Copy the selected manual-trace point into the controlled-motion target."""
+
+        selected = self.get_selected_trace_point()
+        if selected is None:
+            messagebox.showinfo("No trace point selected", "Select a captured trace point first.", parent=self)
+            return
+
+        trace_index, point_index, point = selected
+        self.motion_target_x_var.set(float(point[0]))
+        self.motion_target_y_var.set(float(point[1]))
+        self.motion_status_var.set(
+            f"Target set from trace {trace_index + 1}.{point_index + 1}: X{point[0]:.4f} Y{point[1]:.4f}"
+        )
+        self.queue_save_settings()
+
+    def controlled_move_to_target(self) -> None:
+        """Send one guarded X/Y controlled move to the target fields."""
+
+        if not bool(self.controlled_motion_enabled_var.get()):
+            self.motion_status_var.set("Controlled motion disabled - enable it first")
+            return
+        if self.motion_busy:
+            self.motion_status_var.set("Move busy - wait for current move or press STOP Move")
+            return
+
+        target_x = self.safe_float_from_var(self.motion_target_x_var, 0.0)
+        target_y = self.safe_float_from_var(self.motion_target_y_var, 0.0)
+        feed = self.safe_float_from_var(self.motion_feed_var, 20.0)
+        coord_label = self.linuxcnc_coord_mode_var.get()
+
+        accepted = messagebox.askyesno(
+            "Move machine to target?",
+            f"Move X/Y to:\n\n"
+            f"X = {target_x:.4f}\n"
+            f"Y = {target_y:.4f}\n"
+            f"Feed = {feed:.1f} units/min\n"
+            f"Coordinates = {coord_label}\n\n"
+            "This will command LinuxCNC motion. Keep your hand near E-stop. Continue?",
+            parent=self,
+        )
+        if not accepted:
+            self.motion_status_var.set("Controlled move cancelled")
+            return
+
+        self.motion_busy = True
+        self.motion_status_var.set(f"Starting move to X{target_x:.4f} Y{target_y:.4f}...")
+        self.append_status(f"\nStarting controlled move to X{target_x:.4f} Y{target_y:.4f}.")
+
+        result = self.linuxcnc_reader.controlled_xy_move(target_x, target_y, feed, coord_label)
+        self.latest_linuxcnc_status = result.status or self.linuxcnc_reader.read_status()
+        self.update_linuxcnc_display()
+        self.redraw_preview()
+
+        if not result.success:
+            self.motion_busy = False
+            self.motion_status_var.set(result.message)
+            self.append_status(f"\n{result.message}")
+            messagebox.showinfo("FabScan controlled move refused", result.message, parent=self)
+            return
+
+        self.motion_status_var.set(result.message)
+        self.append_status(f"\n{result.message}\nMDI: {result.mdi_command}")
+        self.queue_save_settings()
+        self.schedule_controlled_motion_monitor()
+
+    def schedule_controlled_motion_monitor(self) -> None:
+        if self.motion_monitor_job is not None:
+            self.after_cancel(self.motion_monitor_job)
+        self.motion_monitor_job = self.after(500, self._controlled_motion_monitor_tick)
+
+    def _controlled_motion_monitor_tick(self) -> None:
+        self.motion_monitor_job = None
+        status = self.linuxcnc_reader.read_status()
+        self.latest_linuxcnc_status = status
+        self.update_linuxcnc_display()
+        self.redraw_preview()
+
+        if not self.motion_busy:
+            return
+        if not status.connected:
+            self.motion_busy = False
+            self.motion_status_var.set(status.error or "LinuxCNC disconnected during controlled move")
+            return
+        if status.interp_state == "IDLE":
+            self.motion_busy = False
+            x, y, _z = self.get_active_linuxcnc_position(status)
+            self.motion_status_var.set(f"Move complete / idle at X{x:.4f} Y{y:.4f}")
+            self.append_status(f"\nControlled move complete / LinuxCNC idle at X{x:.4f} Y{y:.4f}.")
+            return
+
+        self.motion_status_var.set(f"Move running... interpreter {status.interp_state}")
+        self.schedule_controlled_motion_monitor()
+
+    def abort_controlled_motion(self) -> None:
+        """Abort FabScan-requested motion through LinuxCNC."""
+
+        result = self.linuxcnc_reader.abort_motion()
+        self.latest_linuxcnc_status = result.status or self.linuxcnc_reader.read_status()
+        self.update_linuxcnc_display()
+        self.redraw_preview()
+
+        if self.motion_monitor_job is not None:
+            self.after_cancel(self.motion_monitor_job)
+            self.motion_monitor_job = None
+        self.motion_busy = False
+        self.motion_status_var.set(result.message)
+        self.append_status(f"\n{result.message}")
+        if not result.success:
+            messagebox.showinfo("FabScan stop/abort", result.message, parent=self)
 
     def capture_trace_point(self) -> None:
         """Capture the current LinuxCNC X/Y/Z position into the active manual trace."""
@@ -1264,6 +1490,7 @@ class FabScanApp(tk.Tk):
             self.jog_controls_enabled_var,
             self.jog_step_var,
             self.jog_feed_var,
+            self.motion_feed_var,
             self.trace_fit_segments_var,
             self.contour_filter_var,
             self.contour_sort_var,
@@ -1311,6 +1538,7 @@ class FabScanApp(tk.Tk):
             "jog_controls_enabled": False,
             "jog_step": self.safe_float_from_var(self.jog_step_var, 0.010),
             "jog_feed_units_per_min": self.safe_float_from_var(self.jog_feed_var, 10.0),
+            "controlled_motion_feed_units_per_min": self.safe_float_from_var(self.motion_feed_var, 20.0),
             "contour_filter_label": str(self.contour_filter_var.get()),
             "contour_sort_label": str(self.contour_sort_var.get()),
             "last_image_dir": str(self.settings.get("last_image_dir", Path.home())),
@@ -1347,6 +1575,9 @@ class FabScanApp(tk.Tk):
         if self.linuxcnc_auto_refresh_job is not None:
             self.after_cancel(self.linuxcnc_auto_refresh_job)
             self.linuxcnc_auto_refresh_job = None
+        if self.motion_monitor_job is not None:
+            self.after_cancel(self.motion_monitor_job)
+            self.motion_monitor_job = None
         self.save_settings_now()
         self.destroy()
 
@@ -1450,6 +1681,13 @@ class FabScanApp(tk.Tk):
         self.jog_step_var.set(float(DEFAULT_SETTINGS["jog_step"]))
         self.jog_feed_var.set(float(DEFAULT_SETTINGS["jog_feed_units_per_min"]))
         self.jog_status_var.set("Jog disabled")
+        self.controlled_motion_enabled_var.set(False)
+        self.motion_busy = False
+        if self.motion_monitor_job is not None:
+            self.after_cancel(self.motion_monitor_job)
+            self.motion_monitor_job = None
+        self.motion_feed_var.set(float(DEFAULT_SETTINGS["controlled_motion_feed_units_per_min"]))
+        self.motion_status_var.set("Controlled motion disabled")
 
         # Existing contours were created using the old controls, so clear them.
         self.processed = None

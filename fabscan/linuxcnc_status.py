@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import glob
 import importlib
+import math
 import sys
 from typing import Optional, Sequence, Tuple
 
@@ -34,6 +35,16 @@ class LinuxCNCJogResult:
     success: bool
     message: str
     status: Optional[LinuxCNCPositionStatus] = None
+
+
+@dataclass
+class LinuxCNCMotionResult:
+    """Result of one FabScan-requested controlled X/Y move."""
+
+    success: bool
+    message: str
+    status: Optional[LinuxCNCPositionStatus] = None
+    mdi_command: str = ""
 
 
 class LinuxCNCStatusReader:
@@ -207,6 +218,92 @@ class LinuxCNCStatusReader:
             self.read_status(),
         )
 
+    def controlled_xy_move(
+        self,
+        target_x: float,
+        target_y: float,
+        feed_per_minute: float,
+        coordinate_mode_label: str,
+    ) -> LinuxCNCMotionResult:
+        """Send one guarded X/Y point-to-point move through LinuxCNC MDI.
+
+        FabScan v0.4.0 keeps controlled motion deliberately small:
+        - X/Y only;
+        - no Z;
+        - no torch/plasma commands;
+        - no program start;
+        - one explicit MDI G1 move at a user-limited feed.
+        """
+
+        try:
+            target_x = float(target_x)
+            target_y = float(target_y)
+            feed_per_minute = abs(float(feed_per_minute))
+        except Exception:  # noqa: BLE001
+            return LinuxCNCMotionResult(False, "Move target/feed values must be numeric.")
+
+        if not math.isfinite(target_x) or not math.isfinite(target_y):
+            return LinuxCNCMotionResult(False, "Move target X/Y must be finite numbers.")
+        if feed_per_minute <= 0:
+            return LinuxCNCMotionResult(False, "Move feed must be greater than zero.")
+        if feed_per_minute > 120.0:
+            return LinuxCNCMotionResult(False, "Controlled move feed is limited to 120 units/minute in FabScan.")
+
+        status = self.read_status()
+        ok, message = self._ok_for_controlled_xy_move(status)
+        if not ok:
+            return LinuxCNCMotionResult(False, message, status)
+
+        if self._linuxcnc is None:
+            return LinuxCNCMotionResult(False, "LinuxCNC Python module is not available.", status)
+
+        coordinate_mode_label = (coordinate_mode_label or "Work coordinates").strip()
+        if coordinate_mode_label == "Machine coordinates":
+            mdi_command = f"G90 G53 G1 X{target_x:.6f} Y{target_y:.6f} F{feed_per_minute:.3f}"
+        else:
+            mdi_command = f"G90 G1 X{target_x:.6f} Y{target_y:.6f} F{feed_per_minute:.3f}"
+
+        try:
+            if self._command is None:
+                self._command = self._linuxcnc.command()
+
+            self._command.mode(self._linuxcnc.MODE_MDI)
+            self._command.wait_complete(1.0)
+            self._command.mdi(mdi_command)
+        except Exception as exc:  # noqa: BLE001
+            return LinuxCNCMotionResult(False, f"LinuxCNC controlled move failed: {exc}", status, mdi_command)
+
+        return LinuxCNCMotionResult(
+            True,
+            f"Started controlled X/Y move to X{target_x:.4f} Y{target_y:.4f} at {feed_per_minute:.1f} units/min.",
+            self.read_status(),
+            mdi_command,
+        )
+
+    def abort_motion(self) -> LinuxCNCMotionResult:
+        """Abort the currently running LinuxCNC command from FabScan.
+
+        This is a software abort, not a replacement for the physical E-stop.
+        """
+
+        status = self.read_status()
+        if not status.available:
+            return LinuxCNCMotionResult(False, status.error or "LinuxCNC Python module is not available.", status)
+        if not status.connected:
+            return LinuxCNCMotionResult(False, status.error or "FabScan is not connected to LinuxCNC.", status)
+
+        if self._linuxcnc is None:
+            return LinuxCNCMotionResult(False, "LinuxCNC Python module is not available.", status)
+
+        try:
+            if self._command is None:
+                self._command = self._linuxcnc.command()
+            self._command.abort()
+        except Exception as exc:  # noqa: BLE001
+            return LinuxCNCMotionResult(False, f"LinuxCNC abort failed: {exc}", status)
+
+        return LinuxCNCMotionResult(True, "FabScan sent LinuxCNC abort command.", self.read_status())
+
     def _ok_for_incremental_jog(self, status: LinuxCNCPositionStatus) -> tuple[bool, str]:
         if not status.available:
             return False, status.error or "LinuxCNC Python module is not available."
@@ -223,6 +320,24 @@ class LinuxCNCStatusReader:
             )
         if not status.all_xyz_homed:
             return False, f"X/Y/Z must be homed before FabScan jogs. Current homed state: {status.homed_text}."
+        return True, "OK"
+
+    def _ok_for_controlled_xy_move(self, status: LinuxCNCPositionStatus) -> tuple[bool, str]:
+        if not status.available:
+            return False, status.error or "LinuxCNC Python module is not available."
+        if not status.connected:
+            return False, status.error or "FabScan is not connected to LinuxCNC."
+        if status.task_state != "ON":
+            return False, f"LinuxCNC task state must be ON before controlled motion. Current state: {status.task_state}."
+        if status.interp_state != "IDLE":
+            return False, f"LinuxCNC interpreter must be IDLE before controlled motion. Current state: {status.interp_state}."
+        if status.task_mode not in ("MANUAL", "MDI"):
+            return False, (
+                "LinuxCNC task mode must be MANUAL or MDI before controlled motion. "
+                f"Current mode: {status.task_mode}."
+            )
+        if not status.all_xyz_homed:
+            return False, f"X/Y/Z must be homed before controlled motion. Current homed state: {status.homed_text}."
         return True, "OK"
 
     def _calculate_work_position(self, machine_position: Position3) -> Position3:
