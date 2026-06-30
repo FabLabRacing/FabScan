@@ -19,7 +19,7 @@ ImagePoint = Tuple[float, float]
 
 
 class FabScanApp(tk.Tk):
-    """FabScan Ver. 0.1.1 desktop app.
+    """FabScan Ver. 0.1.2 desktop app.
 
     This intentionally favors simple and debuggable over pretty. The goal is to
     prove the photo/scan -> contours -> scaled DXF workflow, with manual contour
@@ -28,9 +28,9 @@ class FabScanApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("FabScan Ver. 0.1.1 - Contour Selection")
-        self.geometry("1280x840")
-        self.minsize(1050, 720)
+        self.title("FabScan Ver. 0.1.3 - Scrollable Measurements")
+        self.geometry("1280x820")
+        self.minsize(950, 600)
 
         self.image_path: Optional[Path] = None
         self.image_bgr: Optional[np.ndarray] = None
@@ -99,12 +99,26 @@ class FabScanApp(tk.Tk):
         self.bind("t", lambda _event: self.toggle_selected_contour())
         self.bind("T", lambda _event: self.toggle_selected_contour())
 
-        side = ttk.Frame(main, padding=(8, 0, 0, 0), width=330)
-        side.pack(side=tk.RIGHT, fill=tk.Y)
-        side.pack_propagate(False)
+        side_container = ttk.Frame(main, padding=(8, 0, 0, 0), width=360)
+        side_container.pack(side=tk.RIGHT, fill=tk.Y)
+        side_container.pack_propagate(False)
+
+        self.side_canvas = tk.Canvas(side_container, highlightthickness=0, borderwidth=0)
+        self.side_scrollbar = ttk.Scrollbar(side_container, orient=tk.VERTICAL, command=self.side_canvas.yview)
+        self.side_canvas.configure(yscrollcommand=self.side_scrollbar.set)
+
+        self.side_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.side_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        side = ttk.Frame(self.side_canvas)
+        self.side_canvas_window = self.side_canvas.create_window((0, 0), window=side, anchor=tk.NW)
+        side.bind("<Configure>", lambda _event: self._update_side_scrollregion())
+        self.side_canvas.bind("<Configure>", self._on_side_canvas_configure)
+        self.side_canvas.bind("<Enter>", lambda _event: self._bind_side_mousewheel())
+        self.side_canvas.bind("<Leave>", lambda _event: self._unbind_side_mousewheel())
 
         contours_frame = ttk.LabelFrame(side, text="Contours", padding=6)
-        contours_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        contours_frame.pack(side=tk.TOP, fill=tk.X)
 
         columns = ("enabled", "layer", "area", "points")
         self.contour_tree = ttk.Treeview(
@@ -122,7 +136,7 @@ class FabScanApp(tk.Tk):
         self.contour_tree.column("layer", width=76, anchor=tk.CENTER, stretch=False)
         self.contour_tree.column("area", width=92, anchor=tk.E, stretch=True)
         self.contour_tree.column("points", width=54, anchor=tk.E, stretch=False)
-        self.contour_tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.contour_tree.pack(side=tk.TOP, fill=tk.X)
         self.contour_tree.bind("<<TreeviewSelect>>", self.on_contour_tree_select)
         self.contour_tree.bind("<Double-1>", lambda _event: self.toggle_selected_contour())
 
@@ -138,8 +152,13 @@ class FabScanApp(tk.Tk):
             side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
         )
 
+        ttk.Label(side, text="Measurements", font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W, pady=(8, 0))
+        self.measurement_text = tk.Text(side, height=13, width=38, wrap=tk.WORD)
+        self.measurement_text.pack(fill=tk.X, expand=False, pady=(4, 0))
+        self.measurement_text.configure(state=tk.DISABLED)
+
         ttk.Label(side, text="Status", font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W, pady=(8, 0))
-        self.status_text = tk.Text(side, height=11, width=38, wrap=tk.WORD)
+        self.status_text = tk.Text(side, height=9, width=38, wrap=tk.WORD)
         self.status_text.pack(fill=tk.X, expand=False, pady=(4, 0))
         self.status_text.configure(state=tk.DISABLED)
 
@@ -148,7 +167,40 @@ class FabScanApp(tk.Tk):
             "Tip: For Ver. 0.1, a high-contrast image with the part separated "
             "from the background will work best."
         )
+        self.set_measurements(
+            "No contours yet.\n\n"
+            "After Find Contours, select a contour to see its bounding box and scaled size."
+        )
         self.refresh_contour_list()
+
+    def _update_side_scrollregion(self) -> None:
+        """Keep the right-side scrollbar matched to the controls panel height."""
+
+        self.side_canvas.configure(scrollregion=self.side_canvas.bbox("all"))
+
+    def _on_side_canvas_configure(self, event: tk.Event) -> None:
+        """Make the scrollable right-side frame track the canvas width."""
+
+        self.side_canvas.itemconfigure(self.side_canvas_window, width=event.width)
+        self._update_side_scrollregion()
+
+    def _bind_side_mousewheel(self) -> None:
+        self.bind_all("<MouseWheel>", self._on_side_mousewheel)
+        self.bind_all("<Button-4>", self._on_side_mousewheel)
+        self.bind_all("<Button-5>", self._on_side_mousewheel)
+
+    def _unbind_side_mousewheel(self) -> None:
+        self.unbind_all("<MouseWheel>")
+        self.unbind_all("<Button-4>")
+        self.unbind_all("<Button-5>")
+
+    def _on_side_mousewheel(self, event: tk.Event) -> None:
+        if getattr(event, "num", None) == 4:
+            self.side_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.side_canvas.yview_scroll(1, "units")
+        else:
+            self.side_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _add_slider(
         self,
@@ -183,6 +235,12 @@ class FabScanApp(tk.Tk):
         self.status_text.insert(tk.END, text)
         self.status_text.configure(state=tk.DISABLED)
 
+    def set_measurements(self, text: str) -> None:
+        self.measurement_text.configure(state=tk.NORMAL)
+        self.measurement_text.delete("1.0", tk.END)
+        self.measurement_text.insert(tk.END, text)
+        self.measurement_text.configure(state=tk.DISABLED)
+
     def append_status(self, text: str) -> None:
         self.status_text.configure(state=tk.NORMAL)
         self.status_text.insert(tk.END, "\n" + text)
@@ -216,6 +274,7 @@ class FabScanApp(tk.Tk):
         h, w = image.shape[:2]
         self.set_status(f"Loaded:\n{self.image_path.name}\n\nImage size: {w} x {h} px")
         self.refresh_contour_list()
+        self.update_measurements()
         self.redraw_preview()
 
     def process_image_if_loaded(self) -> None:
@@ -243,7 +302,91 @@ class FabScanApp(tk.Tk):
         self.selected_contour_id = self.processed.contours[0].id if self.processed.contours else None
         self.refresh_contour_list()
         self.update_processing_status()
+        self.update_measurements()
         self.redraw_preview()
+
+    def get_contour_bbox(self, contour: FoundContour) -> tuple[float, float, float, float, float, float]:
+        """Return min_x, min_y, max_x, max_y, width, height in image pixels."""
+
+        min_x = float(np.min(contour.points[:, 0]))
+        max_x = float(np.max(contour.points[:, 0]))
+        min_y = float(np.min(contour.points[:, 1]))
+        max_y = float(np.max(contour.points[:, 1]))
+        return min_x, min_y, max_x, max_y, max_x - min_x, max_y - min_y
+
+    def get_contours_bbox(self, contours: list[FoundContour]) -> Optional[tuple[float, float, float, float, float, float]]:
+        """Return one bounding box around a group of contours in image pixels."""
+
+        if not contours:
+            return None
+
+        all_points = np.vstack([c.points for c in contours])
+        min_x = float(np.min(all_points[:, 0]))
+        max_x = float(np.max(all_points[:, 0]))
+        min_y = float(np.min(all_points[:, 1]))
+        max_y = float(np.max(all_points[:, 1]))
+        return min_x, min_y, max_x, max_y, max_x - min_x, max_y - min_y
+
+    def format_px(self, value: float) -> str:
+        return f"{value:.1f} px"
+
+    def format_inches(self, pixels: float) -> str:
+        if self.scale_result is None:
+            return "scale not set"
+        return f"{pixels * self.scale_result.inches_per_pixel:.4f} in"
+
+    def format_area_inches(self, area_pixels: float) -> str:
+        if self.scale_result is None:
+            return "scale not set"
+        area = area_pixels * (self.scale_result.inches_per_pixel ** 2)
+        return f"{area:.4f} in²"
+
+    def update_measurements(self) -> None:
+        """Show selected contour and enabled-export bounding box sanity numbers."""
+
+        if self.processed is None or not self.processed.contours:
+            self.set_measurements(
+                "No contours yet.\n\n"
+                "After Find Contours, select a contour to see its bounding box and scaled size."
+            )
+            return
+
+        contour = self.get_selected_contour()
+        enabled_contours = [c for c in self.processed.contours if c.enabled]
+        enabled_bbox = self.get_contours_bbox(enabled_contours)
+
+        lines: list[str] = []
+
+        if contour is None:
+            lines.append("Selected: none")
+        else:
+            min_x, min_y, max_x, max_y, width_px, height_px = self.get_contour_bbox(contour)
+            lines.extend(
+                [
+                    f"Selected contour: {contour.id}",
+                    f"Layer: {contour.layer}",
+                    f"Enabled: {'Yes' if contour.enabled else 'No'}",
+                    f"Points: {len(contour.points)}",
+                    f"Area: {contour.area:.0f} px²",
+                    f"Area: {self.format_area_inches(contour.area)}",
+                    "",
+                    f"BBox X: {self.format_px(min_x)} to {self.format_px(max_x)}",
+                    f"BBox Y: {self.format_px(min_y)} to {self.format_px(max_y)}",
+                    f"Size: {self.format_px(width_px)} x {self.format_px(height_px)}",
+                    f"Size: {self.format_inches(width_px)} x {self.format_inches(height_px)}",
+                ]
+            )
+
+        lines.append("")
+        lines.append("Enabled export bbox:")
+        if enabled_bbox is None:
+            lines.append("No enabled contours")
+        else:
+            _min_x, _min_y, _max_x, _max_y, width_px, height_px = enabled_bbox
+            lines.append(f"Size: {self.format_px(width_px)} x {self.format_px(height_px)}")
+            lines.append(f"Size: {self.format_inches(width_px)} x {self.format_inches(height_px)}")
+
+        self.set_measurements("\n".join(lines))
 
     def update_processing_status(self) -> None:
         if self.processed is None:
@@ -329,7 +472,9 @@ class FabScanApp(tk.Tk):
                 f"Known distance: {self.scale_result.inches:.4f} in\n"
                 f"Scale: {self.scale_result.inches_per_pixel:.8f} in/px"
             )
-            self.update_processing_status() if self.processed is not None else None
+            if self.processed is not None:
+                self.update_processing_status()
+                self.update_measurements()
             self.redraw_preview()
 
     def canvas_to_image_point(self, canvas_x: float, canvas_y: float) -> Optional[ImagePoint]:
@@ -375,6 +520,7 @@ class FabScanApp(tk.Tk):
         if not selection:
             return
         self.selected_contour_id = int(selection[0])
+        self.update_measurements()
         self.redraw_preview()
 
     def get_selected_contour(self) -> Optional[FoundContour]:
@@ -392,6 +538,7 @@ class FabScanApp(tk.Tk):
         contour.enabled = not contour.enabled
         self.refresh_contour_list()
         self.update_processing_status()
+        self.update_measurements()
         self.redraw_preview()
 
     def enable_all_contours(self) -> None:
@@ -401,6 +548,7 @@ class FabScanApp(tk.Tk):
             contour.enabled = True
         self.refresh_contour_list()
         self.update_processing_status()
+        self.update_measurements()
         self.redraw_preview()
 
     def disable_all_contours(self) -> None:
@@ -410,6 +558,7 @@ class FabScanApp(tk.Tk):
             contour.enabled = False
         self.refresh_contour_list()
         self.update_processing_status()
+        self.update_measurements()
         self.redraw_preview()
 
     def select_nearest_contour(self, image_point: ImagePoint) -> None:
@@ -430,6 +579,7 @@ class FabScanApp(tk.Tk):
         if best_id is not None and best_distance <= click_tolerance_px:
             self.selected_contour_id = best_id
             self.refresh_contour_list()
+            self.update_measurements()
             self.redraw_preview()
 
     def export_dxf(self) -> None:
