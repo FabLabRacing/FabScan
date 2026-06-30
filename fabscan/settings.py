@@ -20,6 +20,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "show_threshold": False,
     "export_origin_label": "Move lower-left to 0,0",
     "export_margin_inches": 0.0,
+    "contour_filter_label": "All",
+    "contour_sort_label": "Layer + area",
     "last_image_dir": str(Path.home()),
     "last_export_dir": str(Path.cwd() / "exports"),
 }

@@ -20,7 +20,7 @@ ImagePoint = Tuple[float, float]
 
 
 class FabScanApp(tk.Tk):
-    """FabScan Ver. 0.1.5 desktop app.
+    """FabScan Ver. 0.1.6 desktop app.
 
     This intentionally favors simple and debuggable over pretty. The goal is to
     prove the photo/scan -> contours -> scaled DXF workflow, with manual contour
@@ -32,7 +32,7 @@ class FabScanApp(tk.Tk):
         self.settings = load_settings()
         self._settings_save_job: Optional[str] = None
 
-        self.title("FabScan Ver. 0.1.5 - Save Last Settings")
+        self.title("FabScan Ver. 0.1.6 - Contour List Cleanup")
         try:
             self.geometry(str(self.settings.get("window_geometry", "1280x820")))
         except tk.TclError:
@@ -64,6 +64,16 @@ class FabScanApp(tk.Tk):
         self.show_threshold_var = tk.BooleanVar(value=bool(self.settings.get("show_threshold", False)))
         self.export_origin_var = tk.StringVar(value=origin_label)
         self.export_margin_var = tk.DoubleVar(value=float(self.settings.get("export_margin_inches", 0.0)))
+
+        contour_filter_label = str(self.settings.get("contour_filter_label", "All"))
+        if contour_filter_label not in ("All", "Enabled only", "Disabled only", "OUTSIDE", "INSIDE"):
+            contour_filter_label = "All"
+        contour_sort_label = str(self.settings.get("contour_sort_label", "Layer + area"))
+        if contour_sort_label not in ("Layer + area", "Area largest first", "Area smallest first", "ID", "Points most first"):
+            contour_sort_label = "Layer + area"
+
+        self.contour_filter_var = tk.StringVar(value=contour_filter_label)
+        self.contour_sort_var = tk.StringVar(value=contour_sort_label)
 
         self._build_ui()
         self._register_settings_traces()
@@ -135,7 +145,34 @@ class FabScanApp(tk.Tk):
         contours_frame = ttk.LabelFrame(side, text="Contours", padding=6)
         contours_frame.pack(side=tk.TOP, fill=tk.X)
 
-        columns = ("enabled", "layer", "area", "points")
+        contour_view_row = ttk.Frame(contours_frame)
+        contour_view_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+
+        ttk.Label(contour_view_row, text="Show").grid(row=0, column=0, sticky=tk.W)
+        filter_combo = ttk.Combobox(
+            contour_view_row,
+            textvariable=self.contour_filter_var,
+            values=("All", "Enabled only", "Disabled only", "OUTSIDE", "INSIDE"),
+            state="readonly",
+            width=13,
+        )
+        filter_combo.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        filter_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_contour_view_changed())
+
+        ttk.Label(contour_view_row, text="Sort").grid(row=0, column=1, sticky=tk.W)
+        sort_combo = ttk.Combobox(
+            contour_view_row,
+            textvariable=self.contour_sort_var,
+            values=("Layer + area", "Area largest first", "Area smallest first", "ID", "Points most first"),
+            state="readonly",
+            width=17,
+        )
+        sort_combo.grid(row=1, column=1, sticky="ew", padx=(4, 0))
+        sort_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_contour_view_changed())
+        contour_view_row.columnconfigure(0, weight=1)
+        contour_view_row.columnconfigure(1, weight=1)
+
+        columns = ("id", "enabled", "layer", "area", "points")
         self.contour_tree = ttk.Treeview(
             contours_frame,
             columns=columns,
@@ -143,13 +180,15 @@ class FabScanApp(tk.Tk):
             height=12,
             selectmode="browse",
         )
+        self.contour_tree.heading("id", text="ID")
         self.contour_tree.heading("enabled", text="On")
         self.contour_tree.heading("layer", text="Layer")
         self.contour_tree.heading("area", text="Area px²")
         self.contour_tree.heading("points", text="Pts")
+        self.contour_tree.column("id", width=36, anchor=tk.E, stretch=False)
         self.contour_tree.column("enabled", width=42, anchor=tk.CENTER, stretch=False)
         self.contour_tree.column("layer", width=76, anchor=tk.CENTER, stretch=False)
-        self.contour_tree.column("area", width=92, anchor=tk.E, stretch=True)
+        self.contour_tree.column("area", width=84, anchor=tk.E, stretch=True)
         self.contour_tree.column("points", width=54, anchor=tk.E, stretch=False)
         self.contour_tree.pack(side=tk.TOP, fill=tk.X)
         self.contour_tree.bind("<<TreeviewSelect>>", self.on_contour_tree_select)
@@ -164,6 +203,15 @@ class FabScanApp(tk.Tk):
             side=tk.LEFT, fill=tk.X, expand=True, padx=3
         )
         ttk.Button(contour_buttons, text="Disable All", command=self.disable_all_contours).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
+        )
+
+        visible_buttons = ttk.Frame(contours_frame)
+        visible_buttons.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+        ttk.Button(visible_buttons, text="Enable Visible", command=self.enable_visible_contours).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Button(visible_buttons, text="Disable Visible", command=self.disable_visible_contours).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
         )
 
@@ -287,6 +335,8 @@ class FabScanApp(tk.Tk):
             self.show_threshold_var,
             self.export_origin_var,
             self.export_margin_var,
+            self.contour_filter_var,
+            self.contour_sort_var,
         )
 
         for variable in watched_vars:
@@ -317,6 +367,8 @@ class FabScanApp(tk.Tk):
             "show_threshold": bool(self.show_threshold_var.get()),
             "export_origin_label": str(self.export_origin_var.get()),
             "export_margin_inches": self.safe_float_from_var(self.export_margin_var, 0.0),
+            "contour_filter_label": str(self.contour_filter_var.get()),
+            "contour_sort_label": str(self.contour_sort_var.get()),
             "last_image_dir": str(self.settings.get("last_image_dir", Path.home())),
             "last_export_dir": str(self.settings.get("last_export_dir", Path.cwd() / "exports")),
         }
@@ -572,6 +624,7 @@ class FabScanApp(tk.Tk):
         enabled_inside = sum(1 for c in enabled if c.layer == "INSIDE")
         total_points = sum(len(c.points) for c in self.processed.contours)
         enabled_points = sum(len(c.points) for c in enabled)
+        visible_count = len(self.get_visible_contours())
 
         scale_text = "Not set"
         if self.scale_result is not None:
@@ -581,6 +634,7 @@ class FabScanApp(tk.Tk):
             f"Contours found: {len(self.processed.contours)}\n"
             f"Outside/Inside: {outside} / {inside}\n"
             f"Enabled: {len(enabled)} ({enabled_outside} OUT, {enabled_inside} IN)\n"
+            f"Shown in list: {visible_count}\n"
             f"Points: {enabled_points} enabled / {total_points} total\n\n"
             f"Threshold: {int(self.threshold_var.get())}\n"
             f"Blur: {int(self.blur_var.get())}\n"
@@ -669,6 +723,50 @@ class FabScanApp(tk.Tk):
             self.display_offset_y + image_y * self.display_scale,
         )
 
+    def on_contour_view_changed(self) -> None:
+        """Refresh the contour list after show/sort options change."""
+
+        self.refresh_contour_list()
+        self.update_processing_status()
+        self.update_measurements()
+        self.queue_save_settings()
+
+    def contour_is_visible(self, contour: FoundContour) -> bool:
+        """Return whether a contour should be shown in the list filter."""
+
+        filter_label = self.contour_filter_var.get()
+        if filter_label == "Enabled only":
+            return contour.enabled
+        if filter_label == "Disabled only":
+            return not contour.enabled
+        if filter_label == "OUTSIDE":
+            return contour.layer == "OUTSIDE"
+        if filter_label == "INSIDE":
+            return contour.layer == "INSIDE"
+        return True
+
+    def get_visible_contours(self) -> list[FoundContour]:
+        """Return contours after applying the list filter and sort mode."""
+
+        if self.processed is None:
+            return []
+
+        contours = [contour for contour in self.processed.contours if self.contour_is_visible(contour)]
+        sort_label = self.contour_sort_var.get()
+
+        if sort_label == "Area largest first":
+            return sorted(contours, key=lambda c: (-c.area, c.id))
+        if sort_label == "Area smallest first":
+            return sorted(contours, key=lambda c: (c.area, c.id))
+        if sort_label == "ID":
+            return sorted(contours, key=lambda c: c.id)
+        if sort_label == "Points most first":
+            return sorted(contours, key=lambda c: (-len(c.points), c.id))
+
+        # Default shop-friendly sort: outside profile first, then inside cutouts,
+        # with bigger contours listed before small specks/noise inside each layer.
+        return sorted(contours, key=lambda c: (0 if c.layer == "OUTSIDE" else 1, -c.area, c.id))
+
     def refresh_contour_list(self) -> None:
         for item in self.contour_tree.get_children():
             self.contour_tree.delete(item)
@@ -676,14 +774,20 @@ class FabScanApp(tk.Tk):
         if self.processed is None:
             return
 
-        for contour in self.processed.contours:
+        visible_contours = self.get_visible_contours()
+        visible_ids = {contour.id for contour in visible_contours}
+
+        for contour in visible_contours:
             enabled_mark = "✓" if contour.enabled else ""
             self.contour_tree.insert(
                 "",
                 tk.END,
                 iid=str(contour.id),
-                values=(enabled_mark, contour.layer, f"{contour.area:.0f}", len(contour.points)),
+                values=(contour.id, enabled_mark, contour.layer, f"{contour.area:.0f}", len(contour.points)),
             )
+
+        if self.selected_contour_id not in visible_ids:
+            self.selected_contour_id = visible_contours[0].id if visible_contours else None
 
         if self.selected_contour_id is not None and str(self.selected_contour_id) in self.contour_tree.get_children():
             self.contour_tree.selection_set(str(self.selected_contour_id))
@@ -729,6 +833,30 @@ class FabScanApp(tk.Tk):
         if self.processed is None:
             return
         for contour in self.processed.contours:
+            contour.enabled = False
+        self.refresh_contour_list()
+        self.update_processing_status()
+        self.update_measurements()
+        self.redraw_preview()
+
+    def enable_visible_contours(self) -> None:
+        """Enable only the contours currently visible in the filtered list."""
+
+        if self.processed is None:
+            return
+        for contour in self.get_visible_contours():
+            contour.enabled = True
+        self.refresh_contour_list()
+        self.update_processing_status()
+        self.update_measurements()
+        self.redraw_preview()
+
+    def disable_visible_contours(self) -> None:
+        """Disable only the contours currently visible in the filtered list."""
+
+        if self.processed is None:
+            return
+        for contour in self.get_visible_contours():
             contour.enabled = False
         self.refresh_contour_list()
         self.update_processing_status()

@@ -1,4 +1,4 @@
-# FabScan Ver. 0.1 - First Swing
+# FabScan Ver. 0.1.6 - Contour List Cleanup
 
 FabScan is a small desktop utility for turning a photo/scan of a flat part into a basic DXF outline that can be cleaned up in SheetCam.
 
@@ -8,8 +8,50 @@ This is intentionally simple and rough. The first goal is to prove the workflow:
 2. Threshold it to black/white.
 3. Find contours.
 4. Set scale using two clicked points and a known distance.
-5. Export a DXF.
-6. Import the DXF into SheetCam and let SheetCam clean it up.
+5. Enable/disable detected contours as needed.
+6. Check selected-contour and enabled-export bounding box measurements.
+7. Choose DXF origin behavior and optional lower-left margin.
+8. Export a DXF.
+9. Import the DXF into SheetCam and let SheetCam clean it up.
+
+## New in v0.1.6
+
+FabScan now has a more useful contour list:
+
+- Show all contours
+- Show enabled contours only
+- Show disabled contours only
+- Show OUTSIDE contours only
+- Show INSIDE contours only
+- Sort by layer/area, area, ID, or point count
+- Enable or disable only the contours currently visible in the filtered list
+
+This makes it easier to deal with noisy images where FabScan finds extra specks,
+marks, shadows, or other junk contours.
+
+## Added in v0.1.5
+
+FabScan now remembers the last-used settings between runs:
+
+- Window geometry
+- Threshold
+- Blur
+- Minimum contour area
+- Simplify percent
+- Invert
+- Show Threshold
+- DXF origin option
+- DXF margin
+- Contour list show/sort options
+- Last image-open folder
+- Last DXF-export folder
+
+The settings file is saved outside the git repo:
+
+```text
+Linux: ~/.config/fabscan/settings.json
+Windows: %APPDATA%/fabscan/settings.json
+```
 
 ## Install
 
@@ -27,20 +69,13 @@ pip install -r requirements.txt
 python3 fabscan.py
 ```
 
-## Basic workflow
+## Suggested first tests
 
-1. Click **Load Image**.
-2. Adjust **Threshold**, **Blur**, **Min Area**, and **Simplify** until the preview looks reasonable.
-3. Click **Find Contours**.
-4. Click **Set Scale**.
-5. Click two known points on the image.
-6. Enter the real-world distance between those points in inches.
-7. Click **Export DXF**.
+Use a clean PNG from Inkscape:
 
-## Notes
-
-- DXF units are inches.
-- OUTSIDE contours go on the `OUTSIDE` layer.
-- Hole/internal contours go on the `INSIDE` layer when OpenCV hierarchy can identify them.
-- The Y axis is flipped on export so the DXF opens in a normal CAD/CAM orientation instead of image coordinates.
-- This version does not try to fit arcs. SheetCam can handle detail reduction, arc fitting, circle recognition, and duplicate line cleanup.
+- White background
+- Black 4" x 4" square
+- Export PNG at 300 or 600 DPI
+- Use Invert if the part is black on white
+- Click two known points and enter the known distance
+- Export DXF and verify in SheetCam
