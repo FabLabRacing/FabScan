@@ -14,6 +14,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "window_geometry": "1280x820",
     "threshold": 127,
     "blur": 3,
+    "noise_removal": 0,
+    "edge_cleanup": 0,
     "min_area": 1000.0,
     "simplify_percent": 0.05,
     "invert": False,
@@ -27,6 +29,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "contour_sort_label": "Layer + area",
     "last_image_dir": str(Path.home()),
     "last_export_dir": str(Path.cwd() / "exports"),
+    "last_capture_dir": str(Path.home() / "Pictures" / "FabScan Captures"),
+    "camera_index": 0,
+    "camera_width": 1280,
+    "camera_height": 720,
+    "camera_rotate_degrees": 0,
+    "camera_flip_x": False,
+    "camera_flip_y": False,
+    "camera_fine_rotation_degrees": 0.0,
+    "camera_show_crosshair": True,
+    "camera_show_axis_labels": True,
+    "camera_show_grid": False,
 }
 
 

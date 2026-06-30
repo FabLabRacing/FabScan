@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -10,6 +11,7 @@ from PIL import Image, ImageDraw, ImageTk
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from fabscan.camera_capture import CameraCaptureDialog
 from fabscan.dxf_export import ExportOriginMode, export_contours_to_dxf, get_export_bbox_for_contours
 from fabscan.image_processing import FoundContour, ProcessedImage, find_contours
 from fabscan.scale_tools import ScaleResult, calculate_scale
@@ -20,7 +22,7 @@ ImagePoint = Tuple[float, float]
 
 
 class FabScanApp(tk.Tk):
-    """FabScan Ver. 0.1.9 desktop app.
+    """FabScan Ver. 0.2.0 desktop app.
 
     This intentionally favors simple and debuggable over pretty. The goal is to
     prove the photo/scan -> contours -> scaled DXF workflow, with manual contour
@@ -32,7 +34,7 @@ class FabScanApp(tk.Tk):
         self.settings = load_settings()
         self._settings_save_job: Optional[str] = None
 
-        self.title("FabScan Ver. 0.1.9 - X/Y Sanity Check")
+        self.title("FabScan Ver. 0.2.2 - Camera Capture Aids")
         try:
             self.geometry(str(self.settings.get("window_geometry", "1280x820")))
         except tk.TclError:
@@ -58,6 +60,8 @@ class FabScanApp(tk.Tk):
 
         self.threshold_var = tk.IntVar(value=int(self.settings.get("threshold", 127)))
         self.blur_var = tk.IntVar(value=int(self.settings.get("blur", 3)))
+        self.noise_removal_var = tk.IntVar(value=int(self.settings.get("noise_removal", 0)))
+        self.edge_cleanup_var = tk.IntVar(value=int(self.settings.get("edge_cleanup", 0)))
         self.min_area_var = tk.DoubleVar(value=float(self.settings.get("min_area", 1000.0)))
         self.simplify_var = tk.DoubleVar(value=float(self.settings.get("simplify_percent", 0.05)))
         self.invert_var = tk.BooleanVar(value=bool(self.settings.get("invert", False)))
@@ -87,6 +91,7 @@ class FabScanApp(tk.Tk):
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Button(toolbar, text="Load Image", command=self.load_image).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="Camera Capture", command=self.capture_camera_image).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Find Contours", command=self.process_image).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Set Scale", command=self.start_scale_mode).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Export DXF", command=self.export_dxf).pack(side=tk.LEFT, padx=6)
@@ -107,7 +112,7 @@ class FabScanApp(tk.Tk):
 
         ttk.Label(
             toolbar,
-            text="Tip: set scale from a known CNC/part dimension, then use X/Y sanity check to verify the other axis.",
+            text="Tip: use low cleanup values first; high cleanup can change real geometry.",
         ).pack(side=tk.LEFT, padx=(18, 0))
 
         controls = ttk.LabelFrame(self, text="Image Cleanup", padding=8)
@@ -115,8 +120,10 @@ class FabScanApp(tk.Tk):
 
         self._add_slider(controls, "Threshold", self.threshold_var, 0, 255, 1, 0)
         self._add_slider(controls, "Blur", self.blur_var, 1, 21, 1, 1)
-        self._add_slider(controls, "Min Area", self.min_area_var, 0, 50000, 100, 2)
-        self._add_slider(controls, "Simplify %", self.simplify_var, 0.01, 1.0, 0.01, 3)
+        self._add_slider(controls, "Noise Removal", self.noise_removal_var, 0, 5, 1, 2)
+        self._add_slider(controls, "Edge Cleanup", self.edge_cleanup_var, 0, 5, 1, 3)
+        self._add_slider(controls, "Min Area", self.min_area_var, 0, 50000, 100, 4)
+        self._add_slider(controls, "Simplify %", self.simplify_var, 0.01, 1.0, 0.01, 5)
 
         main = ttk.Frame(self, padding=(8, 0, 8, 8))
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -367,6 +374,8 @@ class FabScanApp(tk.Tk):
         watched_vars: tuple[tk.Variable, ...] = (
             self.threshold_var,
             self.blur_var,
+            self.noise_removal_var,
+            self.edge_cleanup_var,
             self.min_area_var,
             self.simplify_var,
             self.invert_var,
@@ -402,6 +411,8 @@ class FabScanApp(tk.Tk):
             "window_geometry": self.geometry(),
             "threshold": self.safe_int_from_var(self.threshold_var, 127),
             "blur": self.safe_int_from_var(self.blur_var, 3),
+            "noise_removal": self.safe_int_from_var(self.noise_removal_var, 0),
+            "edge_cleanup": self.safe_int_from_var(self.edge_cleanup_var, 0),
             "min_area": self.safe_float_from_var(self.min_area_var, 1000.0),
             "simplify_percent": self.safe_float_from_var(self.simplify_var, 0.05),
             "invert": bool(self.invert_var.get()),
@@ -415,6 +426,17 @@ class FabScanApp(tk.Tk):
             "contour_sort_label": str(self.contour_sort_var.get()),
             "last_image_dir": str(self.settings.get("last_image_dir", Path.home())),
             "last_export_dir": str(self.settings.get("last_export_dir", Path.cwd() / "exports")),
+            "last_capture_dir": str(self.settings.get("last_capture_dir", Path.home() / "Pictures" / "FabScan Captures")),
+            "camera_index": int(self.settings.get("camera_index", 0)),
+            "camera_width": int(self.settings.get("camera_width", 1280)),
+            "camera_height": int(self.settings.get("camera_height", 720)),
+            "camera_rotate_degrees": int(self.settings.get("camera_rotate_degrees", 0)),
+            "camera_flip_x": bool(self.settings.get("camera_flip_x", False)),
+            "camera_flip_y": bool(self.settings.get("camera_flip_y", False)),
+            "camera_fine_rotation_degrees": float(self.settings.get("camera_fine_rotation_degrees", 0.0)),
+            "camera_show_crosshair": bool(self.settings.get("camera_show_crosshair", True)),
+            "camera_show_axis_labels": bool(self.settings.get("camera_show_axis_labels", True)),
+            "camera_show_grid": bool(self.settings.get("camera_show_grid", False)),
         }
 
     def queue_save_settings(self) -> None:
@@ -475,19 +497,126 @@ class FabScanApp(tk.Tk):
             messagebox.showerror("Load failed", "OpenCV could not load that image.")
             return
 
-        self.image_path = Path(path)
-        self.settings["last_image_dir"] = str(self.image_path.parent)
+        image_path = Path(path)
+        self.settings["last_image_dir"] = str(image_path.parent)
         self.queue_save_settings()
 
-        self.image_bgr = image
+        self.set_current_image(
+            image_bgr=image,
+            image_path=image_path,
+            source_text=f"Loaded:\n{image_path.name}",
+        )
+
+    def capture_camera_image(self) -> None:
+        """Capture a still frame from a camera and load it as the working image."""
+
+        camera_index = self.safe_int_from_settings("camera_index", 0)
+        camera_width = self.safe_int_from_settings("camera_width", 1280)
+        camera_height = self.safe_int_from_settings("camera_height", 720)
+        camera_rotate_degrees = self.safe_int_from_settings("camera_rotate_degrees", 0)
+        camera_flip_x = self.safe_bool_from_settings("camera_flip_x", False)
+        camera_flip_y = self.safe_bool_from_settings("camera_flip_y", False)
+        camera_fine_rotation_degrees = self.safe_float_from_settings("camera_fine_rotation_degrees", 0.0)
+        camera_show_crosshair = self.safe_bool_from_settings("camera_show_crosshair", True)
+        camera_show_axis_labels = self.safe_bool_from_settings("camera_show_axis_labels", True)
+        camera_show_grid = self.safe_bool_from_settings("camera_show_grid", False)
+
+        dialog = CameraCaptureDialog(
+            self,
+            camera_index=camera_index,
+            camera_width=camera_width,
+            camera_height=camera_height,
+            rotate_degrees=camera_rotate_degrees,
+            flip_x=camera_flip_x,
+            flip_y=camera_flip_y,
+            fine_rotation_degrees=camera_fine_rotation_degrees,
+            show_crosshair=camera_show_crosshair,
+            show_axis_labels=camera_show_axis_labels,
+            show_grid=camera_show_grid,
+        )
+        self.wait_window(dialog)
+
+        if dialog.result is None:
+            return
+
+        self.settings["camera_index"] = dialog.result.camera_index
+        self.settings["camera_width"] = dialog.result.requested_width
+        self.settings["camera_height"] = dialog.result.requested_height
+        self.settings["camera_rotate_degrees"] = dialog.result.rotate_degrees
+        self.settings["camera_flip_x"] = dialog.result.flip_x
+        self.settings["camera_flip_y"] = dialog.result.flip_y
+        self.settings["camera_fine_rotation_degrees"] = dialog.result.fine_rotation_degrees
+        self.settings["camera_show_crosshair"] = dialog.result.show_crosshair
+        self.settings["camera_show_axis_labels"] = dialog.result.show_axis_labels
+        self.settings["camera_show_grid"] = dialog.result.show_grid
+
+        capture_dir = Path(
+            str(self.settings.get("last_capture_dir", Path.home() / "Pictures" / "FabScan Captures"))
+        )
+        try:
+            capture_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            capture_dir = Path.home()
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = capture_dir / f"fabscan_camera_{timestamp}.png"
+        saved = cv2.imwrite(str(output_path), dialog.result.frame_bgr)
+
+        orientation_text = (
+            f"Rotate {dialog.result.rotate_degrees}°, "
+            f"Flip X {'on' if dialog.result.flip_x else 'off'}, "
+            f"Flip Y {'on' if dialog.result.flip_y else 'off'}, "
+            f"Fine {dialog.result.fine_rotation_degrees:+.1f}°"
+        )
+
+        if saved:
+            self.settings["last_capture_dir"] = str(output_path.parent)
+            image_path = output_path
+            source_text = f"Captured from camera {dialog.result.camera_index}:\n{output_path.name}\n{orientation_text}"
+        else:
+            image_path = Path(f"fabscan_camera_{timestamp}.png")
+            source_text = f"Captured from camera {dialog.result.camera_index}:\nnot saved to disk\n{orientation_text}"
+
+        self.queue_save_settings()
+        self.set_current_image(
+            image_bgr=dialog.result.frame_bgr,
+            image_path=image_path,
+            source_text=source_text,
+        )
+
+    def safe_int_from_settings(self, key: str, default: int) -> int:
+        try:
+            return int(self.settings.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def safe_float_from_settings(self, key: str, default: float) -> float:
+        try:
+            return float(self.settings.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def safe_bool_from_settings(self, key: str, default: bool) -> bool:
+        value = self.settings.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def set_current_image(self, *, image_bgr: np.ndarray, image_path: Path, source_text: str) -> None:
+        """Load a BGR image array into the normal FabScan image pipeline."""
+
+        self.image_path = image_path
+        self.image_bgr = image_bgr
         self.processed = None
         self.scale_result = None
         self.scale_points = []
         self.scale_mode = False
         self.selected_contour_id = None
 
-        h, w = image.shape[:2]
-        self.set_status(f"Loaded:\n{self.image_path.name}\n\nImage size: {w} x {h} px")
+        h, w = image_bgr.shape[:2]
+        self.set_status(f"{source_text}\n\nImage size: {w} x {h} px")
         self.refresh_contour_list()
         self.update_measurements()
         self.redraw_preview()
@@ -518,6 +647,8 @@ class FabScanApp(tk.Tk):
                 threshold_value=int(self.threshold_var.get()),
                 blur_size=int(self.blur_var.get()),
                 invert=bool(self.invert_var.get()),
+                noise_removal=int(self.noise_removal_var.get()),
+                edge_cleanup=int(self.edge_cleanup_var.get()),
                 min_area=float(self.min_area_var.get()),
                 simplify_percent=float(self.simplify_var.get()),
             )
@@ -734,6 +865,8 @@ class FabScanApp(tk.Tk):
             f"Points: {enabled_points} enabled / {total_points} total\n\n"
             f"Threshold: {int(self.threshold_var.get())}\n"
             f"Blur: {int(self.blur_var.get())}\n"
+            f"Noise removal: {int(self.noise_removal_var.get())}\n"
+            f"Edge cleanup: {int(self.edge_cleanup_var.get())}\n"
             f"Min area: {float(self.min_area_var.get()):.1f}\n"
             f"Simplify: {float(self.simplify_var.get()):.2f}%\n\n"
             f"Scale: {scale_text}\n"
