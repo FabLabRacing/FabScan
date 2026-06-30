@@ -7,3 +7,4 @@ exports/*.dxf
 *.log
 .DS_Store
 Thumbs.db
+zips/
