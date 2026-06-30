@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 import cv2
 import numpy as np
@@ -11,10 +11,12 @@ import numpy as np
 class FoundContour:
     """A contour found in the thresholded image."""
 
+    id: int
     points: np.ndarray  # Shape: (N, 2), pixel coordinates
     area: float
     layer: str
     parent_index: int
+    enabled: bool = True
 
 
 @dataclass
@@ -61,7 +63,7 @@ def find_contours(
     blur_size: int = 3,
     invert: bool = False,
     min_area: float = 100.0,
-    simplify_percent: float = 0.20,
+    simplify_percent: float = 0.05,
 ) -> ProcessedImage:
     """Find simplified contours suitable for a rough DXF export.
 
@@ -76,11 +78,16 @@ def find_contours(
         invert=invert,
     )
 
+    # CHAIN_APPROX_NONE keeps full contour detail before our own simplification.
+    # That gives radii/curves enough source points for SheetCam's arc fitting.
     contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     found: List[FoundContour] = []
 
     if hierarchy is None:
         return ProcessedImage(threshold_image=binary, contours=found)
+
+    image_h, image_w = binary.shape[:2]
+    border_margin = 2
 
     hierarchy = hierarchy[0]
     for index, contour in enumerate(contours):
@@ -97,18 +104,14 @@ def find_contours(
         if len(points) < 3:
             continue
 
-        # Ignore contours that touch the image border.
-        # These are usually the page/image boundary, not the part.
-        image_h, image_w = binary.shape[:2]
-        border_margin = 2
-
+        # Ignore contours that touch the image/page border. These are usually the
+        # image boundary, not the part.
         touches_border = (
             np.min(points[:, 0]) <= border_margin
             or np.min(points[:, 1]) <= border_margin
             or np.max(points[:, 0]) >= image_w - 1 - border_margin
             or np.max(points[:, 1]) >= image_h - 1 - border_margin
         )
-
         if touches_border:
             continue
 
@@ -117,13 +120,18 @@ def find_contours(
 
         found.append(
             FoundContour(
+                id=-1,  # Assigned after sorting.
                 points=points,
                 area=area,
                 layer=layer,
                 parent_index=parent_index,
+                enabled=True,
             )
         )
 
-    # Largest contours first. This makes the UI status easier to understand.
+    # Largest contours first. This makes the UI status and contour list easier to read.
     found.sort(key=lambda c: c.area, reverse=True)
+    for contour_id, contour in enumerate(found):
+        contour.id = contour_id
+
     return ProcessedImage(threshold_image=binary, contours=found)

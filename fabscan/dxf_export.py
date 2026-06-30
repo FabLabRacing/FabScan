@@ -32,7 +32,7 @@ def export_contours_to_dxf(
     scale_inches_per_pixel: float,
     image_height_pixels: int,
 ) -> Path:
-    """Export contours to a simple polyline DXF."""
+    """Export enabled contours to a simple polyline DXF."""
 
     if scale_inches_per_pixel <= 0:
         raise ValueError("scale_inches_per_pixel must be greater than zero")
@@ -49,6 +49,9 @@ def export_contours_to_dxf(
             doc.layers.new(name=layer_name)
 
     for contour in contours:
+        if not contour.enabled:
+            continue
+
         dxf_points = list(
             image_points_to_dxf_points(
                 points=contour.points,

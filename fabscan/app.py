@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -18,17 +19,18 @@ ImagePoint = Tuple[float, float]
 
 
 class FabScanApp(tk.Tk):
-    """FabScan Ver. 0.1 desktop app.
+    """FabScan Ver. 0.1.1 desktop app.
 
     This intentionally favors simple and debuggable over pretty. The goal is to
-    prove the photo/scan -> contours -> scaled DXF workflow.
+    prove the photo/scan -> contours -> scaled DXF workflow, with manual contour
+    enable/disable before export.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("FabScan Ver. 0.1 - First Swing")
-        self.geometry("1200x820")
-        self.minsize(1000, 700)
+        self.title("FabScan Ver. 0.1.1 - Contour Selection")
+        self.geometry("1280x840")
+        self.minsize(1050, 720)
 
         self.image_path: Optional[Path] = None
         self.image_bgr: Optional[np.ndarray] = None
@@ -36,6 +38,7 @@ class FabScanApp(tk.Tk):
         self.scale_result: Optional[ScaleResult] = None
         self.scale_points: list[ImagePoint] = []
         self.scale_mode = False
+        self.selected_contour_id: Optional[int] = None
 
         self.display_scale = 1.0
         self.display_offset_x = 0.0
@@ -74,6 +77,10 @@ class FabScanApp(tk.Tk):
             command=self.redraw_preview,
         ).pack(side=tk.LEFT, padx=6)
 
+        ttk.Label(toolbar, text="Tip: select a contour in the list or click its edge; press T to toggle.").pack(
+            side=tk.LEFT, padx=(18, 0)
+        )
+
         controls = ttk.LabelFrame(self, text="Image Cleanup", padding=8)
         controls.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
 
@@ -89,14 +96,51 @@ class FabScanApp(tk.Tk):
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Configure>", lambda _event: self.redraw_preview())
+        self.bind("t", lambda _event: self.toggle_selected_contour())
+        self.bind("T", lambda _event: self.toggle_selected_contour())
 
-        side = ttk.Frame(main, padding=(8, 0, 0, 0), width=240)
+        side = ttk.Frame(main, padding=(8, 0, 0, 0), width=330)
         side.pack(side=tk.RIGHT, fill=tk.Y)
         side.pack_propagate(False)
 
-        ttk.Label(side, text="Status", font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W)
-        self.status_text = tk.Text(side, height=20, width=34, wrap=tk.WORD)
-        self.status_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        contours_frame = ttk.LabelFrame(side, text="Contours", padding=6)
+        contours_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        columns = ("enabled", "layer", "area", "points")
+        self.contour_tree = ttk.Treeview(
+            contours_frame,
+            columns=columns,
+            show="headings",
+            height=12,
+            selectmode="browse",
+        )
+        self.contour_tree.heading("enabled", text="On")
+        self.contour_tree.heading("layer", text="Layer")
+        self.contour_tree.heading("area", text="Area px²")
+        self.contour_tree.heading("points", text="Pts")
+        self.contour_tree.column("enabled", width=42, anchor=tk.CENTER, stretch=False)
+        self.contour_tree.column("layer", width=76, anchor=tk.CENTER, stretch=False)
+        self.contour_tree.column("area", width=92, anchor=tk.E, stretch=True)
+        self.contour_tree.column("points", width=54, anchor=tk.E, stretch=False)
+        self.contour_tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.contour_tree.bind("<<TreeviewSelect>>", self.on_contour_tree_select)
+        self.contour_tree.bind("<Double-1>", lambda _event: self.toggle_selected_contour())
+
+        contour_buttons = ttk.Frame(contours_frame)
+        contour_buttons.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+        ttk.Button(contour_buttons, text="Toggle Selected", command=self.toggle_selected_contour).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Button(contour_buttons, text="Enable All", command=self.enable_all_contours).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=3
+        )
+        ttk.Button(contour_buttons, text="Disable All", command=self.disable_all_contours).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
+        )
+
+        ttk.Label(side, text="Status", font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W, pady=(8, 0))
+        self.status_text = tk.Text(side, height=11, width=38, wrap=tk.WORD)
+        self.status_text.pack(fill=tk.X, expand=False, pady=(4, 0))
         self.status_text.configure(state=tk.DISABLED)
 
         self.set_status(
@@ -104,6 +148,7 @@ class FabScanApp(tk.Tk):
             "Tip: For Ver. 0.1, a high-contrast image with the part separated "
             "from the background will work best."
         )
+        self.refresh_contour_list()
 
     def _add_slider(
         self,
@@ -166,9 +211,11 @@ class FabScanApp(tk.Tk):
         self.scale_result = None
         self.scale_points = []
         self.scale_mode = False
+        self.selected_contour_id = None
 
         h, w = image.shape[:2]
         self.set_status(f"Loaded:\n{self.image_path.name}\n\nImage size: {w} x {h} px")
+        self.refresh_contour_list()
         self.redraw_preview()
 
     def process_image_if_loaded(self) -> None:
@@ -193,9 +240,22 @@ class FabScanApp(tk.Tk):
             messagebox.showerror("Processing failed", str(exc))
             return
 
+        self.selected_contour_id = self.processed.contours[0].id if self.processed.contours else None
+        self.refresh_contour_list()
+        self.update_processing_status()
+        self.redraw_preview()
+
+    def update_processing_status(self) -> None:
+        if self.processed is None:
+            return
+
         outside = sum(1 for c in self.processed.contours if c.layer == "OUTSIDE")
         inside = sum(1 for c in self.processed.contours if c.layer == "INSIDE")
+        enabled = [c for c in self.processed.contours if c.enabled]
+        enabled_outside = sum(1 for c in enabled if c.layer == "OUTSIDE")
+        enabled_inside = sum(1 for c in enabled if c.layer == "INSIDE")
         total_points = sum(len(c.points) for c in self.processed.contours)
+        enabled_points = sum(len(c.points) for c in enabled)
 
         scale_text = "Not set"
         if self.scale_result is not None:
@@ -203,16 +263,15 @@ class FabScanApp(tk.Tk):
 
         self.set_status(
             f"Contours found: {len(self.processed.contours)}\n"
-            f"Outside: {outside}\n"
-            f"Inside: {inside}\n"
-            f"Total points: {total_points}\n\n"
+            f"Outside/Inside: {outside} / {inside}\n"
+            f"Enabled: {len(enabled)} ({enabled_outside} OUT, {enabled_inside} IN)\n"
+            f"Points: {enabled_points} enabled / {total_points} total\n\n"
             f"Threshold: {int(self.threshold_var.get())}\n"
             f"Blur: {int(self.blur_var.get())}\n"
             f"Min area: {float(self.min_area_var.get()):.1f}\n"
             f"Simplify: {float(self.simplify_var.get()):.2f}%\n\n"
             f"Scale: {scale_text}"
         )
-        self.redraw_preview()
 
     def start_scale_mode(self) -> None:
         if self.image_bgr is None:
@@ -225,13 +284,20 @@ class FabScanApp(tk.Tk):
         self.redraw_preview()
 
     def on_canvas_click(self, event: tk.Event) -> None:
-        if not self.scale_mode or self.image_bgr is None:
+        if self.image_bgr is None:
             return
 
         image_point = self.canvas_to_image_point(event.x, event.y)
         if image_point is None:
             return
 
+        if self.scale_mode:
+            self.handle_scale_click(image_point)
+            return
+
+        self.select_nearest_contour(image_point)
+
+    def handle_scale_click(self, image_point: ImagePoint) -> None:
         self.scale_points.append(image_point)
         self.redraw_preview()
 
@@ -263,6 +329,7 @@ class FabScanApp(tk.Tk):
                 f"Known distance: {self.scale_result.inches:.4f} in\n"
                 f"Scale: {self.scale_result.inches_per_pixel:.8f} in/px"
             )
+            self.update_processing_status() if self.processed is not None else None
             self.redraw_preview()
 
     def canvas_to_image_point(self, canvas_x: float, canvas_y: float) -> Optional[ImagePoint]:
@@ -283,6 +350,88 @@ class FabScanApp(tk.Tk):
             self.display_offset_y + image_y * self.display_scale,
         )
 
+    def refresh_contour_list(self) -> None:
+        for item in self.contour_tree.get_children():
+            self.contour_tree.delete(item)
+
+        if self.processed is None:
+            return
+
+        for contour in self.processed.contours:
+            enabled_mark = "✓" if contour.enabled else ""
+            self.contour_tree.insert(
+                "",
+                tk.END,
+                iid=str(contour.id),
+                values=(enabled_mark, contour.layer, f"{contour.area:.0f}", len(contour.points)),
+            )
+
+        if self.selected_contour_id is not None and str(self.selected_contour_id) in self.contour_tree.get_children():
+            self.contour_tree.selection_set(str(self.selected_contour_id))
+            self.contour_tree.focus(str(self.selected_contour_id))
+
+    def on_contour_tree_select(self, _event: tk.Event) -> None:
+        selection = self.contour_tree.selection()
+        if not selection:
+            return
+        self.selected_contour_id = int(selection[0])
+        self.redraw_preview()
+
+    def get_selected_contour(self) -> Optional[FoundContour]:
+        if self.processed is None or self.selected_contour_id is None:
+            return None
+        for contour in self.processed.contours:
+            if contour.id == self.selected_contour_id:
+                return contour
+        return None
+
+    def toggle_selected_contour(self) -> None:
+        contour = self.get_selected_contour()
+        if contour is None:
+            return
+        contour.enabled = not contour.enabled
+        self.refresh_contour_list()
+        self.update_processing_status()
+        self.redraw_preview()
+
+    def enable_all_contours(self) -> None:
+        if self.processed is None:
+            return
+        for contour in self.processed.contours:
+            contour.enabled = True
+        self.refresh_contour_list()
+        self.update_processing_status()
+        self.redraw_preview()
+
+    def disable_all_contours(self) -> None:
+        if self.processed is None:
+            return
+        for contour in self.processed.contours:
+            contour.enabled = False
+        self.refresh_contour_list()
+        self.update_processing_status()
+        self.redraw_preview()
+
+    def select_nearest_contour(self, image_point: ImagePoint) -> None:
+        if self.processed is None or not self.processed.contours:
+            return
+
+        click_tolerance_px = max(3.0, 12.0 / max(self.display_scale, 0.001))
+        best_id: Optional[int] = None
+        best_distance = math.inf
+
+        for contour in self.processed.contours:
+            contour_points = contour.points.astype(np.float32).reshape(-1, 1, 2)
+            distance = abs(float(cv2.pointPolygonTest(contour_points, image_point, True)))
+            if distance < best_distance:
+                best_distance = distance
+                best_id = contour.id
+
+        if best_id is not None and best_distance <= click_tolerance_px:
+            self.selected_contour_id = best_id
+            self.refresh_contour_list()
+            self.redraw_preview()
+
     def export_dxf(self) -> None:
         if self.image_bgr is None:
             messagebox.showinfo("No image", "Load an image first.")
@@ -296,6 +445,11 @@ class FabScanApp(tk.Tk):
 
         if self.scale_result is None:
             messagebox.showinfo("Scale required", "Set the scale before exporting a DXF.")
+            return
+
+        enabled_contours = [c for c in self.processed.contours if c.enabled]
+        if not enabled_contours:
+            messagebox.showinfo("No enabled contours", "Enable at least one contour before exporting.")
             return
 
         default_name = "fabscan_export.dxf"
@@ -315,7 +469,7 @@ class FabScanApp(tk.Tk):
         try:
             image_height = int(self.image_bgr.shape[0])
             output = export_contours_to_dxf(
-                contours=self.processed.contours,
+                contours=enabled_contours,
                 output_path=path,
                 scale_inches_per_pixel=self.scale_result.inches_per_pixel,
                 image_height_pixels=image_height,
@@ -324,7 +478,7 @@ class FabScanApp(tk.Tk):
             messagebox.showerror("DXF export failed", str(exc))
             return
 
-        self.append_status(f"\nDXF exported:\n{output}")
+        self.append_status(f"\nDXF exported:\n{output}\nContours exported: {len(enabled_contours)}")
         messagebox.showinfo("DXF exported", f"Saved:\n{output}")
 
     def redraw_preview(self) -> None:
@@ -375,8 +529,16 @@ class FabScanApp(tk.Tk):
 
     def _draw_overlay(self, draw: ImageDraw.ImageDraw) -> None:
         if self.processed is not None:
+            # Draw disabled first so enabled/selected contours stay visually dominant.
             for contour in self.processed.contours:
-                self._draw_contour(draw, contour)
+                if not contour.enabled:
+                    self._draw_contour(draw, contour)
+            for contour in self.processed.contours:
+                if contour.enabled and contour.id != self.selected_contour_id:
+                    self._draw_contour(draw, contour)
+            for contour in self.processed.contours:
+                if contour.enabled and contour.id == self.selected_contour_id:
+                    self._draw_contour(draw, contour)
 
         if self.scale_points:
             scaled_points = [
@@ -392,8 +554,18 @@ class FabScanApp(tk.Tk):
         points = [(x * self.display_scale, y * self.display_scale) for x, y in contour.points]
         if len(points) < 2:
             return
-        color = "lime" if contour.layer == "OUTSIDE" else "cyan"
-        draw.line(points + [points[0]], fill=color, width=2)
+
+        if not contour.enabled:
+            color = "#777777"
+            width = 1
+        elif contour.id == self.selected_contour_id:
+            color = "yellow"
+            width = 4
+        else:
+            color = "lime" if contour.layer == "OUTSIDE" else "cyan"
+            width = 2
+
+        draw.line(points + [points[0]], fill=color, width=width)
 
 
 def main() -> None:
