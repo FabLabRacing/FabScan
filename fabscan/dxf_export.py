@@ -205,3 +205,46 @@ def export_trace_points_to_dxf(
     doc.saveas(output_path)
     return output_path
 
+
+
+
+def export_trace_groups_to_dxf(
+    trace_groups: list[list[Tuple[float, float, float]]] | list[list[Tuple[float, float]]],
+    output_path: str | Path,
+    close: bool = True,
+    layer_name: str = "TRACE",
+) -> Path:
+    """Export multiple manually captured CNC XY traces as separate DXF polylines.
+
+    Each non-empty group becomes one independent polyline on the same layer. This
+    lets the user manually trace an outside profile and one or more inside cutouts
+    without FabScan connecting the end of one contour to the start of the next.
+    Z is accepted for capture history but ignored for 2D DXF export.
+    """
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    groups = [group for group in trace_groups if group]
+    if not groups:
+        raise ValueError("At least one trace group is required for DXF export")
+
+    for index, group in enumerate(groups, start=1):
+        if len(group) < 2:
+            raise ValueError(f"Trace {index} needs at least two points")
+        if close and len(group) < 3:
+            raise ValueError(f"Closed trace {index} needs at least three points")
+
+    doc = ezdxf.new("R2010")
+    doc.units = ezdxf.units.IN
+    msp = doc.modelspace()
+
+    if layer_name not in doc.layers:
+        doc.layers.new(name=layer_name)
+
+    for group in groups:
+        xy_points = [(float(point[0]), float(point[1])) for point in group]
+        msp.add_lwpolyline(xy_points, close=bool(close), dxfattribs={"layer": layer_name})
+
+    doc.saveas(output_path)
+    return output_path

@@ -15,7 +15,7 @@ from fabscan.camera_capture import CameraCaptureDialog
 from fabscan.dxf_export import (
     ExportOriginMode,
     export_contours_to_dxf,
-    export_trace_points_to_dxf,
+    export_trace_groups_to_dxf,
     get_export_bbox_for_contours,
 )
 from fabscan.image_processing import FoundContour, ProcessedImage, find_contours
@@ -26,8 +26,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.3.0"
-APP_TITLE = f"FabScan v{APP_VERSION} - LinuxCNC Manual Trace"
+APP_VERSION = "0.3.2"
+APP_TITLE = f"FabScan v{APP_VERSION} - Multi-Trace Manual Capture"
 
 
 class FabScanApp(tk.Tk):
@@ -61,7 +61,8 @@ class FabScanApp(tk.Tk):
         self.linuxcnc_reader = LinuxCNCStatusReader()
         self.latest_linuxcnc_status: Optional[LinuxCNCPositionStatus] = None
         self.linuxcnc_auto_refresh_job: Optional[str] = None
-        self.trace_points: list[tuple[float, float, float]] = []
+        self.trace_groups: list[list[tuple[float, float, float]]] = [[]]
+        self.active_trace_index = 0
 
         self.display_scale = 1.0
         self.display_offset_x = 0.0
@@ -92,13 +93,16 @@ class FabScanApp(tk.Tk):
         self.linuxcnc_coord_mode_var = tk.StringVar(value=linuxcnc_coord_label)
         self.linuxcnc_auto_refresh_var = tk.BooleanVar(value=bool(self.settings.get("linuxcnc_auto_refresh", False)))
         self.trace_closed_var = tk.BooleanVar(value=bool(self.settings.get("trace_closed", True)))
+        self.trace_preview_var = tk.BooleanVar(value=bool(self.settings.get("trace_preview", True)))
+        self.trace_show_live_position_var = tk.BooleanVar(value=bool(self.settings.get("trace_show_live_position", True)))
+        self.trace_show_point_numbers_var = tk.BooleanVar(value=bool(self.settings.get("trace_show_point_numbers", True)))
         self.linuxcnc_status_var = tk.StringVar(value="Not polled")
         self.linuxcnc_state_var = tk.StringVar(value="—")
         self.linuxcnc_homed_var = tk.StringVar(value="—")
         self.linuxcnc_x_var = tk.StringVar(value="—")
         self.linuxcnc_y_var = tk.StringVar(value="—")
         self.linuxcnc_z_var = tk.StringVar(value="—")
-        self.trace_count_var = tk.StringVar(value="0 points")
+        self.trace_count_var = tk.StringVar(value="Trace 1: 0 points")
 
         contour_filter_label = str(self.settings.get("contour_filter_label", "All"))
         if contour_filter_label not in ("All", "Enabled only", "Disabled only", "OUTSIDE", "INSIDE"):
@@ -145,6 +149,12 @@ class FabScanApp(tk.Tk):
         ttk.Button(toolbar, text="Set Scale", command=self.start_scale_mode).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Export DXF", command=self.export_dxf).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Refresh LinuxCNC", command=self.refresh_linuxcnc_status).pack(side=tk.LEFT, padx=6)
+        ttk.Checkbutton(
+            toolbar,
+            text="Trace Preview",
+            variable=self.trace_preview_var,
+            command=self.on_trace_display_changed,
+        ).pack(side=tk.LEFT, padx=(12, 6))
         ttk.Button(toolbar, text="Reset Defaults", command=self.reset_recommended_defaults).pack(side=tk.LEFT, padx=(18, 6))
         ttk.Button(toolbar, text="Help", command=self.show_workflow_help).pack(side=tk.LEFT, padx=6)
 
@@ -479,6 +489,9 @@ class FabScanApp(tk.Tk):
         ttk.Button(capture_row, text="Capture Point", command=self.capture_trace_point).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
         )
+        ttk.Button(capture_row, text="Start New", command=self.start_new_trace).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=3
+        )
         ttk.Button(capture_row, text="Undo", command=self.undo_trace_point).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=3
         )
@@ -486,28 +499,56 @@ class FabScanApp(tk.Tk):
             side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
         )
 
-        columns = ("n", "x", "y", "z")
+        columns = ("trace", "n", "x", "y", "z")
         self.trace_tree = ttk.Treeview(
             trace_frame,
             columns=columns,
             show="headings",
-            height=6,
+            height=7,
             selectmode="browse",
         )
+        self.trace_tree.heading("trace", text="Trace")
         self.trace_tree.heading("n", text="#")
         self.trace_tree.heading("x", text="X")
         self.trace_tree.heading("y", text="Y")
         self.trace_tree.heading("z", text="Z")
+        self.trace_tree.column("trace", width=48, anchor=tk.E, stretch=False)
         self.trace_tree.column("n", width=34, anchor=tk.E, stretch=False)
-        self.trace_tree.column("x", width=76, anchor=tk.E, stretch=True)
-        self.trace_tree.column("y", width=76, anchor=tk.E, stretch=True)
-        self.trace_tree.column("z", width=76, anchor=tk.E, stretch=True)
+        self.trace_tree.column("x", width=70, anchor=tk.E, stretch=True)
+        self.trace_tree.column("y", width=70, anchor=tk.E, stretch=True)
+        self.trace_tree.column("z", width=70, anchor=tk.E, stretch=True)
         self.trace_tree.pack(fill=tk.X, pady=(6, 0))
 
         trace_footer = ttk.Frame(trace_frame)
         trace_footer.pack(fill=tk.X, pady=(6, 0))
         ttk.Label(trace_footer, textvariable=self.trace_count_var).pack(side=tk.LEFT)
-        ttk.Checkbutton(trace_footer, text="Closed", variable=self.trace_closed_var).pack(side=tk.RIGHT)
+        ttk.Checkbutton(
+            trace_footer,
+            text="Closed",
+            variable=self.trace_closed_var,
+            command=self.on_trace_display_changed,
+        ).pack(side=tk.RIGHT)
+
+        trace_preview_options = ttk.Frame(trace_frame)
+        trace_preview_options.pack(fill=tk.X, pady=(6, 0))
+        ttk.Checkbutton(
+            trace_preview_options,
+            text="Preview",
+            variable=self.trace_preview_var,
+            command=self.on_trace_display_changed,
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            trace_preview_options,
+            text="Live pos",
+            variable=self.trace_show_live_position_var,
+            command=self.on_trace_display_changed,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            trace_preview_options,
+            text="Point #s",
+            variable=self.trace_show_point_numbers_var,
+            command=self.on_trace_display_changed,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Button(trace_frame, text="Export Manual Trace DXF", command=self.export_trace_dxf).pack(
             fill=tk.X, pady=(6, 0)
@@ -515,9 +556,51 @@ class FabScanApp(tk.Tk):
 
         ttk.Label(
             trace_frame,
-            text="Read-only in v0.3.0: jog with LinuxCNC, then capture points here. FabScan sends no motion commands.",
+            text="Read-only in v0.3.2: jog with LinuxCNC, capture points here, and use Start New for separate contours. FabScan sends no motion commands.",
             wraplength=300,
         ).pack(anchor=tk.W, pady=(6, 0))
+
+
+    def get_active_trace_points(self) -> list[tuple[float, float, float]]:
+        """Return the point list for the currently active manual trace."""
+
+        if not self.trace_groups:
+            self.trace_groups = [[]]
+            self.active_trace_index = 0
+
+        if self.active_trace_index < 0 or self.active_trace_index >= len(self.trace_groups):
+            self.active_trace_index = len(self.trace_groups) - 1
+
+        return self.trace_groups[self.active_trace_index]
+
+    def get_nonempty_trace_groups(self) -> list[list[tuple[float, float, float]]]:
+        """Return only manual trace groups that contain points."""
+
+        return [group for group in self.trace_groups if group]
+
+    def get_total_trace_point_count(self) -> int:
+        """Return the total number of captured manual trace points across all traces."""
+
+        return sum(len(group) for group in self.trace_groups)
+
+    def get_active_trace_label(self) -> str:
+        return f"Trace {self.active_trace_index + 1}"
+
+    def start_new_trace(self) -> None:
+        """Start a new manual trace group so separate contours do not connect."""
+
+        active_points = self.get_active_trace_points()
+        if not active_points:
+            self.append_status(f"\n{self.get_active_trace_label()} is empty; capture points or select Clear first.")
+            return
+
+        self.trace_groups.append([])
+        self.active_trace_index = len(self.trace_groups) - 1
+        self.refresh_trace_point_list()
+        self.append_status(
+            f"\nStarted {self.get_active_trace_label()}. "
+            "New captured points will be separate from the previous trace."
+        )
 
     def on_linuxcnc_auto_refresh_changed(self) -> None:
         self.queue_save_settings()
@@ -526,6 +609,12 @@ class FabScanApp(tk.Tk):
         elif self.linuxcnc_auto_refresh_job is not None:
             self.after_cancel(self.linuxcnc_auto_refresh_job)
             self.linuxcnc_auto_refresh_job = None
+
+    def on_trace_display_changed(self) -> None:
+        """Refresh the manual trace preview after trace display options change."""
+
+        self.queue_save_settings()
+        self.redraw_preview()
 
     def schedule_linuxcnc_auto_refresh(self) -> None:
         if self.linuxcnc_auto_refresh_job is not None:
@@ -545,6 +634,7 @@ class FabScanApp(tk.Tk):
         status = self.linuxcnc_reader.read_status()
         self.latest_linuxcnc_status = status
         self.update_linuxcnc_display()
+        self.redraw_preview()
 
         if show_errors and not status.connected:
             messagebox.showinfo(
@@ -597,7 +687,7 @@ class FabScanApp(tk.Tk):
         return status.work_position
 
     def capture_trace_point(self) -> None:
-        """Capture the current LinuxCNC X/Y/Z position into the manual trace list."""
+        """Capture the current LinuxCNC X/Y/Z position into the active manual trace."""
 
         self.refresh_linuxcnc_status(show_errors=False)
         status = self.latest_linuxcnc_status
@@ -611,58 +701,101 @@ class FabScanApp(tk.Tk):
             return
 
         position = self.get_active_linuxcnc_position(status)
-        self.trace_points.append(position)
+        active_points = self.get_active_trace_points()
+        active_points.append(position)
         self.refresh_trace_point_list()
         self.append_status(
-            f"\nCaptured trace point {len(self.trace_points)}: "
+            f"\nCaptured {self.get_active_trace_label()} point {len(active_points)}: "
             f"X {position[0]:.4f}, Y {position[1]:.4f}, Z {position[2]:.4f} "
             f"({self.linuxcnc_coord_mode_var.get()})"
         )
 
     def undo_trace_point(self) -> None:
-        if not self.trace_points:
+        active_points = self.get_active_trace_points()
+        if not active_points:
             return
-        removed = self.trace_points.pop()
+        removed = active_points.pop()
         self.refresh_trace_point_list()
         self.append_status(
-            f"\nRemoved trace point: X {removed[0]:.4f}, Y {removed[1]:.4f}, Z {removed[2]:.4f}"
+            f"\nRemoved {self.get_active_trace_label()} point: "
+            f"X {removed[0]:.4f}, Y {removed[1]:.4f}, Z {removed[2]:.4f}"
         )
 
     def clear_trace_points(self) -> None:
-        if not self.trace_points:
+        if self.get_total_trace_point_count() == 0 and len(self.trace_groups) <= 1:
             return
-        if not messagebox.askyesno("Clear trace points?", "Clear all manually captured trace points?", parent=self):
+        if not messagebox.askyesno("Clear trace points?", "Clear all manually captured trace groups?", parent=self):
             return
-        self.trace_points.clear()
+        self.trace_groups = [[]]
+        self.active_trace_index = 0
         self.refresh_trace_point_list()
-        self.append_status("\nManual trace points cleared.")
+        self.append_status("\nManual trace groups cleared.")
 
     def refresh_trace_point_list(self) -> None:
         for item in self.trace_tree.get_children():
             self.trace_tree.delete(item)
 
-        for index, point in enumerate(self.trace_points, start=1):
-            self.trace_tree.insert(
-                "",
-                tk.END,
-                iid=str(index - 1),
-                values=(index, f"{point[0]:.4f}", f"{point[1]:.4f}", f"{point[2]:.4f}"),
-            )
+        last_iid: Optional[str] = None
+        for group_index, group in enumerate(self.trace_groups, start=1):
+            if not group:
+                continue
+            for point_index, point in enumerate(group, start=1):
+                iid = f"{group_index - 1}:{point_index - 1}"
+                last_iid = iid
+                self.trace_tree.insert(
+                    "",
+                    tk.END,
+                    iid=iid,
+                    values=(
+                        group_index,
+                        point_index,
+                        f"{point[0]:.4f}",
+                        f"{point[1]:.4f}",
+                        f"{point[2]:.4f}",
+                    ),
+                )
 
-        point_word = "point" if len(self.trace_points) == 1 else "points"
-        self.trace_count_var.set(f"{len(self.trace_points)} {point_word}")
-        if self.trace_points:
-            self.trace_tree.see(str(len(self.trace_points) - 1))
+        total_points = self.get_total_trace_point_count()
+        nonempty_groups = self.get_nonempty_trace_groups()
+        active_points = self.get_active_trace_points()
+        point_word = "point" if total_points == 1 else "points"
+        trace_word = "trace" if len(nonempty_groups) == 1 else "traces"
+        self.trace_count_var.set(
+            f"{len(nonempty_groups)} {trace_word}, {total_points} {point_word} | "
+            f"Active {self.active_trace_index + 1}: {len(active_points)}"
+        )
+        if last_iid is not None:
+            self.trace_tree.see(last_iid)
+
+        self.redraw_preview()
 
     def export_trace_dxf(self) -> None:
-        if len(self.trace_points) < 2:
+        groups = self.get_nonempty_trace_groups()
+        if not groups:
             messagebox.showinfo("Not enough points", "Capture at least two CNC points before exporting.", parent=self)
             return
 
-        close_trace = bool(self.trace_closed_var.get())
-        if close_trace and len(self.trace_points) < 3:
-            messagebox.showinfo("Not enough points", "A closed trace needs at least three CNC points.", parent=self)
+        too_short = [index + 1 for index, group in enumerate(self.trace_groups) if group and len(group) < 2]
+        if too_short:
+            messagebox.showinfo(
+                "Not enough points",
+                "Each exported trace needs at least two points. "
+                f"Check trace(s): {', '.join(str(value) for value in too_short)}",
+                parent=self,
+            )
             return
+
+        close_trace = bool(self.trace_closed_var.get())
+        if close_trace:
+            too_short_closed = [index + 1 for index, group in enumerate(self.trace_groups) if group and len(group) < 3]
+            if too_short_closed:
+                messagebox.showinfo(
+                    "Not enough points",
+                    "A closed trace needs at least three CNC points. "
+                    f"Check trace(s): {', '.join(str(value) for value in too_short_closed)}",
+                    parent=self,
+                )
+                return
 
         initial_export_dir = Path(str(self.settings.get("last_export_dir", Path.cwd() / "exports")))
         if not initial_export_dir.exists():
@@ -685,8 +818,8 @@ class FabScanApp(tk.Tk):
         self.queue_save_settings()
 
         try:
-            output = export_trace_points_to_dxf(
-                self.trace_points,
+            output = export_trace_groups_to_dxf(
+                groups,
                 output_path=path,
                 close=close_trace,
                 layer_name="TRACE",
@@ -695,18 +828,20 @@ class FabScanApp(tk.Tk):
             messagebox.showerror("Trace DXF export failed", str(exc), parent=self)
             return
 
-        xs = [point[0] for point in self.trace_points]
-        ys = [point[1] for point in self.trace_points]
+        all_points = [point for group in groups for point in group]
+        xs = [point[0] for point in all_points]
+        ys = [point[1] for point in all_points]
         width = max(xs) - min(xs)
         height = max(ys) - min(ys)
         export_message = (
             "Manual trace DXF exported successfully.\n"
             f"File: {output}\n"
             f"Layer: TRACE\n"
-            f"Points: {len(self.trace_points)}\n"
+            f"Traces: {len(groups)}\n"
+            f"Points: {len(all_points)}\n"
             f"Closed: {'Yes' if close_trace else 'No'}\n"
             f"Coordinate source: {self.linuxcnc_coord_mode_var.get()}\n"
-            f"Trace bbox: {width:.4f} x {height:.4f}\n\n"
+            f"Combined trace bbox: {width:.4f} x {height:.4f}\n\n"
             "Next: import the DXF into SheetCam/CAD and verify the measured geometry."
         )
         self.append_status("\n" + export_message)
@@ -732,6 +867,9 @@ class FabScanApp(tk.Tk):
             self.linuxcnc_coord_mode_var,
             self.linuxcnc_auto_refresh_var,
             self.trace_closed_var,
+            self.trace_preview_var,
+            self.trace_show_live_position_var,
+            self.trace_show_point_numbers_var,
             self.contour_filter_var,
             self.contour_sort_var,
         )
@@ -772,6 +910,9 @@ class FabScanApp(tk.Tk):
             "linuxcnc_coord_mode_label": str(self.linuxcnc_coord_mode_var.get()),
             "linuxcnc_auto_refresh": bool(self.linuxcnc_auto_refresh_var.get()),
             "trace_closed": bool(self.trace_closed_var.get()),
+            "trace_preview": bool(self.trace_preview_var.get()),
+            "trace_show_live_position": bool(self.trace_show_live_position_var.get()),
+            "trace_show_point_numbers": bool(self.trace_show_point_numbers_var.get()),
             "contour_filter_label": str(self.contour_filter_var.get()),
             "contour_sort_label": str(self.contour_sort_var.get()),
             "last_image_dir": str(self.settings.get("last_image_dir", Path.home())),
@@ -846,12 +987,14 @@ class FabScanApp(tk.Tk):
             "1. Start LinuxCNC normally and jog with QtPlasmaC/LinuxCNC.\n"
             "2. Use Refresh LinuxCNC to read position.\n"
             "3. Jog to each point and click Capture Point.\n"
-            "4. Export Manual Trace DXF when done. FabScan does not command motion in v0.3.0.\n\n"
+            "4. Watch captured points in the Trace Preview canvas.\n"
+            "5. Use Start New when tracing a separate contour, such as a hole inside an outside profile.\n"
+            "6. Export Manual Trace DXF when done. FabScan does not command motion in v0.3.2.\n\n"
             "Tips:\n"
             "- Keep cleanup values low unless the camera image is ugly.\n"
             "- Use Show Threshold to see what FabScan is actually tracing.\n"
             "- Disabled contours stay visible in gray but do not export.\n"
-            "- X+ is right and Y+ is up in the transformed camera preview.",
+            "- X+ is right and Y+ is up in the transformed camera preview and manual trace preview.",
             parent=self,
         )
 
@@ -863,7 +1006,7 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
-            "v0.3.0 LinuxCNC support is read-only position capture. It does not command machine motion.\n\n"
+            "v0.3.2 LinuxCNC support is read-only multi-contour position capture with live trace preview. It does not command machine motion.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )
@@ -898,6 +1041,9 @@ class FabScanApp(tk.Tk):
         self.export_margin_var.set(float(DEFAULT_SETTINGS["export_margin_inches"]))
         self.contour_filter_var.set(str(DEFAULT_SETTINGS["contour_filter_label"]))
         self.contour_sort_var.set(str(DEFAULT_SETTINGS["contour_sort_label"]))
+        self.trace_preview_var.set(bool(DEFAULT_SETTINGS["trace_preview"]))
+        self.trace_show_live_position_var.set(bool(DEFAULT_SETTINGS["trace_show_live_position"]))
+        self.trace_show_point_numbers_var.set(bool(DEFAULT_SETTINGS["trace_show_point_numbers"]))
 
         # Existing contours were created using the old controls, so clear them.
         self.processed = None
@@ -1333,6 +1479,9 @@ class FabScanApp(tk.Tk):
         self.redraw_preview()
 
     def on_canvas_click(self, event: tk.Event) -> None:
+        if self.should_show_trace_preview():
+            return
+
         if self.image_bgr is None:
             return
 
@@ -1654,11 +1803,16 @@ class FabScanApp(tk.Tk):
 
     def redraw_preview(self) -> None:
         self.canvas.delete("all")
+
+        if self.should_show_trace_preview():
+            self.draw_trace_preview()
+            return
+
         if self.image_bgr is None:
             self.canvas.create_text(
                 self.canvas.winfo_width() / 2,
                 self.canvas.winfo_height() / 2,
-                text="Load an image to start",
+                text="Load an image or enable Trace Preview",
                 fill="white",
                 font=("TkDefaultFont", 18),
             )
@@ -1687,6 +1841,251 @@ class FabScanApp(tk.Tk):
             anchor=tk.NW,
             image=self._tk_image,
         )
+
+    def should_show_trace_preview(self) -> bool:
+        """Return True when the main canvas should show manual trace geometry."""
+
+        if not bool(self.trace_preview_var.get()):
+            return False
+
+        # With no image loaded, the trace preview is the useful empty-canvas view.
+        if self.image_bgr is None:
+            return True
+
+        # If manual trace groups contain points, show the trace preview while the preview
+        # toggle is enabled. Uncheck Trace Preview to return to image tracing.
+        return self.get_total_trace_point_count() > 0
+
+    def get_live_trace_position(self) -> Optional[tuple[float, float, float]]:
+        """Return current LinuxCNC position when it should be shown in the trace preview."""
+
+        if not bool(self.trace_show_live_position_var.get()):
+            return None
+        status = self.latest_linuxcnc_status
+        if status is None or not status.connected:
+            return None
+        return self.get_active_linuxcnc_position(status)
+
+    def get_trace_plot_points(self) -> list[tuple[float, float, str]]:
+        """Return XY points to include when fitting the trace preview."""
+
+        points: list[tuple[float, float, str]] = []
+        for group_index, group in enumerate(self.trace_groups):
+            for point in group:
+                points.append((float(point[0]), float(point[1]), f"trace_{group_index}"))
+        live = self.get_live_trace_position()
+        if live is not None:
+            points.append((float(live[0]), float(live[1]), "live"))
+        return points
+
+    def draw_trace_preview(self) -> None:
+        """Draw the manually captured CNC trace on the main canvas."""
+
+        canvas_w = max(1, self.canvas.winfo_width())
+        canvas_h = max(1, self.canvas.winfo_height())
+
+        self.canvas.create_rectangle(0, 0, canvas_w, canvas_h, fill="#202020", outline="")
+        self.canvas.create_text(
+            12,
+            12,
+            anchor=tk.NW,
+            text="Manual Trace Preview",
+            fill="white",
+            font=("TkDefaultFont", 14, "bold"),
+        )
+
+        fit_points = self.get_trace_plot_points()
+        if not fit_points:
+            self._draw_empty_trace_preview(canvas_w, canvas_h)
+            return
+
+        xs = [point[0] for point in fit_points]
+        ys = [point[1] for point in fit_points]
+        min_x = min(xs)
+        max_x = max(xs)
+        min_y = min(ys)
+        max_y = max(ys)
+
+        width = max_x - min_x
+        height = max_y - min_y
+        if width < 0.001:
+            center = (min_x + max_x) / 2.0
+            min_x = center - 0.5
+            max_x = center + 0.5
+            width = 1.0
+        if height < 0.001:
+            center = (min_y + max_y) / 2.0
+            min_y = center - 0.5
+            max_y = center + 0.5
+            height = 1.0
+
+        # Add 10 percent world padding, with a small minimum so single-point
+        # captures are still legible.
+        pad_x = max(width * 0.10, 0.100)
+        pad_y = max(height * 0.10, 0.100)
+        min_x -= pad_x
+        max_x += pad_x
+        min_y -= pad_y
+        max_y += pad_y
+        width = max_x - min_x
+        height = max_y - min_y
+
+        margin_left = 58
+        margin_right = 24
+        margin_top = 56
+        margin_bottom = 44
+        plot_w = max(1, canvas_w - margin_left - margin_right)
+        plot_h = max(1, canvas_h - margin_top - margin_bottom)
+        scale = min(plot_w / width, plot_h / height)
+
+        used_w = width * scale
+        used_h = height * scale
+        plot_left = margin_left + (plot_w - used_w) / 2.0
+        plot_top = margin_top + (plot_h - used_h) / 2.0
+        plot_right = plot_left + used_w
+        plot_bottom = plot_top + used_h
+
+        def world_to_canvas(x: float, y: float) -> tuple[float, float]:
+            cx = plot_left + (x - min_x) * scale
+            cy = plot_bottom - (y - min_y) * scale
+            return cx, cy
+
+        self._draw_trace_grid(plot_left, plot_top, plot_right, plot_bottom)
+        self._draw_trace_axes(world_to_canvas, min_x, max_x, min_y, max_y, plot_left, plot_top, plot_right, plot_bottom)
+
+        for group_index, group in enumerate(self.trace_groups, start=1):
+            if not group:
+                continue
+
+            captured_canvas_points = [world_to_canvas(float(x), float(y)) for x, y, _z in group]
+            line_fill = "lime" if (group_index - 1) == self.active_trace_index else "#35b6ff"
+            point_fill = "yellow" if (group_index - 1) == self.active_trace_index else "#9fd8ff"
+
+            if len(captured_canvas_points) >= 2:
+                flat_points = [coord for point in captured_canvas_points for coord in point]
+                self.canvas.create_line(*flat_points, fill=line_fill, width=2)
+                if bool(self.trace_closed_var.get()) and len(captured_canvas_points) >= 3:
+                    self.canvas.create_line(
+                        captured_canvas_points[-1][0],
+                        captured_canvas_points[-1][1],
+                        captured_canvas_points[0][0],
+                        captured_canvas_points[0][1],
+                        fill=line_fill,
+                        width=2,
+                    )
+
+            for point_index, (x, y, z) in enumerate(group, start=1):
+                cx, cy = world_to_canvas(float(x), float(y))
+                radius = 5
+                self.canvas.create_oval(
+                    cx - radius,
+                    cy - radius,
+                    cx + radius,
+                    cy + radius,
+                    fill=point_fill,
+                    outline="black",
+                )
+                if bool(self.trace_show_point_numbers_var.get()):
+                    self.canvas.create_text(
+                        cx + 8,
+                        cy - 8,
+                        anchor=tk.SW,
+                        text=f"{group_index}.{point_index}",
+                        fill="white",
+                        font=("TkDefaultFont", 9, "bold"),
+                    )
+
+        live = self.get_live_trace_position()
+        if live is not None:
+            lx, ly, lz = live
+            cx, cy = world_to_canvas(float(lx), float(ly))
+            size = 9
+            self.canvas.create_line(cx - size, cy, cx + size, cy, fill="red", width=2)
+            self.canvas.create_line(cx, cy - size, cx, cy + size, fill="red", width=2)
+            self.canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, outline="red", width=2)
+            self.canvas.create_text(
+                cx + 12,
+                cy + 12,
+                anchor=tk.NW,
+                text=f"Live X {lx:.4f}  Y {ly:.4f}",
+                fill="red",
+                font=("TkDefaultFont", 9, "bold"),
+            )
+
+        trace_state = "Closed" if bool(self.trace_closed_var.get()) else "Open"
+        coord_source = self.linuxcnc_coord_mode_var.get()
+        self.canvas.create_text(
+            12,
+            canvas_h - 12,
+            anchor=tk.SW,
+            text=(
+                f"{len(self.get_nonempty_trace_groups())} traces, {self.get_total_trace_point_count()} points  |  "
+                f"Active {self.active_trace_index + 1}  |  {trace_state}  |  {coord_source}  |  "
+                "Start New creates a separate contour"
+            ),
+            fill="#dddddd",
+            font=("TkDefaultFont", 10),
+        )
+
+        self._draw_trace_direction_indicator(canvas_w, canvas_h)
+
+    def _draw_empty_trace_preview(self, canvas_w: int, canvas_h: int) -> None:
+        center_x = canvas_w / 2.0
+        center_y = canvas_h / 2.0
+        self.canvas.create_line(center_x - 80, center_y, center_x + 80, center_y, fill="#555555", width=1)
+        self.canvas.create_line(center_x, center_y - 80, center_x, center_y + 80, fill="#555555", width=1)
+        self.canvas.create_text(
+            center_x,
+            center_y + 110,
+            text="Jog in LinuxCNC, then click Capture Point.\nCaptured CNC points will plot here.",
+            fill="#dddddd",
+            font=("TkDefaultFont", 14),
+            justify=tk.CENTER,
+        )
+        self._draw_trace_direction_indicator(canvas_w, canvas_h)
+
+    def _draw_trace_grid(self, left: float, top: float, right: float, bottom: float) -> None:
+        self.canvas.create_rectangle(left, top, right, bottom, outline="#666666", width=1)
+        for i in range(1, 4):
+            x = left + (right - left) * i / 4.0
+            y = top + (bottom - top) * i / 4.0
+            self.canvas.create_line(x, top, x, bottom, fill="#303030")
+            self.canvas.create_line(left, y, right, y, fill="#303030")
+
+    def _draw_trace_axes(
+        self,
+        world_to_canvas,
+        min_x: float,
+        max_x: float,
+        min_y: float,
+        max_y: float,
+        left: float,
+        top: float,
+        right: float,
+        bottom: float,
+    ) -> None:
+        # Draw X=0 and Y=0 axes when they are inside the fitted world range.
+        if min_y <= 0.0 <= max_y:
+            x1, y0 = world_to_canvas(min_x, 0.0)
+            x2, _y0 = world_to_canvas(max_x, 0.0)
+            self.canvas.create_line(x1, y0, x2, y0, fill="#777777", dash=(4, 4))
+        if min_x <= 0.0 <= max_x:
+            x0, y1 = world_to_canvas(0.0, min_y)
+            _x0, y2 = world_to_canvas(0.0, max_y)
+            self.canvas.create_line(x0, y1, x0, y2, fill="#777777", dash=(4, 4))
+
+        self.canvas.create_text(left, bottom + 6, anchor=tk.NW, text=f"X {min_x:.3f}", fill="#bbbbbb")
+        self.canvas.create_text(right, bottom + 6, anchor=tk.NE, text=f"X {max_x:.3f}", fill="#bbbbbb")
+        self.canvas.create_text(left - 6, top, anchor=tk.NE, text=f"Y {max_y:.3f}", fill="#bbbbbb")
+        self.canvas.create_text(left - 6, bottom, anchor=tk.SE, text=f"Y {min_y:.3f}", fill="#bbbbbb")
+
+    def _draw_trace_direction_indicator(self, canvas_w: int, canvas_h: int) -> None:
+        base_x = canvas_w - 86
+        base_y = 70
+        self.canvas.create_line(base_x, base_y, base_x + 46, base_y, fill="white", width=2, arrow=tk.LAST)
+        self.canvas.create_line(base_x, base_y, base_x, base_y - 46, fill="white", width=2, arrow=tk.LAST)
+        self.canvas.create_text(base_x + 52, base_y, text="X+", fill="white", anchor=tk.W, font=("TkDefaultFont", 10, "bold"))
+        self.canvas.create_text(base_x, base_y - 52, text="Y+", fill="white", anchor=tk.S, font=("TkDefaultFont", 10, "bold"))
 
     def _make_display_rgb(self) -> np.ndarray:
         if self.image_bgr is None:

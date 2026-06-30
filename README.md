@@ -1,24 +1,29 @@
-# FabScan v0.3.0 - LinuxCNC Manual Trace
+# FabScan v0.3.2 - Multi-Trace Manual Capture
 
-This update keeps the working camera/image-to-DXF workflow and adds the first machine-side tracing feature.
+This update keeps the working camera/image-to-DXF workflow and improves the LinuxCNC manual trace workflow by allowing multiple separate traced contours.
 
 ## Added
 
-- **LinuxCNC / Manual Trace** side-panel.
-- Read-only LinuxCNC status polling.
-- Current X/Y/Z position display.
-- Coordinate source selector:
-  - Work coordinates
-  - Machine coordinates
-- Manual point capture while jogging normally in LinuxCNC/QtPlasmaC.
-- Undo / clear captured points.
-- Closed/open trace option.
-- Export manually captured points as a DXF on layer `TRACE`.
-- Optional auto-refresh for LinuxCNC position display.
+- **Start New** button in the LinuxCNC / Manual Trace panel.
+- Multiple manual trace groups/contours.
+- Trace point list now shows trace number and point number.
+- Trace preview draws each trace group separately, without connecting one contour to the next.
+- Manual trace DXF export writes each trace group as a separate DXF polyline on layer `TRACE`.
+
+## Why this matters
+
+This lets you trace shapes like:
+
+- square inside a square
+- outside profile plus hole
+- outside profile plus slot
+- multiple disconnected reference shapes
+
+Use **Start New** after finishing one contour, then capture points for the next contour.
 
 ## Safety boundary
 
-FabScan v0.3.0 is read-only with LinuxCNC.
+FabScan v0.3.2 is still read-only with LinuxCNC.
 
 It does **not**:
 
@@ -36,29 +41,22 @@ Use LinuxCNC/QtPlasmaC to jog the table like normal, then capture points in FabS
 1. Start LinuxCNC/QtPlasmaC normally.
 2. Home the machine and set work zero if you want the trace in work coordinates.
 3. Open FabScan.
-4. In **LinuxCNC / Manual Trace**, click **Refresh Position**.
-5. Choose **Work coordinates** or **Machine coordinates**.
-6. Jog the machine/pointer to the first feature point.
-7. Click **Capture Point**.
-8. Repeat around the profile.
-9. Leave **Closed** checked for a closed part outline, or uncheck it for an open reference trace.
+4. Turn on **Auto** refresh or click **Refresh Position**.
+5. Jog the machine in LinuxCNC/QtPlasmaC.
+6. Click **Capture Point** at each traced location.
+7. When one contour is done, click **Start New**.
+8. Capture points for the next contour.
+9. Choose **Closed** or open trace.
 10. Click **Export Manual Trace DXF**.
-11. Verify/import the DXF in SheetCam or CAD.
 
-## Existing image/camera workflow
+The manual trace DXF exports on layer `TRACE` and uses the captured CNC X/Y coordinates directly.
 
-1. Load Image or use Camera Capture.
-2. Adjust Threshold / Blur / Noise Removal / Edge Cleanup.
-3. Click Find Contours.
-4. Enable/disable contours so only wanted geometry exports.
-5. Click Set Scale, pick two known points, and enter the real distance.
-6. Use the X/Y Sanity Check against known CNC/part dimensions.
-7. Export DXF and bring it into SheetCam/CAD for final cleanup.
+## Trace preview notes
 
-## Notes
-
-- Manual trace DXF points are exported exactly as captured in X/Y.
-- Z is displayed and stored in the trace list for reference, but DXF export is 2D.
-- The DXF layer for manual trace output is `TRACE`.
-- FabScan sets DXF units to inches.
-- If the `linuxcnc` Python module is not available in the virtual environment, FabScan still opens; the LinuxCNC panel will report that the module is missing.
+- `X+` points right.
+- `Y+` points up.
+- Active trace points are yellow with green connecting lines.
+- Previous trace groups are drawn separately in blue.
+- Point labels use `trace.point` format, such as `1.4` or `2.1`.
+- The red crosshair marks the latest live LinuxCNC position when enabled.
+- Uncheck **Trace Preview** to return the main canvas to image preview when image tracing.
