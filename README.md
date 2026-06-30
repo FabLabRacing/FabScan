@@ -1,53 +1,46 @@
-# FabScan v0.3.4 - Jog Mode Cleanup
+# FabScan v0.3.5 - Assisted Trace Tools
 
-FabScan v0.3.4 cleans up the guarded X/Y incremental jog behavior added in v0.3.3.
+FabScan v0.3.5 adds basic helper tools for cleaning up manually captured CNC trace geometry.
 
 ## What this version changes
 
-- Removes the forced LinuxCNC task-mode change before each jog.
-- Adds a task-mode display to the LinuxCNC / Manual Trace panel.
-- Refuses FabScan jogs unless LinuxCNC is already in `MANUAL` mode.
-- Adds a short jog-busy lockout after successful step jogs.
-- Improves jog status messages.
+Adds an **Assisted Trace Tools** section to the LinuxCNC / Manual Trace panel:
 
-## Why this patch exists
+- `Line Endpoints` — reduces the active trace to a straight line from its first point to its last point.
+- `Rect 2 Pts` — turns the first two active trace points into an axis-aligned rectangle using those points as opposite corners.
+- `Circle Fit` — fits a circle through the active trace points and replaces the active trace with sampled circle points.
+- `Arc Last 3` — replaces the last three points in the active trace with a sampled arc through those points.
+- `Curve pts` — controls the detail used for generated circles and arcs.
 
-If FabScan asks LinuxCNC to switch task mode while an incremental jog is still active, LinuxCNC can report:
+These tools modify the **active trace only**. Other trace groups are left alone.
 
-```text
-Ignoring task mode change while jogging
-```
+## Why this exists
 
-FabScan should not be changing task modes during every jog. This version treats task mode as a required precondition instead:
+Manual CNC tracing is useful, but raw point chains are not always the clean geometry you want in CAD/SheetCam.
 
-1. Put LinuxCNC/QtPlasmaC in manual/jog mode.
-2. Enable FabScan jog controls.
-3. Use FabScan X/Y step jog buttons.
+Examples:
 
-## Jog safety behavior
+- Touch two opposite corners and use `Rect 2 Pts` for a square or rectangular profile.
+- Touch several points around a hole and use `Circle Fit`.
+- Touch the start, midpoint, and end of a radius and use `Arc Last 3`.
+- Touch a few points along an edge and use `Line Endpoints` to force it straight.
 
-FabScan will refuse to jog unless:
+FabScan still exports simple DXF polylines. SheetCam can continue to do detail reduction and arc fitting after import.
 
-- LinuxCNC is connected.
-- LinuxCNC task state is ON.
-- LinuxCNC interpreter state is IDLE.
-- LinuxCNC task mode is MANUAL.
-- X/Y/Z show as homed.
-- Jog controls were explicitly enabled for this session.
-- The requested jog is X or Y only.
-- The requested step/feed are inside FabScan's conservative limits.
+## Notes
 
-FabScan v0.3.4 still does not provide continuous jog, Z jog, torch commands, MDI moves, or program start.
+- `Rect 2 Pts` and `Circle Fit` automatically enable `Closed` trace mode.
+- `Arc Last 3` is intended for radius cleanup inside the active trace. It preserves any points before the last three points.
+- If you are exporting an open arc by itself, uncheck `Closed` before exporting.
+- Jogging remains guarded X/Y incremental only. No continuous jog, no Z jog, no torch commands, no MDI, and no program start.
 
-## Manual trace workflow
+## Suggested test
 
 1. Start LinuxCNC/QtPlasmaC normally.
-2. Home the machine and disable the torch/plasma output for tracing.
-3. Put LinuxCNC/QtPlasmaC in manual/jog mode.
-4. Open FabScan.
-5. Refresh LinuxCNC status and verify task mode shows `MANUAL`.
-6. Enable FabScan jog controls if you want to jog from FabScan.
-7. Use X/Y step jog buttons to move to a trace point.
-8. Click `Capture Point`.
-9. Use `Start New` for another contour, such as an inside cutout.
-10. Export the manual trace DXF.
+2. Open FabScan and verify LinuxCNC is connected in `MANUAL` mode.
+3. Capture two opposite corners of a rectangle.
+4. Click `Rect 2 Pts`.
+5. Use `Start New`.
+6. Capture 3 or more points around a circle/hole.
+7. Click `Circle Fit`.
+8. Export Manual Trace DXF and import into SheetCam/CAD.

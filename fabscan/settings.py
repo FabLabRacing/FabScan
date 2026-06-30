@@ -34,6 +34,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "jog_controls_enabled": False,
     "jog_step": 0.010,
     "jog_feed_units_per_min": 10.0,
+    "trace_fit_segments": 72,
     "contour_filter_label": "All",
     "contour_sort_label": "Layer + area",
     "last_image_dir": str(Path.home()),

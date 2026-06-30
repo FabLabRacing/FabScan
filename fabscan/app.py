@@ -26,8 +26,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.3.4"
-APP_TITLE = f"FabScan v{APP_VERSION} - Jog Mode Cleanup"
+APP_VERSION = "0.3.5"
+APP_TITLE = f"FabScan v{APP_VERSION} - Assisted Trace Tools"
 
 
 class FabScanApp(tk.Tk):
@@ -101,6 +101,7 @@ class FabScanApp(tk.Tk):
         self.jog_controls_enabled_var = tk.BooleanVar(value=False)
         self.jog_step_var = tk.DoubleVar(value=float(self.settings.get("jog_step", 0.010)))
         self.jog_feed_var = tk.DoubleVar(value=float(self.settings.get("jog_feed_units_per_min", 10.0)))
+        self.trace_fit_segments_var = tk.IntVar(value=int(self.settings.get("trace_fit_segments", 72)))
         self.jog_status_var = tk.StringVar(value="Jog disabled")
         self.linuxcnc_status_var = tk.StringVar(value="Not polled")
         self.linuxcnc_state_var = tk.StringVar(value="—")
@@ -602,13 +603,45 @@ class FabScanApp(tk.Tk):
             command=self.on_trace_display_changed,
         ).pack(side=tk.LEFT, padx=(8, 0))
 
+        fit_frame = ttk.LabelFrame(trace_frame, text="Assisted Trace Tools", padding=6)
+        fit_frame.pack(fill=tk.X, pady=(8, 0))
+
+        fit_settings = ttk.Frame(fit_frame)
+        fit_settings.pack(fill=tk.X)
+        ttk.Label(fit_settings, text="Curve pts").pack(side=tk.LEFT)
+        ttk.Entry(fit_settings, textvariable=self.trace_fit_segments_var, width=7).pack(side=tk.LEFT, padx=(6, 0))
+
+        fit_row1 = ttk.Frame(fit_frame)
+        fit_row1.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(fit_row1, text="Line Endpoints", command=self.fit_active_trace_line_endpoints).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Button(fit_row1, text="Rect 2 Pts", command=self.fit_active_trace_rectangle).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
+        )
+
+        fit_row2 = ttk.Frame(fit_frame)
+        fit_row2.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(fit_row2, text="Circle Fit", command=self.fit_active_trace_circle).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Button(fit_row2, text="Arc Last 3", command=self.fit_active_trace_arc_last3).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
+        )
+
+        ttk.Label(
+            fit_frame,
+            text="Tools modify the active trace only. Arc Last 3 replaces the last 3 captured points with a sampled arc.",
+            wraplength=300,
+        ).pack(anchor=tk.W, pady=(5, 0))
+
         ttk.Button(trace_frame, text="Export Manual Trace DXF", command=self.export_trace_dxf).pack(
             fill=tk.X, pady=(6, 0)
         )
 
         ttk.Label(
             trace_frame,
-            text="v0.3.4: Start New creates separate contours. Jog buttons are guarded X/Y incremental moves only, require MANUAL mode, and will not force task mode changes.",
+            text="v0.3.5: Assisted Trace Tools can clean the active manual trace into endpoints, rectangles, fitted circles, or sampled 3-point arcs. Jog remains guarded X/Y incremental only.",
             wraplength=300,
         ).pack(anchor=tk.W, pady=(6, 0))
 
@@ -874,6 +907,221 @@ class FabScanApp(tk.Tk):
         self.refresh_trace_point_list()
         self.append_status("\nManual trace groups cleared.")
 
+    def get_trace_fit_segment_count(self, minimum: int = 4, maximum: int = 360) -> int:
+        """Return a bounded segment/point count for generated manual trace curves."""
+
+        try:
+            value = int(self.trace_fit_segments_var.get())
+        except (tk.TclError, ValueError):
+            value = 72
+        value = max(minimum, min(value, maximum))
+        if value != self.trace_fit_segments_var.get():
+            self.trace_fit_segments_var.set(value)
+        return value
+
+    def warn_active_trace_points(self, required: int, tool_name: str) -> Optional[list[tuple[float, float, float]]]:
+        """Return active trace points or show a friendly message when too few exist."""
+
+        points = self.get_active_trace_points()
+        if len(points) < required:
+            messagebox.showinfo(
+                tool_name,
+                f"{tool_name} needs at least {required} point{'s' if required != 1 else ''} in the active trace.",
+                parent=self,
+            )
+            return None
+        return points
+
+    def replace_active_trace_points(self, new_points: list[tuple[float, float, float]], message: str) -> None:
+        """Replace the active trace with generated/fitted points and refresh the UI."""
+
+        if not new_points:
+            return
+        self.trace_groups[self.active_trace_index] = new_points
+        self.refresh_trace_point_list()
+        self.append_status("\n" + message)
+
+    def fit_active_trace_line_endpoints(self) -> None:
+        """Reduce the active trace to a straight line between its first and last point."""
+
+        points = self.warn_active_trace_points(2, "Line Endpoints")
+        if points is None:
+            return
+        new_points = [points[0], points[-1]]
+        self.replace_active_trace_points(
+            new_points,
+            f"Line Endpoints replaced {self.get_active_trace_label()} with a 2-point straight line.",
+        )
+
+    def fit_active_trace_rectangle(self) -> None:
+        """Replace the active trace with an axis-aligned rectangle from two opposite corners."""
+
+        points = self.warn_active_trace_points(2, "Rect 2 Pts")
+        if points is None:
+            return
+
+        p1 = points[0]
+        p2 = points[1]
+        x1, y1, z1 = p1
+        x2, y2, z2 = p2
+        if math.isclose(x1, x2) or math.isclose(y1, y2):
+            messagebox.showinfo(
+                "Rect 2 Pts",
+                "The first two points need different X and Y values to make a rectangle.",
+                parent=self,
+            )
+            return
+
+        z_mid = (float(z1) + float(z2)) / 2.0
+        new_points = [
+            (float(x1), float(y1), float(z1)),
+            (float(x2), float(y1), z_mid),
+            (float(x2), float(y2), float(z2)),
+            (float(x1), float(y2), z_mid),
+        ]
+        self.trace_closed_var.set(True)
+        self.replace_active_trace_points(
+            new_points,
+            f"Rect 2 Pts replaced {self.get_active_trace_label()} with a 4-corner rectangle. Closed trace enabled.",
+        )
+
+    def fit_active_trace_circle(self) -> None:
+        """Fit a circle to the active trace points and replace the trace with sampled circle points."""
+
+        points = self.warn_active_trace_points(3, "Circle Fit")
+        if points is None:
+            return
+
+        xy = np.array([(float(point[0]), float(point[1])) for point in points], dtype=float)
+        x = xy[:, 0]
+        y = xy[:, 1]
+        a = np.column_stack((x, y, np.ones_like(x)))
+        b = -(x * x + y * y)
+
+        try:
+            d, e, f = np.linalg.lstsq(a, b, rcond=None)[0]
+        except np.linalg.LinAlgError as exc:
+            messagebox.showinfo("Circle Fit", f"Could not fit a circle: {exc}", parent=self)
+            return
+
+        center_x = -d / 2.0
+        center_y = -e / 2.0
+        radius_sq = (d * d + e * e) / 4.0 - f
+        if radius_sq <= 0.0:
+            messagebox.showinfo("Circle Fit", "Could not fit a valid circle to those points.", parent=self)
+            return
+
+        radius = math.sqrt(float(radius_sq))
+        segments = self.get_trace_fit_segment_count(minimum=12, maximum=720)
+        z_avg = float(sum(point[2] for point in points) / len(points))
+        new_points = []
+        for index in range(segments):
+            angle = (2.0 * math.pi * index) / segments
+            new_points.append((center_x + radius * math.cos(angle), center_y + radius * math.sin(angle), z_avg))
+
+        self.trace_closed_var.set(True)
+        self.replace_active_trace_points(
+            new_points,
+            f"Circle Fit replaced {self.get_active_trace_label()} with {segments} sampled points. "
+            f"Center X {center_x:.4f}, Y {center_y:.4f}, radius {radius:.4f}. Closed trace enabled.",
+        )
+
+    def fit_active_trace_arc_last3(self) -> None:
+        """Replace the last three active trace points with a sampled arc through those points."""
+
+        points = self.warn_active_trace_points(3, "Arc Last 3")
+        if points is None:
+            return
+
+        prefix = list(points[:-3])
+        start = points[-3]
+        mid = points[-2]
+        end = points[-1]
+
+        arc_points = self.calculate_arc_points_from_3_points(start, mid, end)
+        if arc_points is None:
+            return
+
+        new_points = prefix + arc_points
+        self.replace_active_trace_points(
+            new_points,
+            f"Arc Last 3 replaced the last three points in {self.get_active_trace_label()} "
+            f"with {len(arc_points)} sampled arc points.",
+        )
+
+    def calculate_arc_points_from_3_points(
+        self,
+        start: tuple[float, float, float],
+        mid: tuple[float, float, float],
+        end: tuple[float, float, float],
+    ) -> Optional[list[tuple[float, float, float]]]:
+        """Return sampled arc points through start/mid/end, preserving the correct direction."""
+
+        x1, y1, z1 = start
+        x2, y2, z2 = mid
+        x3, y3, z3 = end
+
+        determinant = 2.0 * (
+            x1 * (y2 - y3)
+            + x2 * (y3 - y1)
+            + x3 * (y1 - y2)
+        )
+        if math.isclose(determinant, 0.0, abs_tol=1e-9):
+            messagebox.showinfo("Arc Last 3", "The last three points are too close to a straight line to fit an arc.", parent=self)
+            return None
+
+        ux = (
+            (x1 * x1 + y1 * y1) * (y2 - y3)
+            + (x2 * x2 + y2 * y2) * (y3 - y1)
+            + (x3 * x3 + y3 * y3) * (y1 - y2)
+        ) / determinant
+        uy = (
+            (x1 * x1 + y1 * y1) * (x3 - x2)
+            + (x2 * x2 + y2 * y2) * (x1 - x3)
+            + (x3 * x3 + y3 * y3) * (x2 - x1)
+        ) / determinant
+
+        radius = math.hypot(x1 - ux, y1 - uy)
+        if radius <= 0.0:
+            messagebox.showinfo("Arc Last 3", "Could not fit a valid arc radius.", parent=self)
+            return None
+
+        def angle_of(x_value: float, y_value: float) -> float:
+            return math.atan2(y_value - uy, x_value - ux)
+
+        def ccw_delta(a0: float, a1: float) -> float:
+            return (a1 - a0) % (2.0 * math.pi)
+
+        start_angle = angle_of(x1, y1)
+        mid_angle = angle_of(x2, y2)
+        end_angle = angle_of(x3, y3)
+
+        start_to_end_ccw = ccw_delta(start_angle, end_angle)
+        start_to_mid_ccw = ccw_delta(start_angle, mid_angle)
+
+        if start_to_mid_ccw <= start_to_end_ccw:
+            arc_sweep = start_to_end_ccw
+        else:
+            arc_sweep = start_to_end_ccw - (2.0 * math.pi)
+
+        segments = self.get_trace_fit_segment_count(minimum=4, maximum=360)
+        # Use fewer segments for tiny arcs but never fewer than 4. Segment count is
+        # interpreted as a maximum for the generated curve.
+        sweep_fraction = abs(arc_sweep) / (2.0 * math.pi)
+        actual_segments = max(4, int(math.ceil(segments * sweep_fraction)))
+        z_avg = (float(z1) + float(z2) + float(z3)) / 3.0
+
+        sampled: list[tuple[float, float, float]] = []
+        for index in range(actual_segments + 1):
+            t = index / actual_segments
+            angle = start_angle + arc_sweep * t
+            sampled.append((ux + radius * math.cos(angle), uy + radius * math.sin(angle), z_avg))
+
+        # Force exact CNC-touched endpoints into the generated arc.
+        sampled[0] = (float(x1), float(y1), float(z1))
+        sampled[-1] = (float(x3), float(y3), float(z3))
+        return sampled
+
     def refresh_trace_point_list(self) -> None:
         for item in self.trace_tree.get_children():
             self.trace_tree.delete(item)
@@ -1016,6 +1264,7 @@ class FabScanApp(tk.Tk):
             self.jog_controls_enabled_var,
             self.jog_step_var,
             self.jog_feed_var,
+            self.trace_fit_segments_var,
             self.contour_filter_var,
             self.contour_sort_var,
         )
