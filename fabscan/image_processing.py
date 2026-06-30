@@ -76,7 +76,7 @@ def find_contours(
         invert=invert,
     )
 
-    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     found: List[FoundContour] = []
 
     if hierarchy is None:

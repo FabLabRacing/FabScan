@@ -45,7 +45,7 @@ class FabScanApp(tk.Tk):
         self.threshold_var = tk.IntVar(value=127)
         self.blur_var = tk.IntVar(value=3)
         self.min_area_var = tk.DoubleVar(value=1000.0)
-        self.simplify_var = tk.DoubleVar(value=0.20)
+        self.simplify_var = tk.DoubleVar(value=0.05)
         self.invert_var = tk.BooleanVar(value=False)
         self.show_threshold_var = tk.BooleanVar(value=False)
 
@@ -80,7 +80,7 @@ class FabScanApp(tk.Tk):
         self._add_slider(controls, "Threshold", self.threshold_var, 0, 255, 1, 0)
         self._add_slider(controls, "Blur", self.blur_var, 1, 21, 1, 1)
         self._add_slider(controls, "Min Area", self.min_area_var, 0, 50000, 100, 2)
-        self._add_slider(controls, "Simplify %", self.simplify_var, 0.01, 5.0, 0.01, 3)
+        self._add_slider(controls, "Simplify %", self.simplify_var, 0.01, 1.0, 0.01, 3)
 
         main = ttk.Frame(self, padding=(8, 0, 8, 8))
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
