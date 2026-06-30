@@ -97,6 +97,21 @@ def find_contours(
         if len(points) < 3:
             continue
 
+        # Ignore contours that touch the image border.
+        # These are usually the page/image boundary, not the part.
+        image_h, image_w = binary.shape[:2]
+        border_margin = 2
+
+        touches_border = (
+            np.min(points[:, 0]) <= border_margin
+            or np.min(points[:, 1]) <= border_margin
+            or np.max(points[:, 0]) >= image_w - 1 - border_margin
+            or np.max(points[:, 1]) >= image_h - 1 - border_margin
+        )
+
+        if touches_border:
+            continue
+
         parent_index = int(hierarchy[index][3])
         layer = "OUTSIDE" if parent_index == -1 else "INSIDE"
 
