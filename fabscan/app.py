@@ -13,13 +13,14 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from fabscan.dxf_export import ExportOriginMode, export_contours_to_dxf, get_export_bbox_for_contours
 from fabscan.image_processing import FoundContour, ProcessedImage, find_contours
 from fabscan.scale_tools import ScaleResult, calculate_scale
+from fabscan.settings import get_settings_path, load_settings, save_settings
 
 
 ImagePoint = Tuple[float, float]
 
 
 class FabScanApp(tk.Tk):
-    """FabScan Ver. 0.1.4 desktop app.
+    """FabScan Ver. 0.1.5 desktop app.
 
     This intentionally favors simple and debuggable over pretty. The goal is to
     prove the photo/scan -> contours -> scaled DXF workflow, with manual contour
@@ -28,8 +29,14 @@ class FabScanApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("FabScan Ver. 0.1.4 - DXF Origin Control")
-        self.geometry("1280x820")
+        self.settings = load_settings()
+        self._settings_save_job: Optional[str] = None
+
+        self.title("FabScan Ver. 0.1.5 - Save Last Settings")
+        try:
+            self.geometry(str(self.settings.get("window_geometry", "1280x820")))
+        except tk.TclError:
+            self.geometry("1280x820")
         self.minsize(950, 600)
 
         self.image_path: Optional[Path] = None
@@ -45,16 +52,22 @@ class FabScanApp(tk.Tk):
         self.display_offset_y = 0.0
         self._tk_image: Optional[ImageTk.PhotoImage] = None
 
-        self.threshold_var = tk.IntVar(value=127)
-        self.blur_var = tk.IntVar(value=3)
-        self.min_area_var = tk.DoubleVar(value=1000.0)
-        self.simplify_var = tk.DoubleVar(value=0.05)
-        self.invert_var = tk.BooleanVar(value=False)
-        self.show_threshold_var = tk.BooleanVar(value=False)
-        self.export_origin_var = tk.StringVar(value="Move lower-left to 0,0")
-        self.export_margin_var = tk.DoubleVar(value=0.0)
+        origin_label = str(self.settings.get("export_origin_label", "Move lower-left to 0,0"))
+        if origin_label not in ("Move lower-left to 0,0", "Preserve image position", "Center on 0,0"):
+            origin_label = "Move lower-left to 0,0"
+
+        self.threshold_var = tk.IntVar(value=int(self.settings.get("threshold", 127)))
+        self.blur_var = tk.IntVar(value=int(self.settings.get("blur", 3)))
+        self.min_area_var = tk.DoubleVar(value=float(self.settings.get("min_area", 1000.0)))
+        self.simplify_var = tk.DoubleVar(value=float(self.settings.get("simplify_percent", 0.05)))
+        self.invert_var = tk.BooleanVar(value=bool(self.settings.get("invert", False)))
+        self.show_threshold_var = tk.BooleanVar(value=bool(self.settings.get("show_threshold", False)))
+        self.export_origin_var = tk.StringVar(value=origin_label)
+        self.export_margin_var = tk.DoubleVar(value=float(self.settings.get("export_margin_inches", 0.0)))
 
         self._build_ui()
+        self._register_settings_traces()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self) -> None:
         toolbar = ttk.Frame(self, padding=8)
@@ -262,6 +275,71 @@ class FabScanApp(tk.Tk):
         entry = ttk.Entry(frame, textvariable=variable, width=10)
         entry.pack(anchor=tk.W, pady=(2, 0))
 
+    def _register_settings_traces(self) -> None:
+        """Save control/export settings shortly after the user changes them."""
+
+        watched_vars: tuple[tk.Variable, ...] = (
+            self.threshold_var,
+            self.blur_var,
+            self.min_area_var,
+            self.simplify_var,
+            self.invert_var,
+            self.show_threshold_var,
+            self.export_origin_var,
+            self.export_margin_var,
+        )
+
+        for variable in watched_vars:
+            variable.trace_add("write", lambda *_args: self.queue_save_settings())
+
+    def safe_int_from_var(self, variable: tk.Variable, default: int) -> int:
+        try:
+            return int(variable.get())
+        except (tk.TclError, TypeError, ValueError):
+            return default
+
+    def safe_float_from_var(self, variable: tk.Variable, default: float) -> float:
+        try:
+            return float(variable.get())
+        except (tk.TclError, TypeError, ValueError):
+            return default
+
+    def collect_settings(self) -> dict[str, object]:
+        """Collect the last-used user settings that should persist between runs."""
+
+        return {
+            "window_geometry": self.geometry(),
+            "threshold": self.safe_int_from_var(self.threshold_var, 127),
+            "blur": self.safe_int_from_var(self.blur_var, 3),
+            "min_area": self.safe_float_from_var(self.min_area_var, 1000.0),
+            "simplify_percent": self.safe_float_from_var(self.simplify_var, 0.05),
+            "invert": bool(self.invert_var.get()),
+            "show_threshold": bool(self.show_threshold_var.get()),
+            "export_origin_label": str(self.export_origin_var.get()),
+            "export_margin_inches": self.safe_float_from_var(self.export_margin_var, 0.0),
+            "last_image_dir": str(self.settings.get("last_image_dir", Path.home())),
+            "last_export_dir": str(self.settings.get("last_export_dir", Path.cwd() / "exports")),
+        }
+
+    def queue_save_settings(self) -> None:
+        """Debounce settings saves so slider movement does not write constantly."""
+
+        if self._settings_save_job is not None:
+            self.after_cancel(self._settings_save_job)
+        self._settings_save_job = self.after(500, self.save_settings_now)
+
+    def save_settings_now(self) -> None:
+        self._settings_save_job = None
+        self.settings.update(self.collect_settings())
+        save_settings(self.settings)
+
+    def on_close(self) -> None:
+        if self._settings_save_job is not None:
+            self.after_cancel(self._settings_save_job)
+            self._settings_save_job = None
+        self.save_settings_now()
+        self.destroy()
+
     def set_status(self, text: str) -> None:
         self.status_text.configure(state=tk.NORMAL)
         self.status_text.delete("1.0", tk.END)
@@ -281,8 +359,13 @@ class FabScanApp(tk.Tk):
         self.status_text.see(tk.END)
 
     def load_image(self) -> None:
+        initial_dir = Path(str(self.settings.get("last_image_dir", Path.home())))
+        if not initial_dir.exists():
+            initial_dir = Path.home()
+
         path = filedialog.askopenfilename(
             title="Load part image",
+            initialdir=str(initial_dir),
             filetypes=(
                 ("Image files", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
                 ("All files", "*.*"),
@@ -297,6 +380,9 @@ class FabScanApp(tk.Tk):
             return
 
         self.image_path = Path(path)
+        self.settings["last_image_dir"] = str(self.image_path.parent)
+        self.queue_save_settings()
+
         self.image_bgr = image
         self.processed = None
         self.scale_result = None
@@ -694,15 +780,22 @@ class FabScanApp(tk.Tk):
         if self.image_path is not None:
             default_name = self.image_path.stem + ".dxf"
 
+        initial_export_dir = Path(str(self.settings.get("last_export_dir", Path.cwd() / "exports")))
+        if not initial_export_dir.exists():
+            initial_export_dir.mkdir(parents=True, exist_ok=True)
+
         path = filedialog.asksaveasfilename(
             title="Export DXF",
             defaultextension=".dxf",
             initialfile=default_name,
-            initialdir=str(Path.cwd() / "exports"),
+            initialdir=str(initial_export_dir),
             filetypes=(("DXF files", "*.dxf"), ("All files", "*.*")),
         )
         if not path:
             return
+
+        self.settings["last_export_dir"] = str(Path(path).parent)
+        self.queue_save_settings()
 
         try:
             image_height = int(self.image_bgr.shape[0])
