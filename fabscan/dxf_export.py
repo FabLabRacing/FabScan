@@ -172,3 +172,36 @@ def export_contours_to_dxf(
 
     doc.saveas(output_path)
     return output_path
+
+def export_trace_points_to_dxf(
+    points: list[Tuple[float, float, float]] | list[Tuple[float, float]],
+    output_path: str | Path,
+    close: bool = True,
+    layer_name: str = "TRACE",
+) -> Path:
+    """Export manually captured CNC XY trace points to a simple DXF polyline.
+
+    The points are expected to already be in machine/work units. FabScan sets
+    the DXF units to inches because the target plasma workflow is inch-based.
+    Z is accepted for display/capture history but ignored for 2D DXF export.
+    """
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(points) < 2:
+        raise ValueError("At least two trace points are required for DXF export")
+
+    doc = ezdxf.new("R2010")
+    doc.units = ezdxf.units.IN
+    msp = doc.modelspace()
+
+    if layer_name not in doc.layers:
+        doc.layers.new(name=layer_name)
+
+    xy_points = [(float(point[0]), float(point[1])) for point in points]
+    msp.add_lwpolyline(xy_points, close=bool(close), dxfattribs={"layer": layer_name})
+
+    doc.saveas(output_path)
+    return output_path
+

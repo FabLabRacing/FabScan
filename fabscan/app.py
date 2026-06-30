@@ -12,16 +12,22 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from fabscan.camera_capture import CameraCaptureDialog
-from fabscan.dxf_export import ExportOriginMode, export_contours_to_dxf, get_export_bbox_for_contours
+from fabscan.dxf_export import (
+    ExportOriginMode,
+    export_contours_to_dxf,
+    export_trace_points_to_dxf,
+    get_export_bbox_for_contours,
+)
 from fabscan.image_processing import FoundContour, ProcessedImage, find_contours
+from fabscan.linuxcnc_status import LinuxCNCPositionStatus, LinuxCNCStatusReader
 from fabscan.scale_tools import ScaleResult, calculate_scale
 from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings, save_settings
 
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.2.3"
-APP_TITLE = f"FabScan v{APP_VERSION} - Polish / Stability"
+APP_VERSION = "0.3.0"
+APP_TITLE = f"FabScan v{APP_VERSION} - LinuxCNC Manual Trace"
 
 
 class FabScanApp(tk.Tk):
@@ -52,6 +58,11 @@ class FabScanApp(tk.Tk):
         self.scale_mode = False
         self.selected_contour_id: Optional[int] = None
 
+        self.linuxcnc_reader = LinuxCNCStatusReader()
+        self.latest_linuxcnc_status: Optional[LinuxCNCPositionStatus] = None
+        self.linuxcnc_auto_refresh_job: Optional[str] = None
+        self.trace_points: list[tuple[float, float, float]] = []
+
         self.display_scale = 1.0
         self.display_offset_x = 0.0
         self.display_offset_y = 0.0
@@ -75,6 +86,20 @@ class FabScanApp(tk.Tk):
         self.export_origin_var = tk.StringVar(value=origin_label)
         self.export_margin_var = tk.DoubleVar(value=float(self.settings.get("export_margin_inches", 0.0)))
 
+        linuxcnc_coord_label = str(self.settings.get("linuxcnc_coord_mode_label", "Work coordinates"))
+        if linuxcnc_coord_label not in ("Work coordinates", "Machine coordinates"):
+            linuxcnc_coord_label = "Work coordinates"
+        self.linuxcnc_coord_mode_var = tk.StringVar(value=linuxcnc_coord_label)
+        self.linuxcnc_auto_refresh_var = tk.BooleanVar(value=bool(self.settings.get("linuxcnc_auto_refresh", False)))
+        self.trace_closed_var = tk.BooleanVar(value=bool(self.settings.get("trace_closed", True)))
+        self.linuxcnc_status_var = tk.StringVar(value="Not polled")
+        self.linuxcnc_state_var = tk.StringVar(value="—")
+        self.linuxcnc_homed_var = tk.StringVar(value="—")
+        self.linuxcnc_x_var = tk.StringVar(value="—")
+        self.linuxcnc_y_var = tk.StringVar(value="—")
+        self.linuxcnc_z_var = tk.StringVar(value="—")
+        self.trace_count_var = tk.StringVar(value="0 points")
+
         contour_filter_label = str(self.settings.get("contour_filter_label", "All"))
         if contour_filter_label not in ("All", "Enabled only", "Disabled only", "OUTSIDE", "INSIDE"):
             contour_filter_label = "All"
@@ -89,6 +114,8 @@ class FabScanApp(tk.Tk):
         self._build_ui()
         self._register_settings_traces()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self.linuxcnc_auto_refresh_var.get():
+            self.schedule_linuxcnc_auto_refresh()
 
     def _build_menu(self) -> None:
         """Create simple menus for help/about and reset actions."""
@@ -117,6 +144,7 @@ class FabScanApp(tk.Tk):
         ttk.Button(toolbar, text="Find Contours", command=self.process_image).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Set Scale", command=self.start_scale_mode).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Export DXF", command=self.export_dxf).pack(side=tk.LEFT, padx=6)
+        ttk.Button(toolbar, text="Refresh LinuxCNC", command=self.refresh_linuxcnc_status).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Reset Defaults", command=self.reset_recommended_defaults).pack(side=tk.LEFT, padx=(18, 6))
         ttk.Button(toolbar, text="Help", command=self.show_workflow_help).pack(side=tk.LEFT, padx=6)
 
@@ -288,6 +316,8 @@ class FabScanApp(tk.Tk):
             wraplength=300,
         ).pack(anchor=tk.W, pady=(6, 0))
 
+        self._build_linuxcnc_trace_panel(side)
+
         export_frame = ttk.LabelFrame(side, text="DXF Export", padding=6)
         export_frame.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
 
@@ -326,7 +356,7 @@ class FabScanApp(tk.Tk):
 
         self.set_status(
             "Load a clean photo/scan of a flat part.\n\n"
-            "Tip: For Ver. 0.1, a high-contrast image with the part separated "
+            "Tip: For image tracing, a high-contrast image with the part separated "
             "from the background will work best."
         )
         self.set_measurements(
@@ -392,6 +422,296 @@ class FabScanApp(tk.Tk):
         entry = ttk.Entry(frame, textvariable=variable, width=10)
         entry.pack(anchor=tk.W, pady=(2, 0))
 
+    def _build_linuxcnc_trace_panel(self, side: ttk.Frame) -> None:
+        """Build the read-only LinuxCNC position and manual trace controls."""
+
+        trace_frame = ttk.LabelFrame(side, text="LinuxCNC / Manual Trace", padding=6)
+        trace_frame.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+
+        status_grid = ttk.Frame(trace_frame)
+        status_grid.pack(fill=tk.X)
+
+        ttk.Label(status_grid, text="Status").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(status_grid, textvariable=self.linuxcnc_status_var).grid(row=0, column=1, sticky=tk.W)
+        ttk.Label(status_grid, text="State").grid(row=1, column=0, sticky=tk.W)
+        ttk.Label(status_grid, textvariable=self.linuxcnc_state_var).grid(row=1, column=1, sticky=tk.W)
+        ttk.Label(status_grid, text="Homed").grid(row=2, column=0, sticky=tk.W)
+        ttk.Label(status_grid, textvariable=self.linuxcnc_homed_var).grid(row=2, column=1, sticky=tk.W)
+        status_grid.columnconfigure(1, weight=1)
+
+        coord_row = ttk.Frame(trace_frame)
+        coord_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(coord_row, text="Capture").pack(side=tk.LEFT)
+        coord_combo = ttk.Combobox(
+            coord_row,
+            textvariable=self.linuxcnc_coord_mode_var,
+            values=("Work coordinates", "Machine coordinates"),
+            state="readonly",
+            width=20,
+        )
+        coord_combo.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(6, 0))
+        coord_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_linuxcnc_display())
+
+        position_grid = ttk.Frame(trace_frame)
+        position_grid.pack(fill=tk.X, pady=(6, 0))
+        for column, label in enumerate(("X", "Y", "Z")):
+            ttk.Label(position_grid, text=label).grid(row=0, column=column, sticky=tk.W)
+        ttk.Label(position_grid, textvariable=self.linuxcnc_x_var, width=10).grid(row=1, column=0, sticky=tk.W)
+        ttk.Label(position_grid, textvariable=self.linuxcnc_y_var, width=10).grid(row=1, column=1, sticky=tk.W)
+        ttk.Label(position_grid, textvariable=self.linuxcnc_z_var, width=10).grid(row=1, column=2, sticky=tk.W)
+        for column in range(3):
+            position_grid.columnconfigure(column, weight=1)
+
+        refresh_row = ttk.Frame(trace_frame)
+        refresh_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(refresh_row, text="Refresh Position", command=self.refresh_linuxcnc_status).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Checkbutton(
+            refresh_row,
+            text="Auto",
+            variable=self.linuxcnc_auto_refresh_var,
+            command=self.on_linuxcnc_auto_refresh_changed,
+        ).pack(side=tk.LEFT, padx=(3, 0))
+
+        capture_row = ttk.Frame(trace_frame)
+        capture_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(capture_row, text="Capture Point", command=self.capture_trace_point).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Button(capture_row, text="Undo", command=self.undo_trace_point).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=3
+        )
+        ttk.Button(capture_row, text="Clear", command=self.clear_trace_points).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
+        )
+
+        columns = ("n", "x", "y", "z")
+        self.trace_tree = ttk.Treeview(
+            trace_frame,
+            columns=columns,
+            show="headings",
+            height=6,
+            selectmode="browse",
+        )
+        self.trace_tree.heading("n", text="#")
+        self.trace_tree.heading("x", text="X")
+        self.trace_tree.heading("y", text="Y")
+        self.trace_tree.heading("z", text="Z")
+        self.trace_tree.column("n", width=34, anchor=tk.E, stretch=False)
+        self.trace_tree.column("x", width=76, anchor=tk.E, stretch=True)
+        self.trace_tree.column("y", width=76, anchor=tk.E, stretch=True)
+        self.trace_tree.column("z", width=76, anchor=tk.E, stretch=True)
+        self.trace_tree.pack(fill=tk.X, pady=(6, 0))
+
+        trace_footer = ttk.Frame(trace_frame)
+        trace_footer.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(trace_footer, textvariable=self.trace_count_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(trace_footer, text="Closed", variable=self.trace_closed_var).pack(side=tk.RIGHT)
+
+        ttk.Button(trace_frame, text="Export Manual Trace DXF", command=self.export_trace_dxf).pack(
+            fill=tk.X, pady=(6, 0)
+        )
+
+        ttk.Label(
+            trace_frame,
+            text="Read-only in v0.3.0: jog with LinuxCNC, then capture points here. FabScan sends no motion commands.",
+            wraplength=300,
+        ).pack(anchor=tk.W, pady=(6, 0))
+
+    def on_linuxcnc_auto_refresh_changed(self) -> None:
+        self.queue_save_settings()
+        if self.linuxcnc_auto_refresh_var.get():
+            self.schedule_linuxcnc_auto_refresh()
+        elif self.linuxcnc_auto_refresh_job is not None:
+            self.after_cancel(self.linuxcnc_auto_refresh_job)
+            self.linuxcnc_auto_refresh_job = None
+
+    def schedule_linuxcnc_auto_refresh(self) -> None:
+        if self.linuxcnc_auto_refresh_job is not None:
+            self.after_cancel(self.linuxcnc_auto_refresh_job)
+        self.linuxcnc_auto_refresh_job = self.after(750, self._linuxcnc_auto_refresh_tick)
+
+    def _linuxcnc_auto_refresh_tick(self) -> None:
+        self.linuxcnc_auto_refresh_job = None
+        if not self.linuxcnc_auto_refresh_var.get():
+            return
+        self.refresh_linuxcnc_status(show_errors=False)
+        self.schedule_linuxcnc_auto_refresh()
+
+    def refresh_linuxcnc_status(self, show_errors: bool = True) -> None:
+        """Poll LinuxCNC status without sending any motion commands."""
+
+        status = self.linuxcnc_reader.read_status()
+        self.latest_linuxcnc_status = status
+        self.update_linuxcnc_display()
+
+        if show_errors and not status.connected:
+            messagebox.showinfo(
+                "LinuxCNC not connected",
+                status.error or "LinuxCNC status is not available.",
+                parent=self,
+            )
+
+    def update_linuxcnc_display(self) -> None:
+        status = self.latest_linuxcnc_status
+        if status is None:
+            self.linuxcnc_status_var.set("Not polled")
+            self.linuxcnc_state_var.set("—")
+            self.linuxcnc_homed_var.set("—")
+            self.linuxcnc_x_var.set("—")
+            self.linuxcnc_y_var.set("—")
+            self.linuxcnc_z_var.set("—")
+            return
+
+        if not status.available:
+            self.linuxcnc_status_var.set("Module missing")
+            self.linuxcnc_state_var.set("—")
+            self.linuxcnc_homed_var.set("—")
+            self.linuxcnc_x_var.set("—")
+            self.linuxcnc_y_var.set("—")
+            self.linuxcnc_z_var.set("—")
+            return
+
+        if not status.connected:
+            self.linuxcnc_status_var.set("Not connected")
+            self.linuxcnc_state_var.set("—")
+            self.linuxcnc_homed_var.set("—")
+            self.linuxcnc_x_var.set("—")
+            self.linuxcnc_y_var.set("—")
+            self.linuxcnc_z_var.set("—")
+            return
+
+        self.linuxcnc_status_var.set("Connected")
+        self.linuxcnc_state_var.set(f"{status.task_state} / {status.interp_state}")
+        self.linuxcnc_homed_var.set(status.homed_text)
+
+        position = self.get_active_linuxcnc_position(status)
+        self.linuxcnc_x_var.set(f"{position[0]:.4f}")
+        self.linuxcnc_y_var.set(f"{position[1]:.4f}")
+        self.linuxcnc_z_var.set(f"{position[2]:.4f}")
+
+    def get_active_linuxcnc_position(self, status: LinuxCNCPositionStatus) -> tuple[float, float, float]:
+        if self.linuxcnc_coord_mode_var.get() == "Machine coordinates":
+            return status.machine_position
+        return status.work_position
+
+    def capture_trace_point(self) -> None:
+        """Capture the current LinuxCNC X/Y/Z position into the manual trace list."""
+
+        self.refresh_linuxcnc_status(show_errors=False)
+        status = self.latest_linuxcnc_status
+        if status is None or not status.connected:
+            messagebox.showinfo(
+                "No LinuxCNC position",
+                (status.error if status is not None else None)
+                or "Could not read LinuxCNC position. Start LinuxCNC and try Refresh Position.",
+                parent=self,
+            )
+            return
+
+        position = self.get_active_linuxcnc_position(status)
+        self.trace_points.append(position)
+        self.refresh_trace_point_list()
+        self.append_status(
+            f"\nCaptured trace point {len(self.trace_points)}: "
+            f"X {position[0]:.4f}, Y {position[1]:.4f}, Z {position[2]:.4f} "
+            f"({self.linuxcnc_coord_mode_var.get()})"
+        )
+
+    def undo_trace_point(self) -> None:
+        if not self.trace_points:
+            return
+        removed = self.trace_points.pop()
+        self.refresh_trace_point_list()
+        self.append_status(
+            f"\nRemoved trace point: X {removed[0]:.4f}, Y {removed[1]:.4f}, Z {removed[2]:.4f}"
+        )
+
+    def clear_trace_points(self) -> None:
+        if not self.trace_points:
+            return
+        if not messagebox.askyesno("Clear trace points?", "Clear all manually captured trace points?", parent=self):
+            return
+        self.trace_points.clear()
+        self.refresh_trace_point_list()
+        self.append_status("\nManual trace points cleared.")
+
+    def refresh_trace_point_list(self) -> None:
+        for item in self.trace_tree.get_children():
+            self.trace_tree.delete(item)
+
+        for index, point in enumerate(self.trace_points, start=1):
+            self.trace_tree.insert(
+                "",
+                tk.END,
+                iid=str(index - 1),
+                values=(index, f"{point[0]:.4f}", f"{point[1]:.4f}", f"{point[2]:.4f}"),
+            )
+
+        point_word = "point" if len(self.trace_points) == 1 else "points"
+        self.trace_count_var.set(f"{len(self.trace_points)} {point_word}")
+        if self.trace_points:
+            self.trace_tree.see(str(len(self.trace_points) - 1))
+
+    def export_trace_dxf(self) -> None:
+        if len(self.trace_points) < 2:
+            messagebox.showinfo("Not enough points", "Capture at least two CNC points before exporting.", parent=self)
+            return
+
+        close_trace = bool(self.trace_closed_var.get())
+        if close_trace and len(self.trace_points) < 3:
+            messagebox.showinfo("Not enough points", "A closed trace needs at least three CNC points.", parent=self)
+            return
+
+        initial_export_dir = Path(str(self.settings.get("last_export_dir", Path.cwd() / "exports")))
+        if not initial_export_dir.exists():
+            initial_export_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"fabscan_manual_trace_{timestamp}.dxf"
+
+        path = filedialog.asksaveasfilename(
+            title="Export Manual Trace DXF",
+            defaultextension=".dxf",
+            initialfile=default_name,
+            initialdir=str(initial_export_dir),
+            filetypes=(("DXF files", "*.dxf"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+
+        self.settings["last_export_dir"] = str(Path(path).parent)
+        self.queue_save_settings()
+
+        try:
+            output = export_trace_points_to_dxf(
+                self.trace_points,
+                output_path=path,
+                close=close_trace,
+                layer_name="TRACE",
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Trace DXF export failed", str(exc), parent=self)
+            return
+
+        xs = [point[0] for point in self.trace_points]
+        ys = [point[1] for point in self.trace_points]
+        width = max(xs) - min(xs)
+        height = max(ys) - min(ys)
+        export_message = (
+            "Manual trace DXF exported successfully.\n"
+            f"File: {output}\n"
+            f"Layer: TRACE\n"
+            f"Points: {len(self.trace_points)}\n"
+            f"Closed: {'Yes' if close_trace else 'No'}\n"
+            f"Coordinate source: {self.linuxcnc_coord_mode_var.get()}\n"
+            f"Trace bbox: {width:.4f} x {height:.4f}\n\n"
+            "Next: import the DXF into SheetCam/CAD and verify the measured geometry."
+        )
+        self.append_status("\n" + export_message)
+        messagebox.showinfo("Trace DXF exported", export_message, parent=self)
+
     def _register_settings_traces(self) -> None:
         """Save control/export settings shortly after the user changes them."""
 
@@ -409,6 +729,9 @@ class FabScanApp(tk.Tk):
             self.sanity_tolerance_var,
             self.export_origin_var,
             self.export_margin_var,
+            self.linuxcnc_coord_mode_var,
+            self.linuxcnc_auto_refresh_var,
+            self.trace_closed_var,
             self.contour_filter_var,
             self.contour_sort_var,
         )
@@ -446,6 +769,9 @@ class FabScanApp(tk.Tk):
             "sanity_tolerance_inches": self.safe_float_from_var(self.sanity_tolerance_var, 0.010),
             "export_origin_label": str(self.export_origin_var.get()),
             "export_margin_inches": self.safe_float_from_var(self.export_margin_var, 0.0),
+            "linuxcnc_coord_mode_label": str(self.linuxcnc_coord_mode_var.get()),
+            "linuxcnc_auto_refresh": bool(self.linuxcnc_auto_refresh_var.get()),
+            "trace_closed": bool(self.trace_closed_var.get()),
             "contour_filter_label": str(self.contour_filter_var.get()),
             "contour_sort_label": str(self.contour_sort_var.get()),
             "last_image_dir": str(self.settings.get("last_image_dir", Path.home())),
@@ -479,6 +805,9 @@ class FabScanApp(tk.Tk):
         if self._settings_save_job is not None:
             self.after_cancel(self._settings_save_job)
             self._settings_save_job = None
+        if self.linuxcnc_auto_refresh_job is not None:
+            self.after_cancel(self.linuxcnc_auto_refresh_job)
+            self.linuxcnc_auto_refresh_job = None
         self.save_settings_now()
         self.destroy()
 
@@ -513,6 +842,11 @@ class FabScanApp(tk.Tk):
             "5. Click Set Scale, pick two known points, and enter the real distance.\n"
             "6. Use the X/Y Sanity Check against known CNC/part dimensions.\n"
             "7. Export DXF and bring it into SheetCam/CAD for final cleanup.\n\n"
+            "Manual CNC trace workflow:\n"
+            "1. Start LinuxCNC normally and jog with QtPlasmaC/LinuxCNC.\n"
+            "2. Use Refresh LinuxCNC to read position.\n"
+            "3. Jog to each point and click Capture Point.\n"
+            "4. Export Manual Trace DXF when done. FabScan does not command motion in v0.3.0.\n\n"
             "Tips:\n"
             "- Keep cleanup values low unless the camera image is ugly.\n"
             "- Use Show Threshold to see what FabScan is actually tracing.\n"
@@ -527,8 +861,9 @@ class FabScanApp(tk.Tk):
         messagebox.showinfo(
             "About FabScan",
             f"FabScan v{APP_VERSION}\n\n"
-            "Photo/camera-to-DXF helper for flat plasma parts.\n\n"
+            "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
+            "v0.3.0 LinuxCNC support is read-only position capture. It does not command machine motion.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )
