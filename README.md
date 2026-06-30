@@ -1,48 +1,48 @@
-# FabScan v0.2.2 - Camera Capture Aids
+# FabScan v0.2.3 - Polish / Stability
 
-This update adds camera alignment/orientation tools to the camera capture window.
+This update keeps the working v0.2.2 camera/DXF workflow and adds small usability improvements.
 
 ## Added
 
-- Live crosshair overlay.
-- X+ / Y+ axis direction labels.
-- Optional grid overlay.
-- Camera orientation controls:
-  - Rotate 0 / 90 / 180 / 270 degrees.
-  - Flip X.
-  - Flip Y.
-  - Fine rotation from -10.0 to +10.0 degrees.
-  - Fine adjustment buttons: -1, -0.1, 0, +0.1, +1 degree.
-- Captured PNGs are saved after the orientation transform is applied.
-- Preview overlays are not saved into the captured PNG.
-- Camera aid settings are saved in `~/.config/fabscan/settings.json`.
+- Version number in the main window title.
+- **Help > Basic Workflow** menu item.
+- **Help > About FabScan** menu item.
+- Toolbar **Help** button.
+- Toolbar/menu **Reset Recommended Defaults** action.
+- Better status text after loading/capturing an image.
+- Better DXF export summary after saving a DXF.
 
-## Camera workflow
+## Reset Recommended Defaults
 
-1. Click **Camera Capture**.
-2. Open the camera.
-3. Use rotate/flip/fine-rotation until the preview lines up with the intended machine/CAD axes.
-4. Use the crosshair and axis labels as a setup aid.
-5. Click **Capture Frame**.
-6. Continue with the normal FabScan workflow:
-   - Threshold / cleanup.
-   - Find Contours.
-   - Enable/disable contours.
-   - Set Scale.
-   - Run X/Y Sanity Check.
-   - Export DXF.
+The reset action restores the main tracing/export controls:
 
-## Axis convention
+- Threshold
+- Blur
+- Noise Removal
+- Edge Cleanup
+- Min Area
+- Simplify %
+- Invert
+- Show Threshold
+- X/Y sanity check fields
+- DXF origin/margin
+- Contour list show/sort
 
-In the transformed camera preview:
+It intentionally keeps camera orientation/settings, camera size, last folders, and window position.
 
-- `X+` points right.
-- `Y+` points up.
+## Basic workflow
 
-That matches the intended DXF/CAD orientation after FabScan exports the geometry.
+1. Load Image or use Camera Capture.
+2. Adjust Threshold / Blur / Noise Removal / Edge Cleanup.
+3. Click Find Contours.
+4. Enable/disable contours so only wanted geometry exports.
+5. Click Set Scale, pick two known points, and enter the real distance.
+6. Use the X/Y Sanity Check against known CNC/part dimensions.
+7. Export DXF and bring it into SheetCam/CAD for final cleanup.
 
 ## Notes
 
-Fine rotation is only for small camera-mount alignment errors. It helps make the image square to the desired X/Y axes, but it does not correct camera perspective or lens distortion.
-
-For best results, keep the camera as square to the part/background as possible and use even lighting.
+- Disabled contours stay visible in gray but do not export.
+- Use **Show Threshold** to see what FabScan is actually tracing.
+- Keep cleanup values low unless the camera image is ugly.
+- X+ is right and Y+ is up in the transformed camera preview.

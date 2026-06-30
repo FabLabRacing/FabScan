@@ -15,14 +15,17 @@ from fabscan.camera_capture import CameraCaptureDialog
 from fabscan.dxf_export import ExportOriginMode, export_contours_to_dxf, get_export_bbox_for_contours
 from fabscan.image_processing import FoundContour, ProcessedImage, find_contours
 from fabscan.scale_tools import ScaleResult, calculate_scale
-from fabscan.settings import get_settings_path, load_settings, save_settings
+from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings, save_settings
 
 
 ImagePoint = Tuple[float, float]
 
+APP_VERSION = "0.2.3"
+APP_TITLE = f"FabScan v{APP_VERSION} - Polish / Stability"
+
 
 class FabScanApp(tk.Tk):
-    """FabScan Ver. 0.2.0 desktop app.
+    """FabScan desktop app.
 
     This intentionally favors simple and debuggable over pretty. The goal is to
     prove the photo/scan -> contours -> scaled DXF workflow, with manual contour
@@ -34,7 +37,7 @@ class FabScanApp(tk.Tk):
         self.settings = load_settings()
         self._settings_save_job: Optional[str] = None
 
-        self.title("FabScan Ver. 0.2.2 - Camera Capture Aids")
+        self.title(APP_TITLE)
         try:
             self.geometry(str(self.settings.get("window_geometry", "1280x820")))
         except tk.TclError:
@@ -82,9 +85,28 @@ class FabScanApp(tk.Tk):
         self.contour_filter_var = tk.StringVar(value=contour_filter_label)
         self.contour_sort_var = tk.StringVar(value=contour_sort_label)
 
+        self._build_menu()
         self._build_ui()
         self._register_settings_traces()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _build_menu(self) -> None:
+        """Create simple menus for help/about and reset actions."""
+
+        menubar = tk.Menu(self)
+
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="Reset Recommended Defaults", command=self.reset_recommended_defaults)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="Basic Workflow", command=self.show_workflow_help)
+        help_menu.add_command(label="About FabScan", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+
+        self.configure(menu=menubar)
 
     def _build_ui(self) -> None:
         toolbar = ttk.Frame(self, padding=8)
@@ -95,6 +117,8 @@ class FabScanApp(tk.Tk):
         ttk.Button(toolbar, text="Find Contours", command=self.process_image).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Set Scale", command=self.start_scale_mode).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Export DXF", command=self.export_dxf).pack(side=tk.LEFT, padx=6)
+        ttk.Button(toolbar, text="Reset Defaults", command=self.reset_recommended_defaults).pack(side=tk.LEFT, padx=(18, 6))
+        ttk.Button(toolbar, text="Help", command=self.show_workflow_help).pack(side=tk.LEFT, padx=6)
 
         ttk.Checkbutton(
             toolbar,
@@ -476,6 +500,86 @@ class FabScanApp(tk.Tk):
         self.status_text.configure(state=tk.DISABLED)
         self.status_text.see(tk.END)
 
+    def show_workflow_help(self) -> None:
+        """Show the basic FabScan workflow in a small help dialog."""
+
+        messagebox.showinfo(
+            "FabScan Basic Workflow",
+            "Basic workflow:\n\n"
+            "1. Load Image or use Camera Capture.\n"
+            "2. Adjust Threshold / Blur / Noise Removal / Edge Cleanup.\n"
+            "3. Click Find Contours.\n"
+            "4. Enable/disable contours so only wanted geometry exports.\n"
+            "5. Click Set Scale, pick two known points, and enter the real distance.\n"
+            "6. Use the X/Y Sanity Check against known CNC/part dimensions.\n"
+            "7. Export DXF and bring it into SheetCam/CAD for final cleanup.\n\n"
+            "Tips:\n"
+            "- Keep cleanup values low unless the camera image is ugly.\n"
+            "- Use Show Threshold to see what FabScan is actually tracing.\n"
+            "- Disabled contours stay visible in gray but do not export.\n"
+            "- X+ is right and Y+ is up in the transformed camera preview.",
+            parent=self,
+        )
+
+    def show_about(self) -> None:
+        """Show version/about information."""
+
+        messagebox.showinfo(
+            "About FabScan",
+            f"FabScan v{APP_VERSION}\n\n"
+            "Photo/camera-to-DXF helper for flat plasma parts.\n\n"
+            "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
+            f"Settings file:\n{get_settings_path()}",
+            parent=self,
+        )
+
+    def reset_recommended_defaults(self) -> None:
+        """Reset normal tracing/export controls to known-good default values."""
+
+        confirm = messagebox.askyesno(
+            "Reset defaults?",
+            "Reset the main FabScan tracing/export controls to recommended defaults?\n\n"
+            "Camera orientation, camera size, last folders, and window position will be kept.",
+            parent=self,
+        )
+        if not confirm:
+            return
+
+        # Main image-processing controls.
+        self.threshold_var.set(int(DEFAULT_SETTINGS["threshold"]))
+        self.blur_var.set(int(DEFAULT_SETTINGS["blur"]))
+        self.noise_removal_var.set(int(DEFAULT_SETTINGS["noise_removal"]))
+        self.edge_cleanup_var.set(int(DEFAULT_SETTINGS["edge_cleanup"]))
+        self.min_area_var.set(float(DEFAULT_SETTINGS["min_area"]))
+        self.simplify_var.set(float(DEFAULT_SETTINGS["simplify_percent"]))
+        self.invert_var.set(bool(DEFAULT_SETTINGS["invert"]))
+        self.show_threshold_var.set(bool(DEFAULT_SETTINGS["show_threshold"]))
+
+        # Measurement/export/list controls.
+        self.sanity_expected_width_var.set(float(DEFAULT_SETTINGS["sanity_expected_width_inches"]))
+        self.sanity_expected_height_var.set(float(DEFAULT_SETTINGS["sanity_expected_height_inches"]))
+        self.sanity_tolerance_var.set(float(DEFAULT_SETTINGS["sanity_tolerance_inches"]))
+        self.export_origin_var.set(str(DEFAULT_SETTINGS["export_origin_label"]))
+        self.export_margin_var.set(float(DEFAULT_SETTINGS["export_margin_inches"]))
+        self.contour_filter_var.set(str(DEFAULT_SETTINGS["contour_filter_label"]))
+        self.contour_sort_var.set(str(DEFAULT_SETTINGS["contour_sort_label"]))
+
+        # Existing contours were created using the old controls, so clear them.
+        self.processed = None
+        self.selected_contour_id = None
+        self.scale_points = []
+        self.scale_mode = False
+
+        self.refresh_contour_list()
+        self.update_measurements()
+        self.redraw_preview()
+        self.queue_save_settings()
+        self.set_status(
+            "Recommended defaults restored.\n\n"
+            "Camera orientation/settings were left alone.\n"
+            "Click Find Contours to process the current image with the restored settings."
+        )
+
     def load_image(self) -> None:
         initial_dir = Path(str(self.settings.get("last_image_dir", Path.home())))
         if not initial_dir.exists():
@@ -504,7 +608,7 @@ class FabScanApp(tk.Tk):
         self.set_current_image(
             image_bgr=image,
             image_path=image_path,
-            source_text=f"Loaded:\n{image_path.name}",
+            source_text=f"Loaded image:\n{image_path}\n\nNext: adjust cleanup, click Find Contours, then set scale.",
         )
 
     def capture_camera_image(self) -> None:
@@ -572,10 +676,20 @@ class FabScanApp(tk.Tk):
         if saved:
             self.settings["last_capture_dir"] = str(output_path.parent)
             image_path = output_path
-            source_text = f"Captured from camera {dialog.result.camera_index}:\n{output_path.name}\n{orientation_text}"
+            source_text = (
+                f"Captured from camera {dialog.result.camera_index}.\n"
+                f"Saved PNG:\n{output_path}\n"
+                f"Orientation: {orientation_text}\n\n"
+                "Next: adjust cleanup, click Find Contours, then set scale."
+            )
         else:
             image_path = Path(f"fabscan_camera_{timestamp}.png")
-            source_text = f"Captured from camera {dialog.result.camera_index}:\nnot saved to disk\n{orientation_text}"
+            source_text = (
+                f"Captured from camera {dialog.result.camera_index}.\n"
+                "Warning: frame was not saved to disk.\n"
+                f"Orientation: {orientation_text}\n\n"
+                "Next: adjust cleanup, click Find Contours, then set scale."
+            )
 
         self.queue_save_settings()
         self.set_current_image(
@@ -1168,12 +1282,40 @@ class FabScanApp(tk.Tk):
             messagebox.showerror("DXF export failed", str(exc))
             return
 
-        self.append_status(
-            f"\nDXF exported:\n{output}\n"
-            f"Contours exported: {len(enabled_contours)}\n"
-            f"Origin: {self.format_export_origin()}"
+        enabled_outside = sum(1 for contour in enabled_contours if contour.layer == "OUTSIDE")
+        enabled_inside = sum(1 for contour in enabled_contours if contour.layer == "INSIDE")
+        enabled_points = sum(len(contour.points) for contour in enabled_contours)
+
+        export_lines = [
+            "DXF exported successfully.",
+            f"File: {output}",
+            f"Contours: {len(enabled_contours)} total ({enabled_outside} OUTSIDE, {enabled_inside} INSIDE)",
+            f"Points: {enabled_points}",
+            f"Scale: {self.scale_result.inches_per_pixel:.8f} in/px",
+            f"Origin: {self.format_export_origin()}",
+        ]
+
+        dxf_bbox = get_export_bbox_for_contours(
+            contours=enabled_contours,
+            scale_inches_per_pixel=self.scale_result.inches_per_pixel,
+            image_height_pixels=image_height,
+            origin_mode=self.get_export_origin_mode(),
+            margin_inches=self.get_export_margin_inches(),
         )
-        messagebox.showinfo("DXF exported", f"Saved:\n{output}")
+        if dxf_bbox is not None:
+            min_x, min_y, max_x, max_y, width_in, height_in = dxf_bbox
+            export_lines.extend(
+                [
+                    f"DXF size: {width_in:.4f} x {height_in:.4f} in",
+                    f"DXF X: {min_x:.4f} to {max_x:.4f} in",
+                    f"DXF Y: {min_y:.4f} to {max_y:.4f} in",
+                ]
+            )
+
+        export_lines.append("Next: import the DXF into SheetCam/CAD and run normal cleanup as needed.")
+        export_message = "\n".join(export_lines)
+        self.append_status("\n" + export_message)
+        messagebox.showinfo("DXF exported", export_message)
 
     def redraw_preview(self) -> None:
         self.canvas.delete("all")
