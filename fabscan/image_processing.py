@@ -32,11 +32,22 @@ def threshold_image(
     threshold_value: int = 127,
     blur_size: int = 3,
     invert: bool = False,
+    noise_removal: int = 0,
+    edge_cleanup: int = 0,
 ) -> np.ndarray:
     """Convert a BGR image to a clean black/white threshold image.
 
     OpenCV contour detection works best when the part/profile is white on a black
     background. Use `invert=True` when the part shows up dark on a light background.
+
+    The cleanup controls operate on the already-thresholded binary image:
+
+    - noise_removal performs a morphological open to remove small isolated white
+      specks and edge crumbs.
+    - edge_cleanup performs a morphological close to fill small black gaps/notches
+      in the white part/profile.
+
+    Keep both controls low. Large values can change real geometry.
     """
 
     if image_bgr is None:
@@ -54,7 +65,44 @@ def threshold_image(
 
     mode = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
     _, binary = cv2.threshold(gray, int(threshold_value), 255, mode)
+
+    binary = clean_binary_image(
+        binary,
+        noise_removal=noise_removal,
+        edge_cleanup=edge_cleanup,
+    )
     return binary
+
+
+def _cleanup_kernel(level: int) -> np.ndarray:
+    """Return a small ellipse kernel for cleanup level 1-5."""
+
+    level = max(0, min(5, int(level)))
+    # Level 1 -> 3 px, level 2 -> 5 px, ... level 5 -> 11 px.
+    size = (level * 2) + 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+
+def clean_binary_image(
+    binary: np.ndarray,
+    noise_removal: int = 0,
+    edge_cleanup: int = 0,
+) -> np.ndarray:
+    """Apply optional binary cleanup before contour detection."""
+
+    cleaned = binary.copy()
+
+    noise_level = max(0, min(5, int(noise_removal)))
+    if noise_level > 0:
+        kernel = _cleanup_kernel(noise_level)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+
+    edge_level = max(0, min(5, int(edge_cleanup)))
+    if edge_level > 0:
+        kernel = _cleanup_kernel(edge_level)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+
+    return cleaned
 
 
 def find_contours(
@@ -64,6 +112,8 @@ def find_contours(
     invert: bool = False,
     min_area: float = 100.0,
     simplify_percent: float = 0.05,
+    noise_removal: int = 0,
+    edge_cleanup: int = 0,
 ) -> ProcessedImage:
     """Find simplified contours suitable for a rough DXF export.
 
@@ -76,6 +126,8 @@ def find_contours(
         threshold_value=threshold_value,
         blur_size=blur_size,
         invert=invert,
+        noise_removal=noise_removal,
+        edge_cleanup=edge_cleanup,
     )
 
     # CHAIN_APPROX_NONE keeps full contour detail before our own simplification.
