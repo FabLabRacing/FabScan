@@ -13,33 +13,48 @@ Position3 = Tuple[float, float, float]
 
 @dataclass
 class LinuxCNCPositionStatus:
-    """Small, UI-friendly snapshot of LinuxCNC status.
-
-    FabScan uses this read-only. No motion commands live in this module.
-    """
+    """Small, UI-friendly snapshot of LinuxCNC status."""
 
     available: bool
     connected: bool
     error: Optional[str]
     task_state: str = "Unknown"
     interp_state: str = "Unknown"
+    task_mode: str = "Unknown"
     homed_text: str = "Unknown"
     all_xyz_homed: bool = False
     machine_position: Position3 = (0.0, 0.0, 0.0)
     work_position: Position3 = (0.0, 0.0, 0.0)
 
 
+@dataclass
+class LinuxCNCJogResult:
+    """Result of one FabScan-requested incremental jog."""
+
+    success: bool
+    message: str
+    status: Optional[LinuxCNCPositionStatus] = None
+
+
 class LinuxCNCStatusReader:
-    """Read LinuxCNC status safely and optionally from inside a venv.
+    """Read LinuxCNC status and send guarded incremental jogs.
+
+    FabScan keeps this deliberately conservative:
+    - status polling is always safe/read-only;
+    - jog support is X/Y incremental only;
+    - every jog checks LinuxCNC state before motion.
 
     The LinuxCNC Python module is commonly installed in the system Python
     dist-packages path. If FabScan is running from a virtual environment, this
     reader tries the normal import first, then tries common system paths.
     """
 
+    AXIS_TO_INDEX = {"X": 0, "Y": 1}
+
     def __init__(self) -> None:
         self._linuxcnc = None
         self._stat = None
+        self._command = None
         self._import_error: Optional[str] = None
         self._load_linuxcnc_module()
 
@@ -99,6 +114,7 @@ class LinuxCNCStatusReader:
             work_position = self._calculate_work_position(machine_position)
             task_state = self._task_state_text(getattr(self._stat, "task_state", None))
             interp_state = self._interp_state_text(getattr(self._stat, "interp_state", None))
+            task_mode = self._task_mode_text(getattr(self._stat, "task_mode", None))
             homed_values = list(getattr(self._stat, "homed", []))
             homed_text, all_xyz_homed = self._homed_text(homed_values)
         except Exception as exc:  # noqa: BLE001
@@ -114,18 +130,107 @@ class LinuxCNCStatusReader:
             error=None,
             task_state=task_state,
             interp_state=interp_state,
+            task_mode=task_mode,
             homed_text=homed_text,
             all_xyz_homed=all_xyz_homed,
             machine_position=machine_position,
             work_position=work_position,
         )
 
+    def incremental_jog(
+        self,
+        axis: str,
+        direction: int,
+        step_distance: float,
+        feed_per_minute: float,
+    ) -> LinuxCNCJogResult:
+        """Send one guarded X/Y incremental jog command.
+
+        Parameters are in the active LinuxCNC machine/user units. FabScan labels
+        the feed field as units/minute, then converts to units/second before
+        calling LinuxCNC's jog API.
+        """
+
+        axis = axis.upper().strip()
+        if axis not in self.AXIS_TO_INDEX:
+            return LinuxCNCJogResult(False, "FabScan v0.3.4 only supports X/Y jog buttons.")
+
+        direction = 1 if direction >= 0 else -1
+        step_distance = abs(float(step_distance))
+        feed_per_minute = abs(float(feed_per_minute))
+
+        if step_distance <= 0:
+            return LinuxCNCJogResult(False, "Jog step must be greater than zero.")
+        if step_distance > 1.0:
+            return LinuxCNCJogResult(False, "Jog step is limited to 1.000 machine unit per click in FabScan.")
+        if feed_per_minute <= 0:
+            return LinuxCNCJogResult(False, "Jog feed must be greater than zero.")
+        if feed_per_minute > 120.0:
+            return LinuxCNCJogResult(False, "Jog feed is limited to 120 units/minute in FabScan.")
+
+        status = self.read_status()
+        ok, message = self._ok_for_incremental_jog(status)
+        if not ok:
+            return LinuxCNCJogResult(False, message, status)
+
+        if self._linuxcnc is None:
+            return LinuxCNCJogResult(False, "LinuxCNC Python module is not available.", status)
+
+        try:
+            if self._command is None:
+                self._command = self._linuxcnc.command()
+
+            # Axis jogging in Cartesian/world mode requires teleop enabled on
+            # supported LinuxCNC versions. If unavailable, continue and let the
+            # jog command report any error.
+            try:
+                self._command.teleop_enable(True)
+                self._command.wait_complete(1.0)
+            except AttributeError:
+                pass
+
+            axis_index = self.AXIS_TO_INDEX[axis]
+            velocity_per_second = (feed_per_minute / 60.0) * direction
+            self._command.jog(
+                self._linuxcnc.JOG_INCREMENT,
+                False,  # False = axis Cartesian coordinate jog, not joint jog
+                axis_index,
+                velocity_per_second,
+                step_distance,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return LinuxCNCJogResult(False, f"LinuxCNC jog command failed: {exc}", status)
+
+        return LinuxCNCJogResult(
+            True,
+            f"Jogged {axis}{'+' if direction > 0 else '-'} {step_distance:.4f} at {feed_per_minute:.1f} units/min.",
+            self.read_status(),
+        )
+
+    def _ok_for_incremental_jog(self, status: LinuxCNCPositionStatus) -> tuple[bool, str]:
+        if not status.available:
+            return False, status.error or "LinuxCNC Python module is not available."
+        if not status.connected:
+            return False, status.error or "FabScan is not connected to LinuxCNC."
+        if status.task_state != "ON":
+            return False, f"LinuxCNC task state must be ON before jogging. Current state: {status.task_state}."
+        if status.interp_state != "IDLE":
+            return False, f"LinuxCNC interpreter must be IDLE before jogging. Current state: {status.interp_state}."
+        if status.task_mode != "MANUAL":
+            return False, (
+                "LinuxCNC task mode must already be MANUAL before FabScan jogs. "
+                f"Current mode: {status.task_mode}. Switch LinuxCNC/QtPlasmaC to manual/jog mode."
+            )
+        if not status.all_xyz_homed:
+            return False, f"X/Y/Z must be homed before FabScan jogs. Current homed state: {status.homed_text}."
+        return True, "OK"
+
     def _calculate_work_position(self, machine_position: Position3) -> Position3:
         """Calculate a practical work-coordinate display from LinuxCNC status.
 
-        LinuxCNC reports machine position plus active offsets. For this first
-        read-only FabScan trace workflow, subtracting G5x, G92, and tool offsets
-        gives the normal displayed work position for basic X/Y capture.
+        LinuxCNC reports machine position plus active offsets. For this FabScan
+        trace workflow, subtracting G5x, G92, and tool offsets gives the normal
+        displayed work position for basic X/Y capture.
         """
 
         g5x = self._position3(getattr(self._stat, "g5x_offset", (0.0, 0.0, 0.0)))
@@ -159,6 +264,15 @@ class LinuxCNCStatusReader:
             getattr(linuxcnc, "INTERP_READING", object()): "READING",
             getattr(linuxcnc, "INTERP_PAUSED", object()): "PAUSED",
             getattr(linuxcnc, "INTERP_WAITING", object()): "WAITING",
+        }
+        return mapping.get(value, str(value))
+
+    def _task_mode_text(self, value: object) -> str:
+        linuxcnc = self._linuxcnc
+        mapping = {
+            getattr(linuxcnc, "MODE_MANUAL", object()): "MANUAL",
+            getattr(linuxcnc, "MODE_MDI", object()): "MDI",
+            getattr(linuxcnc, "MODE_AUTO", object()): "AUTO",
         }
         return mapping.get(value, str(value))
 

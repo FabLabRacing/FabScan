@@ -1,62 +1,53 @@
-# FabScan v0.3.2 - Multi-Trace Manual Capture
+# FabScan v0.3.4 - Jog Mode Cleanup
 
-This update keeps the working camera/image-to-DXF workflow and improves the LinuxCNC manual trace workflow by allowing multiple separate traced contours.
+FabScan v0.3.4 cleans up the guarded X/Y incremental jog behavior added in v0.3.3.
 
-## Added
+## What this version changes
 
-- **Start New** button in the LinuxCNC / Manual Trace panel.
-- Multiple manual trace groups/contours.
-- Trace point list now shows trace number and point number.
-- Trace preview draws each trace group separately, without connecting one contour to the next.
-- Manual trace DXF export writes each trace group as a separate DXF polyline on layer `TRACE`.
+- Removes the forced LinuxCNC task-mode change before each jog.
+- Adds a task-mode display to the LinuxCNC / Manual Trace panel.
+- Refuses FabScan jogs unless LinuxCNC is already in `MANUAL` mode.
+- Adds a short jog-busy lockout after successful step jogs.
+- Improves jog status messages.
 
-## Why this matters
+## Why this patch exists
 
-This lets you trace shapes like:
+If FabScan asks LinuxCNC to switch task mode while an incremental jog is still active, LinuxCNC can report:
 
-- square inside a square
-- outside profile plus hole
-- outside profile plus slot
-- multiple disconnected reference shapes
+```text
+Ignoring task mode change while jogging
+```
 
-Use **Start New** after finishing one contour, then capture points for the next contour.
+FabScan should not be changing task modes during every jog. This version treats task mode as a required precondition instead:
 
-## Safety boundary
+1. Put LinuxCNC/QtPlasmaC in manual/jog mode.
+2. Enable FabScan jog controls.
+3. Use FabScan X/Y step jog buttons.
 
-FabScan v0.3.2 is still read-only with LinuxCNC.
+## Jog safety behavior
 
-It does **not**:
+FabScan will refuse to jog unless:
 
-- jog the machine
-- send MDI commands
-- move Z
-- fire the torch
-- start a program
-- change LinuxCNC state
+- LinuxCNC is connected.
+- LinuxCNC task state is ON.
+- LinuxCNC interpreter state is IDLE.
+- LinuxCNC task mode is MANUAL.
+- X/Y/Z show as homed.
+- Jog controls were explicitly enabled for this session.
+- The requested jog is X or Y only.
+- The requested step/feed are inside FabScan's conservative limits.
 
-Use LinuxCNC/QtPlasmaC to jog the table like normal, then capture points in FabScan.
+FabScan v0.3.4 still does not provide continuous jog, Z jog, torch commands, MDI moves, or program start.
 
-## Manual CNC trace workflow
+## Manual trace workflow
 
 1. Start LinuxCNC/QtPlasmaC normally.
-2. Home the machine and set work zero if you want the trace in work coordinates.
-3. Open FabScan.
-4. Turn on **Auto** refresh or click **Refresh Position**.
-5. Jog the machine in LinuxCNC/QtPlasmaC.
-6. Click **Capture Point** at each traced location.
-7. When one contour is done, click **Start New**.
-8. Capture points for the next contour.
-9. Choose **Closed** or open trace.
-10. Click **Export Manual Trace DXF**.
-
-The manual trace DXF exports on layer `TRACE` and uses the captured CNC X/Y coordinates directly.
-
-## Trace preview notes
-
-- `X+` points right.
-- `Y+` points up.
-- Active trace points are yellow with green connecting lines.
-- Previous trace groups are drawn separately in blue.
-- Point labels use `trace.point` format, such as `1.4` or `2.1`.
-- The red crosshair marks the latest live LinuxCNC position when enabled.
-- Uncheck **Trace Preview** to return the main canvas to image preview when image tracing.
+2. Home the machine and disable the torch/plasma output for tracing.
+3. Put LinuxCNC/QtPlasmaC in manual/jog mode.
+4. Open FabScan.
+5. Refresh LinuxCNC status and verify task mode shows `MANUAL`.
+6. Enable FabScan jog controls if you want to jog from FabScan.
+7. Use X/Y step jog buttons to move to a trace point.
+8. Click `Capture Point`.
+9. Use `Start New` for another contour, such as an inside cutout.
+10. Export the manual trace DXF.

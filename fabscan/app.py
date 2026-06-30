@@ -26,8 +26,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.3.2"
-APP_TITLE = f"FabScan v{APP_VERSION} - Multi-Trace Manual Capture"
+APP_VERSION = "0.3.4"
+APP_TITLE = f"FabScan v{APP_VERSION} - Jog Mode Cleanup"
 
 
 class FabScanApp(tk.Tk):
@@ -61,6 +61,8 @@ class FabScanApp(tk.Tk):
         self.linuxcnc_reader = LinuxCNCStatusReader()
         self.latest_linuxcnc_status: Optional[LinuxCNCPositionStatus] = None
         self.linuxcnc_auto_refresh_job: Optional[str] = None
+        self.jog_busy = False
+        self.jog_release_job: Optional[str] = None
         self.trace_groups: list[list[tuple[float, float, float]]] = [[]]
         self.active_trace_index = 0
 
@@ -96,8 +98,13 @@ class FabScanApp(tk.Tk):
         self.trace_preview_var = tk.BooleanVar(value=bool(self.settings.get("trace_preview", True)))
         self.trace_show_live_position_var = tk.BooleanVar(value=bool(self.settings.get("trace_show_live_position", True)))
         self.trace_show_point_numbers_var = tk.BooleanVar(value=bool(self.settings.get("trace_show_point_numbers", True)))
+        self.jog_controls_enabled_var = tk.BooleanVar(value=False)
+        self.jog_step_var = tk.DoubleVar(value=float(self.settings.get("jog_step", 0.010)))
+        self.jog_feed_var = tk.DoubleVar(value=float(self.settings.get("jog_feed_units_per_min", 10.0)))
+        self.jog_status_var = tk.StringVar(value="Jog disabled")
         self.linuxcnc_status_var = tk.StringVar(value="Not polled")
         self.linuxcnc_state_var = tk.StringVar(value="—")
+        self.linuxcnc_task_mode_var = tk.StringVar(value="—")
         self.linuxcnc_homed_var = tk.StringVar(value="—")
         self.linuxcnc_x_var = tk.StringVar(value="—")
         self.linuxcnc_y_var = tk.StringVar(value="—")
@@ -445,8 +452,10 @@ class FabScanApp(tk.Tk):
         ttk.Label(status_grid, textvariable=self.linuxcnc_status_var).grid(row=0, column=1, sticky=tk.W)
         ttk.Label(status_grid, text="State").grid(row=1, column=0, sticky=tk.W)
         ttk.Label(status_grid, textvariable=self.linuxcnc_state_var).grid(row=1, column=1, sticky=tk.W)
-        ttk.Label(status_grid, text="Homed").grid(row=2, column=0, sticky=tk.W)
-        ttk.Label(status_grid, textvariable=self.linuxcnc_homed_var).grid(row=2, column=1, sticky=tk.W)
+        ttk.Label(status_grid, text="Task mode").grid(row=2, column=0, sticky=tk.W)
+        ttk.Label(status_grid, textvariable=self.linuxcnc_task_mode_var).grid(row=2, column=1, sticky=tk.W)
+        ttk.Label(status_grid, text="Homed").grid(row=3, column=0, sticky=tk.W)
+        ttk.Label(status_grid, textvariable=self.linuxcnc_homed_var).grid(row=3, column=1, sticky=tk.W)
         status_grid.columnconfigure(1, weight=1)
 
         coord_row = ttk.Frame(trace_frame)
@@ -483,6 +492,49 @@ class FabScanApp(tk.Tk):
             variable=self.linuxcnc_auto_refresh_var,
             command=self.on_linuxcnc_auto_refresh_changed,
         ).pack(side=tk.LEFT, padx=(3, 0))
+
+        jog_frame = ttk.LabelFrame(trace_frame, text="FabScan Jog - X/Y Step Only", padding=6)
+        jog_frame.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Checkbutton(
+            jog_frame,
+            text="Enable jog controls",
+            variable=self.jog_controls_enabled_var,
+            command=self.on_jog_controls_enabled_changed,
+        ).pack(anchor=tk.W)
+
+        jog_settings = ttk.Frame(jog_frame)
+        jog_settings.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(jog_settings, text="Step").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(jog_settings, textvariable=self.jog_step_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=(4, 8))
+        ttk.Label(jog_settings, text="Feed/min").grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(jog_settings, textvariable=self.jog_feed_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=(4, 0))
+        jog_settings.columnconfigure(1, weight=1)
+        jog_settings.columnconfigure(3, weight=1)
+
+        jog_step_row = ttk.Frame(jog_frame)
+        jog_step_row.pack(fill=tk.X, pady=(4, 0))
+        for index, value in enumerate((0.001, 0.005, 0.010, 0.050, 0.100, 0.500)):
+            ttk.Button(
+                jog_step_row,
+                text=(f"{value:.3f}" if value < 0.1 else f"{value:.3f}".rstrip("0").rstrip(".")),
+                command=lambda step=value: self.set_jog_step(step),
+            ).grid(row=0, column=index, sticky=tk.EW, padx=(0 if index == 0 else 2, 0))
+            jog_step_row.columnconfigure(index, weight=1)
+
+        jog_pad = ttk.Frame(jog_frame)
+        jog_pad.pack(pady=(6, 0))
+        ttk.Button(jog_pad, text="Y+", width=7, command=lambda: self.incremental_jog("Y", +1)).grid(row=0, column=1, padx=2, pady=2)
+        ttk.Button(jog_pad, text="X-", width=7, command=lambda: self.incremental_jog("X", -1)).grid(row=1, column=0, padx=2, pady=2)
+        ttk.Button(jog_pad, text="X+", width=7, command=lambda: self.incremental_jog("X", +1)).grid(row=1, column=2, padx=2, pady=2)
+        ttk.Button(jog_pad, text="Y-", width=7, command=lambda: self.incremental_jog("Y", -1)).grid(row=2, column=1, padx=2, pady=2)
+
+        ttk.Label(jog_frame, textvariable=self.jog_status_var, wraplength=300).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(
+            jog_frame,
+            text="Guarded incremental moves only. LinuxCNC must already be in MANUAL mode. No Z, no torch, no continuous jog.",
+            wraplength=300,
+        ).pack(anchor=tk.W, pady=(2, 0))
 
         capture_row = ttk.Frame(trace_frame)
         capture_row.pack(fill=tk.X, pady=(6, 0))
@@ -556,7 +608,7 @@ class FabScanApp(tk.Tk):
 
         ttk.Label(
             trace_frame,
-            text="Read-only in v0.3.2: jog with LinuxCNC, capture points here, and use Start New for separate contours. FabScan sends no motion commands.",
+            text="v0.3.4: Start New creates separate contours. Jog buttons are guarded X/Y incremental moves only, require MANUAL mode, and will not force task mode changes.",
             wraplength=300,
         ).pack(anchor=tk.W, pady=(6, 0))
 
@@ -648,6 +700,7 @@ class FabScanApp(tk.Tk):
         if status is None:
             self.linuxcnc_status_var.set("Not polled")
             self.linuxcnc_state_var.set("—")
+            self.linuxcnc_task_mode_var.set("—")
             self.linuxcnc_homed_var.set("—")
             self.linuxcnc_x_var.set("—")
             self.linuxcnc_y_var.set("—")
@@ -657,6 +710,7 @@ class FabScanApp(tk.Tk):
         if not status.available:
             self.linuxcnc_status_var.set("Module missing")
             self.linuxcnc_state_var.set("—")
+            self.linuxcnc_task_mode_var.set("—")
             self.linuxcnc_homed_var.set("—")
             self.linuxcnc_x_var.set("—")
             self.linuxcnc_y_var.set("—")
@@ -666,6 +720,7 @@ class FabScanApp(tk.Tk):
         if not status.connected:
             self.linuxcnc_status_var.set("Not connected")
             self.linuxcnc_state_var.set("—")
+            self.linuxcnc_task_mode_var.set("—")
             self.linuxcnc_homed_var.set("—")
             self.linuxcnc_x_var.set("—")
             self.linuxcnc_y_var.set("—")
@@ -674,6 +729,7 @@ class FabScanApp(tk.Tk):
 
         self.linuxcnc_status_var.set("Connected")
         self.linuxcnc_state_var.set(f"{status.task_state} / {status.interp_state}")
+        self.linuxcnc_task_mode_var.set(status.task_mode)
         self.linuxcnc_homed_var.set(status.homed_text)
 
         position = self.get_active_linuxcnc_position(status)
@@ -685,6 +741,93 @@ class FabScanApp(tk.Tk):
         if self.linuxcnc_coord_mode_var.get() == "Machine coordinates":
             return status.machine_position
         return status.work_position
+
+    def on_jog_controls_enabled_changed(self) -> None:
+        """Require an explicit per-session acknowledgement before jog buttons move the machine."""
+
+        if bool(self.jog_controls_enabled_var.get()):
+            accepted = messagebox.askyesno(
+                "Enable FabScan jog controls?",
+                "FabScan jog buttons will move the machine in X/Y by the selected step.\n\n"
+                "Use only with the torch disabled, the table clear, and your hand near E-stop.\n\n"
+                "FabScan will still refuse to jog unless LinuxCNC is ON, IDLE, homed, and already in MANUAL mode.\n\n"
+                "Enable jog controls for this session?",
+                parent=self,
+            )
+            if not accepted:
+                self.jog_controls_enabled_var.set(False)
+                self.jog_status_var.set("Jog disabled")
+                return
+            self.jog_status_var.set("Jog enabled: X/Y incremental only")
+            self.append_status("\nFabScan jog controls enabled for this session.")
+        else:
+            self.jog_status_var.set("Jog disabled")
+            self.append_status("\nFabScan jog controls disabled.")
+        self.queue_save_settings()
+
+    def set_jog_step(self, step: float) -> None:
+        self.jog_step_var.set(float(step))
+        self.jog_status_var.set(f"Jog step set to {step:.4f}")
+
+    def incremental_jog(self, axis: str, direction: int) -> None:
+        """Send one guarded X/Y incremental jog through LinuxCNC."""
+
+        if not bool(self.jog_controls_enabled_var.get()):
+            self.jog_status_var.set("Jog disabled - check Enable jog controls first")
+            return
+
+        if self.jog_busy:
+            self.jog_status_var.set("Jog busy - wait for the current step to finish")
+            return
+
+        step = self.safe_float_from_var(self.jog_step_var, 0.010)
+        feed = self.safe_float_from_var(self.jog_feed_var, 10.0)
+
+        self.jog_busy = True
+        self.jog_status_var.set(f"Jogging {axis}{'+' if direction >= 0 else '-'} {abs(step):.4f}...")
+
+        result = self.linuxcnc_reader.incremental_jog(axis, direction, step, feed)
+        self.latest_linuxcnc_status = result.status or self.linuxcnc_reader.read_status()
+        self.update_linuxcnc_display()
+        self.redraw_preview()
+
+        self.jog_status_var.set(result.message)
+        self.append_status(f"\n{result.message}")
+
+        if result.success:
+            self.schedule_jog_release(step, feed)
+        else:
+            self.jog_busy = False
+            if self.jog_release_job is not None:
+                self.after_cancel(self.jog_release_job)
+                self.jog_release_job = None
+            messagebox.showinfo("FabScan jog refused", result.message, parent=self)
+
+    def schedule_jog_release(self, step: float, feed: float) -> None:
+        """Briefly lock out jog buttons so repeated clicks do not overlap step moves."""
+
+        if self.jog_release_job is not None:
+            self.after_cancel(self.jog_release_job)
+
+        step = abs(float(step))
+        feed = abs(float(feed))
+        if feed <= 0.0:
+            delay_seconds = 0.35
+        else:
+            units_per_second = feed / 60.0
+            delay_seconds = (step / units_per_second) + 0.25
+
+        delay_seconds = max(0.35, min(delay_seconds, 5.0))
+        self.jog_release_job = self.after(int(delay_seconds * 1000), self.release_jog_busy)
+
+    def release_jog_busy(self) -> None:
+        """Mark the jog panel ready for another incremental move."""
+
+        self.jog_release_job = None
+        self.jog_busy = False
+        if bool(self.jog_controls_enabled_var.get()):
+            self.jog_status_var.set("Jog ready")
+        self.refresh_linuxcnc_status(show_errors=False)
 
     def capture_trace_point(self) -> None:
         """Capture the current LinuxCNC X/Y/Z position into the active manual trace."""
@@ -870,6 +1013,9 @@ class FabScanApp(tk.Tk):
             self.trace_preview_var,
             self.trace_show_live_position_var,
             self.trace_show_point_numbers_var,
+            self.jog_controls_enabled_var,
+            self.jog_step_var,
+            self.jog_feed_var,
             self.contour_filter_var,
             self.contour_sort_var,
         )
@@ -913,6 +1059,9 @@ class FabScanApp(tk.Tk):
             "trace_preview": bool(self.trace_preview_var.get()),
             "trace_show_live_position": bool(self.trace_show_live_position_var.get()),
             "trace_show_point_numbers": bool(self.trace_show_point_numbers_var.get()),
+            "jog_controls_enabled": False,
+            "jog_step": self.safe_float_from_var(self.jog_step_var, 0.010),
+            "jog_feed_units_per_min": self.safe_float_from_var(self.jog_feed_var, 10.0),
             "contour_filter_label": str(self.contour_filter_var.get()),
             "contour_sort_label": str(self.contour_sort_var.get()),
             "last_image_dir": str(self.settings.get("last_image_dir", Path.home())),
@@ -984,12 +1133,12 @@ class FabScanApp(tk.Tk):
             "6. Use the X/Y Sanity Check against known CNC/part dimensions.\n"
             "7. Export DXF and bring it into SheetCam/CAD for final cleanup.\n\n"
             "Manual CNC trace workflow:\n"
-            "1. Start LinuxCNC normally and jog with QtPlasmaC/LinuxCNC.\n"
-            "2. Use Refresh LinuxCNC to read position.\n"
+            "1. Start LinuxCNC normally, home the machine, and keep the torch disabled.\n"
+            "2. Use Refresh LinuxCNC to read position. Optionally enable FabScan X/Y step jogs.\n"
             "3. Jog to each point and click Capture Point.\n"
             "4. Watch captured points in the Trace Preview canvas.\n"
             "5. Use Start New when tracing a separate contour, such as a hole inside an outside profile.\n"
-            "6. Export Manual Trace DXF when done. FabScan does not command motion in v0.3.2.\n\n"
+            "6. Export Manual Trace DXF when done. FabScan can do guarded X/Y incremental jogs in v0.3.4 when jog controls are explicitly enabled and LinuxCNC is already in MANUAL mode.\n\n"
             "Tips:\n"
             "- Keep cleanup values low unless the camera image is ugly.\n"
             "- Use Show Threshold to see what FabScan is actually tracing.\n"
@@ -1006,7 +1155,7 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
-            "v0.3.2 LinuxCNC support is read-only multi-contour position capture with live trace preview. It does not command machine motion.\n\n"
+            "v0.3.4 LinuxCNC support adds guarded X/Y incremental jog buttons, MANUAL-mode checks, multi-contour position capture, and live trace preview.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )
@@ -1044,6 +1193,14 @@ class FabScanApp(tk.Tk):
         self.trace_preview_var.set(bool(DEFAULT_SETTINGS["trace_preview"]))
         self.trace_show_live_position_var.set(bool(DEFAULT_SETTINGS["trace_show_live_position"]))
         self.trace_show_point_numbers_var.set(bool(DEFAULT_SETTINGS["trace_show_point_numbers"]))
+        self.jog_controls_enabled_var.set(False)
+        self.jog_busy = False
+        if self.jog_release_job is not None:
+            self.after_cancel(self.jog_release_job)
+            self.jog_release_job = None
+        self.jog_step_var.set(float(DEFAULT_SETTINGS["jog_step"]))
+        self.jog_feed_var.set(float(DEFAULT_SETTINGS["jog_feed_units_per_min"]))
+        self.jog_status_var.set("Jog disabled")
 
         # Existing contours were created using the old controls, so clear them.
         self.processed = None
