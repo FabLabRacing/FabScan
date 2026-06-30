@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageTk
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from fabscan.dxf_export import export_contours_to_dxf
+from fabscan.dxf_export import ExportOriginMode, export_contours_to_dxf, get_export_bbox_for_contours
 from fabscan.image_processing import FoundContour, ProcessedImage, find_contours
 from fabscan.scale_tools import ScaleResult, calculate_scale
 
@@ -19,7 +19,7 @@ ImagePoint = Tuple[float, float]
 
 
 class FabScanApp(tk.Tk):
-    """FabScan Ver. 0.1.2 desktop app.
+    """FabScan Ver. 0.1.4 desktop app.
 
     This intentionally favors simple and debuggable over pretty. The goal is to
     prove the photo/scan -> contours -> scaled DXF workflow, with manual contour
@@ -28,7 +28,7 @@ class FabScanApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("FabScan Ver. 0.1.3 - Scrollable Measurements")
+        self.title("FabScan Ver. 0.1.4 - DXF Origin Control")
         self.geometry("1280x820")
         self.minsize(950, 600)
 
@@ -51,6 +51,8 @@ class FabScanApp(tk.Tk):
         self.simplify_var = tk.DoubleVar(value=0.05)
         self.invert_var = tk.BooleanVar(value=False)
         self.show_threshold_var = tk.BooleanVar(value=False)
+        self.export_origin_var = tk.StringVar(value="Move lower-left to 0,0")
+        self.export_margin_var = tk.DoubleVar(value=0.0)
 
         self._build_ui()
 
@@ -156,6 +158,37 @@ class FabScanApp(tk.Tk):
         self.measurement_text = tk.Text(side, height=13, width=38, wrap=tk.WORD)
         self.measurement_text.pack(fill=tk.X, expand=False, pady=(4, 0))
         self.measurement_text.configure(state=tk.DISABLED)
+
+        export_frame = ttk.LabelFrame(side, text="DXF Export", padding=6)
+        export_frame.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+
+        ttk.Label(export_frame, text="Origin").pack(anchor=tk.W)
+        origin_combo = ttk.Combobox(
+            export_frame,
+            textvariable=self.export_origin_var,
+            values=(
+                "Move lower-left to 0,0",
+                "Preserve image position",
+                "Center on 0,0",
+            ),
+            state="readonly",
+        )
+        origin_combo.pack(fill=tk.X, pady=(2, 6))
+        origin_combo.bind("<<ComboboxSelected>>", lambda _event: self.update_export_options_display())
+
+        margin_row = ttk.Frame(export_frame)
+        margin_row.pack(fill=tk.X)
+        ttk.Label(margin_row, text="Margin in").pack(side=tk.LEFT)
+        margin_entry = ttk.Entry(margin_row, textvariable=self.export_margin_var, width=10)
+        margin_entry.pack(side=tk.RIGHT)
+        margin_entry.bind("<Return>", lambda _event: self.update_export_options_display())
+        margin_entry.bind("<FocusOut>", lambda _event: self.update_export_options_display())
+
+        ttk.Label(
+            export_frame,
+            text="Margin applies to lower-left origin mode.",
+            wraplength=300,
+        ).pack(anchor=tk.W, pady=(6, 0))
 
         ttk.Label(side, text="Status", font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W, pady=(8, 0))
         self.status_text = tk.Text(side, height=9, width=38, wrap=tk.WORD)
@@ -341,6 +374,36 @@ class FabScanApp(tk.Tk):
         area = area_pixels * (self.scale_result.inches_per_pixel ** 2)
         return f"{area:.4f} in²"
 
+    def format_export_origin(self) -> str:
+        mode = self.get_export_origin_mode()
+        if mode == "lower_left":
+            margin = self.get_export_margin_inches()
+            if margin > 0:
+                return f"Lower-left at {margin:.4f}, {margin:.4f}"
+            return "Lower-left at 0,0"
+        if mode == "center":
+            return "Center at 0,0"
+        return "Preserve image position"
+
+    def get_export_origin_mode(self) -> ExportOriginMode:
+        label = self.export_origin_var.get()
+        if label == "Move lower-left to 0,0":
+            return "lower_left"
+        if label == "Center on 0,0":
+            return "center"
+        return "preserve"
+
+    def get_export_margin_inches(self) -> float:
+        try:
+            margin = float(self.export_margin_var.get())
+        except (tk.TclError, ValueError):
+            return 0.0
+        return max(0.0, margin)
+
+    def update_export_options_display(self) -> None:
+        self.update_processing_status()
+        self.update_measurements()
+
     def update_measurements(self) -> None:
         """Show selected contour and enabled-export bounding box sanity numbers."""
 
@@ -378,13 +441,37 @@ class FabScanApp(tk.Tk):
             )
 
         lines.append("")
-        lines.append("Enabled export bbox:")
+        lines.append("Enabled image bbox:")
         if enabled_bbox is None:
             lines.append("No enabled contours")
         else:
             _min_x, _min_y, _max_x, _max_y, width_px, height_px = enabled_bbox
             lines.append(f"Size: {self.format_px(width_px)} x {self.format_px(height_px)}")
             lines.append(f"Size: {self.format_inches(width_px)} x {self.format_inches(height_px)}")
+
+        lines.append("")
+        lines.append("DXF output bbox:")
+        if enabled_bbox is None:
+            lines.append("No enabled contours")
+        elif self.scale_result is None or self.image_bgr is None:
+            lines.append("Set scale to calculate")
+        else:
+            image_height = int(self.image_bgr.shape[0])
+            dxf_bbox = get_export_bbox_for_contours(
+                contours=enabled_contours,
+                scale_inches_per_pixel=self.scale_result.inches_per_pixel,
+                image_height_pixels=image_height,
+                origin_mode=self.get_export_origin_mode(),
+                margin_inches=self.get_export_margin_inches(),
+            )
+            if dxf_bbox is None:
+                lines.append("No enabled contours")
+            else:
+                min_x, min_y, max_x, max_y, width_in, height_in = dxf_bbox
+                lines.append(self.format_export_origin())
+                lines.append(f"X: {min_x:.4f} to {max_x:.4f} in")
+                lines.append(f"Y: {min_y:.4f} to {max_y:.4f} in")
+                lines.append(f"Size: {width_in:.4f} x {height_in:.4f} in")
 
         self.set_measurements("\n".join(lines))
 
@@ -413,7 +500,8 @@ class FabScanApp(tk.Tk):
             f"Blur: {int(self.blur_var.get())}\n"
             f"Min area: {float(self.min_area_var.get()):.1f}\n"
             f"Simplify: {float(self.simplify_var.get()):.2f}%\n\n"
-            f"Scale: {scale_text}"
+            f"Scale: {scale_text}\n"
+            f"DXF origin: {self.format_export_origin()}"
         )
 
     def start_scale_mode(self) -> None:
@@ -623,12 +711,18 @@ class FabScanApp(tk.Tk):
                 output_path=path,
                 scale_inches_per_pixel=self.scale_result.inches_per_pixel,
                 image_height_pixels=image_height,
+                origin_mode=self.get_export_origin_mode(),
+                margin_inches=self.get_export_margin_inches(),
             )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("DXF export failed", str(exc))
             return
 
-        self.append_status(f"\nDXF exported:\n{output}\nContours exported: {len(enabled_contours)}")
+        self.append_status(
+            f"\nDXF exported:\n{output}\n"
+            f"Contours exported: {len(enabled_contours)}\n"
+            f"Origin: {self.format_export_origin()}"
+        )
         messagebox.showinfo("DXF exported", f"Saved:\n{output}")
 
     def redraw_preview(self) -> None:
