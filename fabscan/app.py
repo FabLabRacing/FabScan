@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.5"
-APP_TITLE = f"FabScan v{APP_VERSION} - Calibration Window Stability"
+APP_VERSION = "0.5.6"
+APP_TITLE = f"FabScan v{APP_VERSION} - Single-Step Edge Follow"
 
 
 class FabScanApp(tk.Tk):
@@ -2112,6 +2112,12 @@ class FabScanApp(tk.Tk):
             "camera_calibration_line_search_px": int(self.settings.get("camera_calibration_line_search_px", 220)),
             "camera_calibration_show_line_preview": bool(self.settings.get("camera_calibration_show_line_preview", True)),
             "camera_calibration_show_mask": bool(self.settings.get("camera_calibration_show_mask", False)),
+            "camera_follow_step": float(self.settings.get("camera_follow_step", 0.050)),
+            "camera_follow_max_correct": float(self.settings.get("camera_follow_max_correct", 0.050)),
+            "camera_follow_min_confidence": float(self.settings.get("camera_follow_min_confidence", 45.0)),
+            "camera_follow_direction": str(self.settings.get("camera_follow_direction", "Forward")),
+            "camera_follow_capture_point": bool(self.settings.get("camera_follow_capture_point", False)),
+            "camera_follow_enabled": bool(self.settings.get("camera_follow_enabled", False)),
             "camera_calibration": self.settings.get("camera_calibration", None),
         }
 
@@ -2406,6 +2412,12 @@ class FabScanApp(tk.Tk):
         cal_line_search_px = self.safe_int_from_settings("camera_calibration_line_search_px", 220)
         cal_show_line_preview = self.safe_bool_from_settings("camera_calibration_show_line_preview", True)
         cal_show_mask = self.safe_bool_from_settings("camera_calibration_show_mask", False)
+        follow_step = self.safe_float_from_settings("camera_follow_step", 0.050)
+        follow_max_correct = self.safe_float_from_settings("camera_follow_max_correct", 0.050)
+        follow_min_confidence = self.safe_float_from_settings("camera_follow_min_confidence", 45.0)
+        follow_direction = str(self.settings.get("camera_follow_direction", "Forward"))
+        follow_capture_point = self.safe_bool_from_settings("camera_follow_capture_point", False)
+        follow_enabled = self.safe_bool_from_settings("camera_follow_enabled", False)
         existing_calibration = self.settings.get("camera_calibration", None)
 
         dialog = CameraCalibrationDialog(
@@ -2428,7 +2440,14 @@ class FabScanApp(tk.Tk):
             line_search_px=cal_line_search_px,
             show_line_preview=cal_show_line_preview,
             show_mask=cal_show_mask,
+            follow_step=follow_step,
+            follow_max_correct=follow_max_correct,
+            follow_min_confidence=follow_min_confidence,
+            follow_direction=follow_direction,
+            follow_capture_point=follow_capture_point,
+            follow_enabled=follow_enabled,
             existing_calibration=existing_calibration,
+            trace_capture_callback=self.capture_trace_point,
         )
         self.wait_window(dialog)
 
@@ -2451,6 +2470,12 @@ class FabScanApp(tk.Tk):
         self.settings["camera_calibration_line_mode"] = dialog.result.line_mode
         self.settings["camera_calibration_line_search_px"] = dialog.result.line_search_px
         self.settings["camera_calibration_show_line_preview"] = dialog.result.show_line_preview
+        self.settings["camera_follow_step"] = dialog.result.follow_step
+        self.settings["camera_follow_max_correct"] = dialog.result.follow_max_correct
+        self.settings["camera_follow_min_confidence"] = dialog.result.follow_min_confidence
+        self.settings["camera_follow_direction"] = dialog.result.follow_direction
+        self.settings["camera_follow_capture_point"] = dialog.result.follow_capture_point
+        self.settings["camera_follow_enabled"] = dialog.result.follow_enabled
 
         if dialog.result.calibration:
             self.settings["camera_calibration"] = dialog.result.calibration

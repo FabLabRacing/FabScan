@@ -60,6 +60,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "camera_calibration_line_search_px": 220,
     "camera_calibration_show_line_preview": True,
     "camera_calibration_show_mask": False,
+    "camera_follow_step": 0.050,
+    "camera_follow_max_correct": 0.050,
+    "camera_follow_min_confidence": 45.0,
+    "camera_follow_direction": "Forward",
+    "camera_follow_capture_point": False,
+    "camera_follow_enabled": False,
     "camera_calibration": None,
 }
 
