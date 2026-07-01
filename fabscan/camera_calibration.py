@@ -67,19 +67,16 @@ class CameraCalibrationDialogResult:
     follow_direction: str
     follow_capture_point: bool
     follow_enabled: bool
+    follow_repeat_count: int
     calibration: Optional[dict[str, Any]] = None
 
 
 class CameraCalibrationDialog(tk.Toplevel):
     """Camera/machine calibration helper for FabScan.
 
-    This is intentionally a "lite" version. It does not follow an edge yet.
-    It only proves the core Scanything-style idea:
-
-        known LinuxCNC X/Y move -> observed camera pixel shift
-
-    The final DXF should still be based on LinuxCNC position. This calibration
-    is only for later steering corrections while camera-following a line/edge.
+    This dialog handles the Scanything-style camera/machine calibration and
+    bounded camera-assisted line/edge following. The final DXF is still based
+    on LinuxCNC position. The camera is only used as the steering eye.
     """
 
     def __init__(
@@ -110,11 +107,12 @@ class CameraCalibrationDialog(tk.Toplevel):
         follow_direction: str = "Forward",
         follow_capture_point: bool = False,
         follow_enabled: bool = False,
+        follow_repeat_count: int = 5,
         existing_calibration: Optional[dict[str, Any]] = None,
         trace_capture_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.7")
+        self.title("FabScan Camera Calibration Lite - v0.5.8")
         self.minsize(1080, 650)
         # Give the dialog an explicit starting size so Tk does not keep
         # recomputing the top-level size as live preview/status content changes.
@@ -136,6 +134,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
         self._motion_active = False
         self._manual_jog_active = False
+        self._follow_stop_requested = False
         self.trace_capture_callback = trace_capture_callback
         self.active_calibration: Optional[dict[str, Any]] = self._validate_calibration(existing_calibration)
 
@@ -164,6 +163,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.follow_direction_var = tk.StringVar(value=self._normalize_follow_direction(follow_direction))
         self.follow_capture_point_var = tk.BooleanVar(value=bool(follow_capture_point))
         self.follow_enabled_var = tk.BooleanVar(value=bool(follow_enabled))
+        self.follow_repeat_count_var = tk.IntVar(value=max(1, min(50, int(follow_repeat_count))))
         self.dot_status_var = tk.StringVar(value="Dot: —")
         self.line_status_var = tk.StringVar(value="Line/edge: —")
         self.cal_status_var = tk.StringVar(value="Open camera, center the calibration dot, then click Find Dot.")
@@ -361,23 +361,28 @@ class CameraCalibrationDialog(tk.Toplevel):
         ttk.Entry(follow_tools, textvariable=self.follow_max_correct_var, width=8).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
         ttk.Label(follow_tools, text="Min conf").grid(row=3, column=0, sticky=tk.W, pady=(5, 0))
         ttk.Entry(follow_tools, textvariable=self.follow_min_confidence_var, width=8).grid(row=3, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
-        ttk.Label(follow_tools, text="Direction").grid(row=4, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Label(follow_tools, text="Count").grid(row=4, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_repeat_count_var, width=8).grid(row=4, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Direction").grid(row=5, column=0, sticky=tk.W, pady=(5, 0))
         ttk.Combobox(
             follow_tools,
             textvariable=self.follow_direction_var,
             values=("Forward", "Reverse"),
             width=9,
             state="readonly",
-        ).grid(row=4, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ).grid(row=5, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
         ttk.Checkbutton(
             follow_tools,
             text="Capture after move",
             variable=self.follow_capture_point_var,
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
         ttk.Button(follow_tools, text="Follow Step", command=self.follow_line_single_step).grid(
-            row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+            row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
-        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(follow_tools, text="Follow N", command=self.follow_line_multiple_steps).grid(
+            row=8, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+        )
+        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         follow_tools.columnconfigure(1, weight=1)
 
     def _register_traces(self) -> None:
@@ -509,6 +514,15 @@ class CameraCalibrationDialog(tk.Toplevel):
         except (tk.TclError, TypeError, ValueError):
             confidence = 45.0
         return max(0.0, min(100.0, confidence))
+
+    def _get_follow_repeat_count(self) -> int:
+        try:
+            count = int(self.follow_repeat_count_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            count = 5
+        count = max(1, min(50, count))
+        self.follow_repeat_count_var.set(count)
+        return count
 
     def _normalize_follow_direction(self, value: object) -> str:
         text = str(value or "Forward").strip()
@@ -1427,12 +1441,18 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.cal_status_var.set("Calibration complete. Use Center Dot to test it, or close this window to return to FabScan.")
 
     def follow_line_single_step(self) -> None:
-        """Move one bounded step along the detected line/edge.
+        """Move one bounded step along the detected line/edge."""
 
-        This is still deliberately not continuous following. One button press
-        performs one camera-derived move: a small forward step along the fitted
-        line direction plus a limited sideways correction that nudges the
-        detected line/edge back toward the crosshair.
+        self._follow_stop_requested = False
+        self._follow_line_step_impl(step_label="Follow Step", show_dialogs=True)
+
+    def follow_line_multiple_steps(self) -> None:
+        """Run a bounded number of single follow steps, stopping on trouble.
+
+        This is still not continuous/free-running following. The user chooses a
+        small count, and FabScan performs that many already-bounded single-step
+        moves. Each step re-detects the line/edge and stops if confidence drops,
+        the target is lost, LinuxCNC is not ready, or STOP Move is pressed.
         """
 
         if self._motion_active:
@@ -1441,49 +1461,101 @@ class CameraCalibrationDialog(tk.Toplevel):
         if self._manual_jog_active:
             return
         if not bool(self.follow_enabled_var.get()):
-            messagebox.showinfo("Follow disabled", "Check Enable follow before using Follow Step.", parent=self)
+            messagebox.showinfo("Follow disabled", "Check Enable follow before using Follow N.", parent=self)
             return
+
+        count = self._get_follow_repeat_count()
+        if count <= 1:
+            self.follow_line_single_step()
+            return
+
+        self._follow_stop_requested = False
+        completed = 0
+        self.cal_status_var.set(f"Follow N starting: {count} requested steps.")
+        self.update()
+
+        for index in range(1, count + 1):
+            if self._follow_stop_requested:
+                break
+            ok = self._follow_line_step_impl(step_label=f"Follow {index}/{count}", show_dialogs=False)
+            if not ok:
+                break
+            completed += 1
+            self._wait_and_pump_camera(0.08)
+
+        last = self.cal_status_var.get()
+        if self._follow_stop_requested:
+            self.cal_status_var.set(f"Follow N stopped by user after {completed}/{count} completed steps.")
+        elif completed >= count:
+            self.cal_status_var.set(f"Follow N complete: {completed}/{count} steps completed.")
+        else:
+            self.cal_status_var.set(f"Follow N stopped after {completed}/{count} completed steps. {last}")
+        self._show_current_frame()
+
+    def _follow_line_step_impl(self, *, step_label: str, show_dialogs: bool) -> bool:
+        """Shared implementation for one camera-derived line/edge follow step."""
+
+        if self._motion_active:
+            if show_dialogs:
+                messagebox.showinfo("Motion active", "Wait for the current motion to finish or press STOP Move.", parent=self)
+            return False
+        if self._manual_jog_active:
+            return False
+        if not bool(self.follow_enabled_var.get()):
+            if show_dialogs:
+                messagebox.showinfo("Follow disabled", "Check Enable follow before using Follow Step.", parent=self)
+            return False
 
         calibration = self._validate_calibration(self.active_calibration)
         if calibration is None:
-            messagebox.showinfo("No calibration", "Run calibration first, then use Follow Step.", parent=self)
-            return
+            if show_dialogs:
+                messagebox.showinfo("No calibration", "Run calibration first, then use Follow Step.", parent=self)
+            self.cal_status_var.set("Follow refused: no valid camera calibration.")
+            return False
         if self.current_frame_bgr is None:
-            messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
-            return
+            if show_dialogs:
+                messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
+            self.cal_status_var.set("Follow refused: no camera frame is available.")
+            return False
 
         status = self.linuxcnc_reader.read_status()
         if not self._status_ok_for_calibration(status):
-            messagebox.showerror("LinuxCNC not ready", status.error or self._status_not_ready_message(status), parent=self)
-            return
+            message = status.error or self._status_not_ready_message(status)
+            if show_dialogs:
+                messagebox.showerror("LinuxCNC not ready", message, parent=self)
+            self.cal_status_var.set(message)
+            return False
 
         line = self.detect_line()
         self.current_line = line
         if not line.found:
             self.cal_status_var.set(line.message)
-            messagebox.showinfo("Line/edge not found", line.message, parent=self)
+            if show_dialogs:
+                messagebox.showinfo("Line/edge not found", line.message, parent=self)
             self._show_current_frame()
-            return
+            return False
 
         min_confidence = self._get_follow_min_confidence()
         if line.confidence < min_confidence:
             self.cal_status_var.set(
-                f"Follow Step refused: confidence {line.confidence:.0f}% is below minimum {min_confidence:.0f}%."
+                f"{step_label} refused: confidence {line.confidence:.0f}% is below minimum {min_confidence:.0f}%."
             )
             self._show_current_frame()
-            return
+            return False
 
         tangent = self._machine_vector_from_pixel_vector(line.vx, line.vy)
         correction = self._machine_correction_from_pixel_error(line.pixel_error_x, line.pixel_error_y)
         if tangent is None or correction is None:
-            messagebox.showerror("Bad calibration", "Saved calibration could not be used for line following.", parent=self)
-            return
+            if show_dialogs:
+                messagebox.showerror("Bad calibration", "Saved calibration could not be used for line following.", parent=self)
+            self.cal_status_var.set("Follow failed: saved calibration could not be used for line following.")
+            return False
 
         tangent_len = math.hypot(tangent[0], tangent[1])
         if tangent_len < 1e-9:
-            self.cal_status_var.set("Follow Step failed: detected line direction could not be converted to machine movement.")
+            self.cal_status_var.set(f"{step_label} failed: detected line direction could not be converted to machine movement.")
             self._show_current_frame()
-            return
+            return False
 
         follow_step = self._get_follow_step()
         direction_sign = self._get_follow_direction_sign()
@@ -1496,12 +1568,10 @@ class CameraCalibrationDialog(tk.Toplevel):
         move_y = tangent_y + correct_y
         move_len = math.hypot(move_x, move_y)
         if move_len < 0.0005:
-            self.cal_status_var.set("Follow Step: calculated move is tiny. No move sent.")
+            self.cal_status_var.set(f"{step_label}: calculated move is tiny. No move sent.")
             self._show_current_frame()
-            return
+            return False
 
-        # Keep this first edge-following version bounded even if the fit or
-        # calibration produces a surprising vector.
         max_total = max(0.001, follow_step + max_correct)
         move_x, move_y, total_limited = self._limit_move_vector(move_x, move_y, max_total)
 
@@ -1520,12 +1590,13 @@ class CameraCalibrationDialog(tk.Toplevel):
                 limit_bits.append("total move limited")
             limit_text = f" ({', '.join(limit_bits)})" if limit_bits else ""
             self.cal_status_var.set(
-                f"Follow Step{limit_text}: tangent X{tangent_x:+.4f} Y{tangent_y:+.4f}, "
+                f"{step_label}{limit_text}: tangent X{tangent_x:+.4f} Y{tangent_y:+.4f}, "
                 f"correct X{correct_x:+.4f} Y{correct_y:+.4f}, "
                 f"total X{move_x:+.4f} Y{move_y:+.4f}."
             )
+            self.update()
             if not self._send_correction_jogs(move_x, move_y, target_x, target_y, feed, coordinate_mode):
-                return
+                return False
 
             self._wait_and_pump_camera(0.20)
             new_line = self.detect_line()
@@ -1536,12 +1607,13 @@ class CameraCalibrationDialog(tk.Toplevel):
                 capture_text = " Captured current position to the active trace."
             if new_line.found:
                 self.cal_status_var.set(
-                    f"Follow Step complete. New offset X{new_line.pixel_error_x:+.1f}px "
+                    f"{step_label} complete. New offset X{new_line.pixel_error_x:+.1f}px "
                     f"Y{new_line.pixel_error_y:+.1f}px, confidence {new_line.confidence:.0f}%." + capture_text
                 )
             else:
-                self.cal_status_var.set("Follow Step complete, but the line/edge was not found afterward." + capture_text)
+                self.cal_status_var.set(f"{step_label} complete, but the line/edge was not found afterward." + capture_text)
             self._show_current_frame()
+            return True
         finally:
             self._manual_jog_active = False
 
@@ -1705,10 +1777,12 @@ class CameraCalibrationDialog(tk.Toplevel):
             follow_direction=self._normalize_follow_direction(self.follow_direction_var.get()),
             follow_capture_point=bool(self.follow_capture_point_var.get()),
             follow_enabled=bool(self.follow_enabled_var.get()),
+            follow_repeat_count=self._get_follow_repeat_count(),
             calibration=calibration or self.active_calibration,
         )
 
     def stop_motion(self) -> None:
+        self._follow_stop_requested = True
         result = self.linuxcnc_reader.abort_motion()
         self.cal_status_var.set(result.message)
 
