@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.2"
-APP_TITLE = f"FabScan v{APP_VERSION} - Calibration Screen Jog Controls"
+APP_VERSION = "0.5.3"
+APP_TITLE = f"FabScan v{APP_VERSION} - Center Dot Calibration Test"
 
 
 class FabScanApp(tk.Tk):
@@ -2107,6 +2107,7 @@ class FabScanApp(tk.Tk):
             "camera_calibration_move_distance": float(self.settings.get("camera_calibration_move_distance", 0.100)),
             "camera_calibration_feed_units_per_min": float(self.settings.get("camera_calibration_feed_units_per_min", 5.0)),
             "camera_calibration_jog_step": float(self.settings.get("camera_calibration_jog_step", 0.010)),
+            "camera_calibration_center_max_move": float(self.settings.get("camera_calibration_center_max_move", 0.100)),
             "camera_calibration_show_mask": bool(self.settings.get("camera_calibration_show_mask", False)),
             "camera_calibration": self.settings.get("camera_calibration", None),
         }
@@ -2190,7 +2191,7 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
-            "v0.5.2 adds X/Y manual jog buttons directly to the Camera Calibration Lite screen, making it easier to center the dot without switching back to the main FabScan window. Calibration still uses guarded MANUAL-mode incremental jogs and LinuxCNC remains the motion controller and position ruler.\n\n"
+            "v0.5.3 adds Center Dot to the Camera Calibration Lite screen. After calibration, FabScan can use the saved camera/machine transform to move the machine so the detected dot lands under the crosshair. This proves the calibration can steer before we try edge following.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )
@@ -2397,7 +2398,9 @@ class FabScanApp(tk.Tk):
         cal_move = self.safe_float_from_settings("camera_calibration_move_distance", 0.100)
         cal_feed = self.safe_float_from_settings("camera_calibration_feed_units_per_min", 5.0)
         cal_jog_step = self.safe_float_from_settings("camera_calibration_jog_step", 0.010)
+        cal_center_max_move = self.safe_float_from_settings("camera_calibration_center_max_move", 0.100)
         cal_show_mask = self.safe_bool_from_settings("camera_calibration_show_mask", False)
+        existing_calibration = self.settings.get("camera_calibration", None)
 
         dialog = CameraCalibrationDialog(
             self,
@@ -2414,7 +2417,9 @@ class FabScanApp(tk.Tk):
             move_distance=cal_move,
             feed_per_minute=cal_feed,
             jog_step=cal_jog_step,
+            center_max_move=cal_center_max_move,
             show_mask=cal_show_mask,
+            existing_calibration=existing_calibration,
         )
         self.wait_window(dialog)
 
@@ -2433,6 +2438,7 @@ class FabScanApp(tk.Tk):
         self.settings["camera_calibration_move_distance"] = dialog.result.move_distance
         self.settings["camera_calibration_feed_units_per_min"] = dialog.result.feed_units_per_min
         self.settings["camera_calibration_jog_step"] = dialog.result.jog_step
+        self.settings["camera_calibration_center_max_move"] = dialog.result.center_max_move
 
         if dialog.result.calibration:
             self.settings["camera_calibration"] = dialog.result.calibration

@@ -42,6 +42,7 @@ class CameraCalibrationDialogResult:
     move_distance: float
     feed_units_per_min: float
     jog_step: float
+    center_max_move: float
     calibration: Optional[dict[str, Any]] = None
 
 
@@ -74,10 +75,12 @@ class CameraCalibrationDialog(tk.Toplevel):
         move_distance: float = 0.100,
         feed_per_minute: float = 5.0,
         jog_step: float = 0.010,
+        center_max_move: float = 0.100,
         show_mask: bool = False,
+        existing_calibration: Optional[dict[str, Any]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.2")
+        self.title("FabScan Camera Calibration Lite - v0.5.3")
         self.minsize(1040, 720)
         self.transient(parent)
 
@@ -91,6 +94,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
         self._motion_active = False
         self._manual_jog_active = False
+        self.active_calibration: Optional[dict[str, Any]] = self._validate_calibration(existing_calibration)
 
         if int(rotate_degrees) not in ROTATE_VALUES:
             rotate_degrees = 0
@@ -107,11 +111,14 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.move_distance_var = tk.DoubleVar(value=max(0.001, float(move_distance)))
         self.feed_var = tk.DoubleVar(value=max(0.1, float(feed_per_minute)))
         self.jog_step_var = tk.DoubleVar(value=max(0.001, float(jog_step)))
+        self.center_max_move_var = tk.DoubleVar(value=max(0.001, float(center_max_move)))
         self.dot_status_var = tk.StringVar(value="Dot: —")
         self.cal_status_var = tk.StringVar(value="Open camera, center the calibration dot, then click Find Dot.")
         self.transform_status_var = tk.StringVar(value="Calibration: not run")
 
         self._build_ui()
+        if self.active_calibration:
+            self._show_calibration_summary(self.active_calibration, loaded=True)
         self._register_traces()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda _event: self.close())
@@ -212,6 +219,14 @@ class CameraCalibrationDialog(tk.Toplevel):
         ttk.Button(jog, text="Find", command=self.find_dot_once).grid(row=3, column=1, columnspan=2, sticky="ew", padx=(0, 2))
         ttk.Button(jog, text="X+", command=lambda: self.manual_jog("X", +1)).grid(row=3, column=3, sticky="ew")
         ttk.Button(jog, text="Y-", command=lambda: self.manual_jog("Y", -1)).grid(row=4, column=1, columnspan=2, sticky="ew", pady=(2, 0))
+
+        ttk.Separator(jog, orient=tk.HORIZONTAL).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 6))
+        ttk.Label(jog, text="Max center").grid(row=6, column=0, columnspan=2, sticky=tk.W)
+        ttk.Entry(jog, textvariable=self.center_max_move_var, width=8).grid(row=6, column=2, columnspan=2, sticky="ew")
+        ttk.Button(jog, text="Center Dot", command=self.center_dot_using_calibration).grid(
+            row=7, column=0, columnspan=4, sticky="ew", pady=(6, 0)
+        )
+
         for col in range(4):
             jog.columnconfigure(col, weight=1)
 
@@ -227,7 +242,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         footer = ttk.Label(
             self,
             text=(
-                "Calibration and dot-centering jogs use guarded X/Y incremental jogs through LinuxCNC MANUAL mode. Torch/plasma should stay disabled. "
+                "Calibration, dot-centering, and screen jogs use guarded X/Y incremental jogs through LinuxCNC MANUAL mode. Torch/plasma should stay disabled. "
                 "The camera steers; LinuxCNC remains the ruler."
             ),
             anchor=tk.W,
@@ -333,6 +348,13 @@ class CameraCalibrationDialog(tk.Toplevel):
         except (tk.TclError, TypeError, ValueError):
             step = 0.010
         return max(0.001, min(1.000, step))
+
+    def _get_center_max_move(self) -> float:
+        try:
+            move = abs(float(self.center_max_move_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            move = 0.100
+        return max(0.001, min(1.000, move))
 
     def open_camera(self) -> None:
         self.release_camera()
@@ -563,6 +585,22 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.cal_status_var.set(dot.message)
         self._show_current_frame()
 
+    def _validate_calibration(self, calibration: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not isinstance(calibration, dict):
+            return None
+        if not calibration.get("valid"):
+            return None
+        matrix = calibration.get("matrix_pixel_to_machine")
+        try:
+            if len(matrix) != 2 or len(matrix[0]) != 2 or len(matrix[1]) != 2:
+                return None
+            values = [float(matrix[0][0]), float(matrix[0][1]), float(matrix[1][0]), float(matrix[1][1])]
+            if not all(math.isfinite(value) for value in values):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        return calibration
+
     def manual_jog(self, axis: str, direction: int) -> None:
         if self._motion_active:
             messagebox.showinfo("Calibration active", "Wait for calibration to finish or press STOP Move.", parent=self)
@@ -683,6 +721,7 @@ class CameraCalibrationDialog(tk.Toplevel):
                 self.cal_status_var.set(f"Calibration failed: {exc}")
                 messagebox.showerror("Calibration failed", str(exc), parent=self)
                 return
+            self.active_calibration = calibration
             self.result = self._make_result(calibration=calibration)
             self._show_calibration_summary(calibration)
         finally:
@@ -939,15 +978,154 @@ class CameraCalibrationDialog(tk.Toplevel):
             "determinant": det,
         }
 
-    def _show_calibration_summary(self, calibration: dict[str, Any]) -> None:
+    def _show_calibration_summary(self, calibration: dict[str, Any], *, loaded: bool = False) -> None:
+        prefix = "Calibration loaded" if loaded else "Calibration valid"
         self.transform_status_var.set(
-            "Calibration valid: "
+            f"{prefix}: "
             f"X {calibration['pixels_per_unit_x']:.1f} px/unit, "
             f"Y {calibration['pixels_per_unit_y']:.1f} px/unit, "
             f"X angle {calibration['x_response_angle_degrees']:+.1f}°, "
             f"Y angle {calibration['y_response_angle_degrees']:+.1f}°."
         )
-        self.cal_status_var.set("Calibration complete. Close this window to return to FabScan.")
+        if loaded:
+            self.cal_status_var.set("Saved calibration loaded. Use Center Dot to test the camera/machine transform.")
+        else:
+            self.cal_status_var.set("Calibration complete. Use Center Dot to test it, or close this window to return to FabScan.")
+
+    def center_dot_using_calibration(self) -> None:
+        if self._motion_active:
+            messagebox.showinfo("Calibration active", "Wait for calibration to finish or press STOP Move.", parent=self)
+            return
+        if self._manual_jog_active:
+            return
+
+        calibration = self._validate_calibration(self.active_calibration)
+        if calibration is None:
+            messagebox.showinfo("No calibration", "Run calibration first, then use Center Dot.", parent=self)
+            return
+        if self.current_frame_bgr is None:
+            messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
+            return
+
+        status = self.linuxcnc_reader.read_status()
+        if not self._status_ok_for_calibration(status):
+            messagebox.showerror("LinuxCNC not ready", status.error or self._status_not_ready_message(status), parent=self)
+            return
+
+        transformed = self.get_transformed_frame_bgr(self.current_frame_bgr)
+        frame_h, frame_w = transformed.shape[:2]
+        dot = self.detect_dot_in_frame(transformed)
+        self.current_dot = dot
+        if not dot.found:
+            self.cal_status_var.set(dot.message)
+            messagebox.showinfo("Dot not found", dot.message, parent=self)
+            self._show_current_frame()
+            return
+
+        err_x = dot.x - (frame_w / 2.0)
+        err_y = dot.y - (frame_h / 2.0)
+        pixel_error = math.hypot(err_x, err_y)
+        if pixel_error <= 2.0:
+            self.cal_status_var.set(f"Center Dot: already centered within {pixel_error:.1f} px.")
+            self._show_current_frame()
+            return
+
+        try:
+            inv = calibration["matrix_pixel_to_machine"]
+            # Desired pixel shift is opposite the current dot-to-crosshair error.
+            move_x = float(inv[0][0]) * (-err_x) + float(inv[0][1]) * (-err_y)
+            move_y = float(inv[1][0]) * (-err_x) + float(inv[1][1]) * (-err_y)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Bad calibration", f"Saved calibration could not be used: {exc}", parent=self)
+            return
+
+        if not math.isfinite(move_x) or not math.isfinite(move_y):
+            messagebox.showerror("Bad correction", "Calculated dot-centering move was not finite.", parent=self)
+            return
+
+        max_move = self._get_center_max_move()
+        vector_len = math.hypot(move_x, move_y)
+        limited = False
+        if vector_len > max_move:
+            scale = max_move / vector_len
+            move_x *= scale
+            move_y *= scale
+            vector_len = max_move
+            limited = True
+
+        if vector_len < 0.0005:
+            self.cal_status_var.set(f"Center Dot: correction is tiny ({vector_len:.5f} units). No move sent.")
+            self._show_current_frame()
+            return
+
+        start_x, start_y, _z = self._active_position(status)
+        target_x = start_x + move_x
+        target_y = start_y + move_y
+        feed = self._get_feed()
+        coordinate_mode = self.coordinate_mode_label
+
+        self._manual_jog_active = True
+        try:
+            limit_text = " limited" if limited else ""
+            self.cal_status_var.set(
+                f"Center Dot:{limit_text} correction X{move_x:+.4f} Y{move_y:+.4f} "
+                f"from pixel error X{err_x:+.1f} Y{err_y:+.1f}."
+            )
+            if not self._send_correction_jogs(move_x, move_y, target_x, target_y, feed, coordinate_mode):
+                return
+            self._wait_and_pump_camera(0.20)
+            new_dot = self.detect_dot()
+            self.current_dot = new_dot
+            if new_dot.found:
+                new_err_x = new_dot.x - (frame_w / 2.0)
+                new_err_y = new_dot.y - (frame_h / 2.0)
+                self.cal_status_var.set(
+                    f"Center Dot complete. New offset X{new_err_x:+.1f}px Y{new_err_y:+.1f}px. "
+                    "Click again if you want to sneak up on center."
+                )
+            else:
+                self.cal_status_var.set("Center Dot move complete, but the dot was not found afterward.")
+            self._show_current_frame()
+        finally:
+            self._manual_jog_active = False
+
+    def _send_correction_jogs(
+        self,
+        move_x: float,
+        move_y: float,
+        target_x: float,
+        target_y: float,
+        feed: float,
+        coordinate_mode: str,
+    ) -> bool:
+        start_status = self.linuxcnc_reader.read_status()
+        start_x, start_y, _z = self._active_position(start_status)
+
+        if abs(move_x) >= 0.0005:
+            direction = 1 if move_x >= 0.0 else -1
+            distance = abs(move_x)
+            jog = self.linuxcnc_reader.incremental_jog("X", direction, distance, feed)
+            if not jog.success:
+                messagebox.showerror("Center Dot jog failed", jog.message, parent=self)
+                self.cal_status_var.set(jog.message)
+                return False
+            if not self._wait_for_position_near(start_x + move_x, start_y, coordinate_mode, distance):
+                self.cal_status_var.set("Center Dot X correction did not settle as expected.")
+                return False
+
+        if abs(move_y) >= 0.0005:
+            direction = 1 if move_y >= 0.0 else -1
+            distance = abs(move_y)
+            jog = self.linuxcnc_reader.incremental_jog("Y", direction, distance, feed)
+            if not jog.success:
+                messagebox.showerror("Center Dot jog failed", jog.message, parent=self)
+                self.cal_status_var.set(jog.message)
+                return False
+            if not self._wait_for_position_near(target_x, target_y, coordinate_mode, distance):
+                self.cal_status_var.set("Center Dot Y correction did not settle as expected.")
+                return False
+
+        return True
 
     def _make_result(self, calibration: Optional[dict[str, Any]]) -> CameraCalibrationDialogResult:
         width, height = self._get_requested_size()
@@ -964,7 +1142,8 @@ class CameraCalibrationDialog(tk.Toplevel):
             move_distance=self._get_move_distance(),
             feed_units_per_min=self._get_feed(),
             jog_step=self._get_jog_step(),
-            calibration=calibration,
+            center_max_move=self._get_center_max_move(),
+            calibration=calibration or self.active_calibration,
         )
 
     def stop_motion(self) -> None:

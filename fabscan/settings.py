@@ -55,6 +55,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "camera_calibration_move_distance": 0.100,
     "camera_calibration_feed_units_per_min": 5.0,
     "camera_calibration_jog_step": 0.010,
+    "camera_calibration_center_max_move": 0.100,
     "camera_calibration_show_mask": False,
     "camera_calibration": None,
 }
