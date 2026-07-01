@@ -1,73 +1,68 @@
-# FabScan v0.5.8 - Bounded Multi-Step Edge Follow
+# FabScan v0.5.9 - Follow Direction Latch
 
-v0.5.8 adds a bounded `Follow N` mode to the Camera Calibration Lite window.
+v0.5.9 fixes the back-and-forth motion seen during bounded multi-step line following.
 
-This is still not free-running continuous following. It simply repeats the already-tested single-step follow logic for a user-selected number of steps. Each step re-detects the line/edge, checks confidence, calculates a bounded tangent/correction move, waits for LinuxCNC to settle, and stops if anything looks wrong.
+A detected line has no inherent arrow direction. Depending on the camera frame and fitted contour, the detected tangent can flip 180 degrees from one step to the next. In v0.5.8 that could make `Follow N` alternate forward/backward even though the line detection and calibration were otherwise working.
 
 ## What changed
 
-- Added `Count` to the Single-Step Follow panel.
-- Added `Follow N` button.
-- Added a stop-request flag so `STOP Move` also stops a running Follow N sequence.
-- Saved/restored follow count in settings.
-- No Z motion, no torch, no MDI, and no continuous chasing.
+- Added a machine-space follow heading latch.
+- First follow step uses the Forward / Reverse selector.
+- Later follow steps choose the detected tangent direction closest to the previously successful move direction.
+- `Find Line / Edge`, camera/threshold/search setting changes, Direction changes, and STOP clear the latch.
+- Follow status now reports whether the heading is `new heading` or `latched`.
+- Motion remains guarded X/Y incremental jog only.
 
-## Safety behavior
+## Suggested test
 
-Follow N stops if:
-
-- LinuxCNC is not ON / IDLE / MANUAL.
-- X/Y/Z are not homed.
-- The line/edge is lost.
-- Detection confidence drops below Min conf.
-- A jog fails or does not settle.
-- STOP Move is pressed.
-- The requested count is completed.
-
-The count is clamped to 1–50 steps.
-
-## Suggested first test
-
-Start conservative:
+Use the same settings that exposed the direction flip:
 
 ```text
-Step: 0.025 or 0.050
-Max correct: 0.025 or 0.050
-Min conf: 45
-Count: 3
-Feed: 5
-Capture after move: off for the first test
+Mode: Line center
+Step: 0.050
+Max correct: 0.010 or 0.015
+Min conf: 55 or 60
+Count: 10 to 50
 ```
 
 Workflow:
 
 ```text
 1. Open Camera Calibrate.
-2. Make sure calibration is valid.
-3. Put a clean line/edge under the camera.
-4. Use Find Line / Edge and confirm the overlay looks right.
-5. Enable follow.
-6. Click Follow Step once.
-7. If direction is correct, set Count to 3 and click Follow N.
-8. Press STOP Move if anything looks wrong.
+2. Verify or run calibration.
+3. Put the line under the camera.
+4. Click Find Line / Edge.
+5. Set Direction to Forward or Reverse.
+6. Click Follow Step once and verify the direction.
+7. Click Follow N.
 ```
+
+If the first step goes the wrong way, change Direction and click `Find Line / Edge` again before running Follow N.
 
 ## Install
 
-Copy these files over an existing FabScan v0.5.7 checkout:
-
-```bash
-cp fabscan/app.py ~/projects/FabScan/fabscan/app.py
-cp fabscan/camera_calibration.py ~/projects/FabScan/fabscan/camera_calibration.py
-cp fabscan/settings.py ~/projects/FabScan/fabscan/settings.py
-cp README_v0.5.8.md ~/projects/FabScan/README.md
-```
-
-Then run:
+From the drop-in zip:
 
 ```bash
 cd ~/projects/FabScan
+cp /path/to/unzipped/FabScan_v059_follow_direction_latch_dropin/fabscan/app.py fabscan/app.py
+cp /path/to/unzipped/FabScan_v059_follow_direction_latch_dropin/fabscan/camera_calibration.py fabscan/camera_calibration.py
+cp /path/to/unzipped/FabScan_v059_follow_direction_latch_dropin/README_v0.5.9.md README.md
+```
+
+Then:
+
+```bash
 source .venv/bin/activate
 python3 -m py_compile fabscan/*.py fabscan.py
 python3 fabscan.py
+```
+
+Commit after live test:
+
+```bash
+git status
+git add fabscan/app.py fabscan/camera_calibration.py README.md
+git commit -m "Latch follow direction during multi-step edge following"
+git push
 ```

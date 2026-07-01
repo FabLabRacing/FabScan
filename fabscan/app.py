@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.7"
-APP_TITLE = f"FabScan v{APP_VERSION} - Single-Step Edge Follow"
+APP_VERSION = "0.5.9"
+APP_TITLE = f"FabScan v{APP_VERSION} - Follow Direction Latch"
 
 
 class FabScanApp(tk.Tk):

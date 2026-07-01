@@ -112,7 +112,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         trace_capture_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.8")
+        self.title("FabScan Camera Calibration Lite - v0.5.9")
         self.minsize(1080, 650)
         # Give the dialog an explicit starting size so Tk does not keep
         # recomputing the top-level size as live preview/status content changes.
@@ -135,6 +135,11 @@ class CameraCalibrationDialog(tk.Toplevel):
         self._motion_active = False
         self._manual_jog_active = False
         self._follow_stop_requested = False
+        # Direction latch for line/edge following. A detected line has no arrow,
+        # so the fitted tangent can flip 180 degrees from one frame to the next.
+        # Once a follow direction is established, keep subsequent steps moving
+        # along the same machine-space heading unless the user changes settings.
+        self._follow_heading_unit: Optional[tuple[float, float]] = None
         self.trace_capture_callback = trace_capture_callback
         self.active_calibration: Optional[dict[str, Any]] = self._validate_calibration(existing_calibration)
 
@@ -399,8 +404,15 @@ class CameraCalibrationDialog(tk.Toplevel):
         )
         for variable in watched_vars:
             variable.trace_add("write", lambda *_args: self._on_preview_setting_changed())
+        self.follow_direction_var.trace_add("write", lambda *_args: self._clear_follow_heading())
+
+    def _clear_follow_heading(self) -> None:
+        self._follow_heading_unit = None
 
     def _on_preview_setting_changed(self) -> None:
+        # Any camera/threshold/search change can alter the fitted tangent. Start
+        # a fresh follow latch after the user deliberately changes detection setup.
+        self._clear_follow_heading()
         self._normalize_fine_rotation_var()
         self._update_fine_rotation_label()
         self._update_threshold_label()
@@ -1005,6 +1017,10 @@ class CameraCalibrationDialog(tk.Toplevel):
         return move_x, move_y, False
 
     def find_line_once(self) -> None:
+        # Treat Find Line/Edge as the user's explicit setup step for a new follow
+        # direction. The next Follow Step will establish a fresh heading from the
+        # Forward/Reverse selector, then later steps will latch to it.
+        self._clear_follow_heading()
         if self.current_frame_bgr is None:
             messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
             return
@@ -1440,6 +1456,45 @@ class CameraCalibrationDialog(tk.Toplevel):
         else:
             self.cal_status_var.set("Calibration complete. Use Center Dot to test it, or close this window to return to FabScan.")
 
+    def _choose_latched_follow_heading(
+        self,
+        raw_tangent_x: float,
+        raw_tangent_y: float,
+        direction_sign: int,
+    ) -> tuple[Optional[tuple[float, float]], str]:
+        """Resolve the 180-degree ambiguity of a detected line tangent.
+
+        cv2.fitLine returns a line axis, not an arrow. On a nearly vertical or
+        horizontal target the sign can flip between frames, which makes the
+        machine step forward/back/forward/back. Convert the detected tangent to
+        a unit machine-space vector, then choose the sign that stays closest to
+        the previously successful follow heading.
+        """
+
+        length = math.hypot(raw_tangent_x, raw_tangent_y)
+        if length < 1e-9:
+            return None, "no tangent"
+
+        unit_x = raw_tangent_x / length
+        unit_y = raw_tangent_y / length
+
+        previous = self._follow_heading_unit
+        if previous is not None:
+            prev_len = math.hypot(previous[0], previous[1])
+            if prev_len > 1e-9:
+                prev_x = previous[0] / prev_len
+                prev_y = previous[1] / prev_len
+                dot = (unit_x * prev_x) + (unit_y * prev_y)
+                if dot < 0.0:
+                    unit_x = -unit_x
+                    unit_y = -unit_y
+                return (unit_x, unit_y), "latched"
+
+        # First step after Find Line/Edge or a setting change: honor the user's
+        # Forward/Reverse selector and establish the heading latch.
+        sign = -1.0 if int(direction_sign) < 0 else 1.0
+        return (unit_x * sign, unit_y * sign), "new heading"
+
     def follow_line_single_step(self) -> None:
         """Move one bounded step along the detected line/edge."""
 
@@ -1559,8 +1614,13 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         follow_step = self._get_follow_step()
         direction_sign = self._get_follow_direction_sign()
-        tangent_x = direction_sign * follow_step * (tangent[0] / tangent_len)
-        tangent_y = direction_sign * follow_step * (tangent[1] / tangent_len)
+        heading, heading_state = self._choose_latched_follow_heading(tangent[0], tangent[1], direction_sign)
+        if heading is None:
+            self.cal_status_var.set(f"{step_label} failed: detected line direction could not be latched.")
+            self._show_current_frame()
+            return False
+        tangent_x = follow_step * heading[0]
+        tangent_y = follow_step * heading[1]
 
         max_correct = self._get_follow_max_correct()
         correct_x, correct_y, correction_limited = self._limit_move_vector(correction[0], correction[1], max_correct)
@@ -1590,7 +1650,7 @@ class CameraCalibrationDialog(tk.Toplevel):
                 limit_bits.append("total move limited")
             limit_text = f" ({', '.join(limit_bits)})" if limit_bits else ""
             self.cal_status_var.set(
-                f"{step_label}{limit_text}: tangent X{tangent_x:+.4f} Y{tangent_y:+.4f}, "
+                f"{step_label}{limit_text}: {heading_state}, tangent X{tangent_x:+.4f} Y{tangent_y:+.4f}, "
                 f"correct X{correct_x:+.4f} Y{correct_y:+.4f}, "
                 f"total X{move_x:+.4f} Y{move_y:+.4f}."
             )
@@ -1598,6 +1658,9 @@ class CameraCalibrationDialog(tk.Toplevel):
             if not self._send_correction_jogs(move_x, move_y, target_x, target_y, feed, coordinate_mode):
                 return False
 
+            # Motion succeeded. Latch the machine-space heading used for this
+            # step so the next detection cannot flip 180 degrees.
+            self._follow_heading_unit = heading
             self._wait_and_pump_camera(0.20)
             new_line = self.detect_line()
             self.current_line = new_line
@@ -1783,6 +1846,7 @@ class CameraCalibrationDialog(tk.Toplevel):
 
     def stop_motion(self) -> None:
         self._follow_stop_requested = True
+        self._clear_follow_heading()
         result = self.linuxcnc_reader.abort_motion()
         self.cal_status_var.set(result.message)
 
