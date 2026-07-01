@@ -114,11 +114,11 @@ class CameraCalibrationDialog(tk.Toplevel):
         trace_capture_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.6")
-        self.minsize(1040, 760)
+        self.title("FabScan Camera Calibration Lite - v0.5.7")
+        self.minsize(1080, 650)
         # Give the dialog an explicit starting size so Tk does not keep
         # recomputing the top-level size as live preview/status content changes.
-        self.geometry("1180x900")
+        self.geometry("1240x760")
         self.transient(parent)
 
         self.linuxcnc_reader = linuxcnc_reader
@@ -130,8 +130,8 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.current_line: LineDetection = LineDetection(False)
         # Fixed live-preview box. Without this, the PhotoImage size can change
         # during line/edge preview and Tk resizes the whole calibration window.
-        self.preview_display_width = 640
-        self.preview_display_height = 480
+        self.preview_display_width = 700
+        self.preview_display_height = 420
         self.after_job: Optional[str] = None
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
         self._motion_active = False
@@ -178,55 +178,70 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.after(100, self.open_camera)
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self, padding=8)
+        """Build a compact calibration/following layout.
+
+        v0.5.6 proved the single-step following logic, but the calibration
+        window used too much vertical space above the live preview. This layout
+        keeps the camera/setup controls short, moves the live status beside the
+        video, and puts the jog/follow controls next to the preview where they
+        are easier to use while watching the camera.
+        """
+
+        footer = ttk.Label(
+            self,
+            text=(
+                "Calibration, dot-centering, single-step follow, and screen jogs use guarded X/Y incremental jogs through LinuxCNC MANUAL mode. "
+                "Torch/plasma should stay disabled. The camera steers; LinuxCNC remains the ruler."
+            ),
+            anchor=tk.W,
+            padding=(8, 0, 8, 8),
+        )
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+
+        root = ttk.Frame(self, padding=8)
+        root.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(root)
         top.pack(side=tk.TOP, fill=tk.X)
 
-        camera = ttk.LabelFrame(top, text="Camera", padding=6)
-        camera.pack(side=tk.TOP, fill=tk.X)
+        camera = ttk.LabelFrame(top, text="Camera / View", padding=6)
+        camera.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
-        ttk.Label(camera, text="Index").pack(side=tk.LEFT)
-        ttk.Spinbox(camera, from_=0, to=10, textvariable=self.camera_index_var, width=5).pack(
-            side=tk.LEFT, padx=(4, 12)
+        ttk.Label(camera, text="Index").grid(row=0, column=0, sticky=tk.W)
+        ttk.Spinbox(camera, from_=0, to=10, textvariable=self.camera_index_var, width=4).grid(
+            row=0, column=1, sticky=tk.W, padx=(4, 10)
         )
-        ttk.Label(camera, text="Width").pack(side=tk.LEFT)
-        ttk.Entry(camera, textvariable=self.camera_width_var, width=8).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Label(camera, text="Height").pack(side=tk.LEFT)
-        ttk.Entry(camera, textvariable=self.camera_height_var, width=8).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Button(camera, text="Open / Restart Camera", command=self.open_camera).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(camera, text="Close", command=self.close).pack(side=tk.LEFT)
+        ttk.Label(camera, text="W").grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(camera, textvariable=self.camera_width_var, width=6).grid(row=0, column=3, sticky=tk.W, padx=(4, 10))
+        ttk.Label(camera, text="H").grid(row=0, column=4, sticky=tk.W)
+        ttk.Entry(camera, textvariable=self.camera_height_var, width=6).grid(row=0, column=5, sticky=tk.W, padx=(4, 10))
+        ttk.Button(camera, text="Open / Restart", command=self.open_camera).grid(row=0, column=6, sticky=tk.W, padx=(0, 6))
+        ttk.Button(camera, text="Close", command=self.close).grid(row=0, column=7, sticky=tk.W)
 
-        controls = ttk.Frame(top)
-        controls.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
-
-        orientation = ttk.LabelFrame(controls, text="Orientation", padding=6)
-        orientation.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-
-        ttk.Label(orientation, text="Rotate").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(camera, text="Rotate").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
         ttk.Combobox(
-            orientation,
+            camera,
             textvariable=self.rotate_var,
             values=tuple(str(value) for value in ROTATE_VALUES),
-            width=5,
+            width=4,
             state="readonly",
-        ).grid(row=0, column=1, sticky=tk.W, padx=(4, 10))
-        ttk.Label(orientation, text="deg").grid(row=0, column=2, sticky=tk.W)
-        ttk.Checkbutton(orientation, text="Flip X", variable=self.flip_x_var).grid(row=0, column=3, sticky=tk.W, padx=(12, 0))
-        ttk.Checkbutton(orientation, text="Flip Y", variable=self.flip_y_var).grid(row=0, column=4, sticky=tk.W, padx=(8, 0))
-
-        ttk.Label(orientation, text="Fine rotation").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ).grid(row=1, column=1, sticky=tk.W, padx=(4, 10), pady=(6, 0))
+        ttk.Checkbutton(camera, text="Flip X", variable=self.flip_x_var).grid(row=1, column=2, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ttk.Checkbutton(camera, text="Flip Y", variable=self.flip_y_var).grid(row=1, column=4, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ttk.Label(camera, text="Fine").grid(row=1, column=6, sticky=tk.E, pady=(6, 0))
         ttk.Scale(
-            orientation,
+            camera,
             from_=-10.0,
             to=10.0,
             variable=self.fine_rotation_var,
             command=lambda _value: self._show_current_frame(),
-        ).grid(row=1, column=1, columnspan=4, sticky="ew", padx=(4, 8), pady=(6, 0))
-        self.fine_rotation_label = ttk.Label(orientation, width=8)
-        self.fine_rotation_label.grid(row=1, column=5, sticky=tk.W, pady=(6, 0))
-        orientation.columnconfigure(4, weight=1)
+        ).grid(row=1, column=7, sticky="ew", padx=(4, 8), pady=(6, 0))
+        self.fine_rotation_label = ttk.Label(camera, width=7)
+        self.fine_rotation_label.grid(row=1, column=8, sticky=tk.W, pady=(6, 0))
+        camera.columnconfigure(7, weight=1)
         self._update_fine_rotation_label()
 
-        vision = ttk.LabelFrame(controls, text="Dot / Mask", padding=6)
+        vision = ttk.LabelFrame(top, text="Dot / Mask", padding=6)
         vision.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
         ttk.Label(vision, text="Threshold").grid(row=0, column=0, sticky=tk.W)
         ttk.Scale(
@@ -235,28 +250,83 @@ class CameraCalibrationDialog(tk.Toplevel):
             to=255,
             variable=self.threshold_var,
             command=lambda _value: self._show_current_frame(),
+            length=110,
         ).grid(row=0, column=1, sticky="ew", padx=(4, 6))
         self.threshold_label = ttk.Label(vision, width=4)
         self.threshold_label.grid(row=0, column=2, sticky=tk.W)
-        ttk.Checkbutton(vision, text="Mask view", variable=self.show_mask_var, command=self._show_current_frame).grid(
-            row=1, column=0, columnspan=3, sticky=tk.W, pady=(4, 0)
+        ttk.Checkbutton(vision, text="Mask", variable=self.show_mask_var, command=self._show_current_frame).grid(
+            row=1, column=0, sticky=tk.W, pady=(4, 0)
         )
-        ttk.Button(vision, text="Find Dot", command=self.find_dot_once).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Button(vision, text="Find Dot", command=self.find_dot_once).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(4, 0))
         vision.columnconfigure(1, weight=1)
 
-        motion = ttk.LabelFrame(controls, text="Calibration Motion", padding=6)
+        motion = ttk.LabelFrame(top, text="Calibration", padding=6)
         motion.pack(side=tk.LEFT, fill=tk.Y)
-        ttk.Label(motion, text="Move dist").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(motion, textvariable=self.move_distance_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=(4, 8))
-        ttk.Label(motion, text="Feed/min").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
-        ttk.Entry(motion, textvariable=self.feed_var, width=8).grid(row=1, column=1, sticky=tk.W, padx=(4, 8), pady=(4, 0))
+        ttk.Label(motion, text="Move").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(motion, textvariable=self.move_distance_var, width=7).grid(row=0, column=1, sticky=tk.W, padx=(4, 8))
+        ttk.Label(motion, text="Feed").grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(motion, textvariable=self.feed_var, width=6).grid(row=0, column=3, sticky=tk.W, padx=(4, 0))
         ttk.Button(motion, text="Run Calibration", command=self.run_calibration).grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+            row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0), padx=(0, 4)
         )
-        ttk.Button(motion, text="STOP Move", command=self.stop_motion).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(motion, text="STOP", command=self.stop_motion).grid(row=1, column=3, sticky="ew", pady=(6, 0))
 
-        jog = ttk.LabelFrame(controls, text="Dot Center Jog", padding=6)
-        jog.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 0))
+        main = ttk.Frame(root)
+        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        left_panel = ttk.Frame(main, width=285)
+        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        left_panel.pack_propagate(False)
+
+        status_frame = ttk.LabelFrame(left_panel, text="Status", padding=6)
+        status_frame.pack(side=tk.TOP, fill=tk.X)
+        wrap = 260
+        ttk.Label(status_frame, textvariable=self.dot_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(status_frame, textvariable=self.cal_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Label(status_frame, textvariable=self.transform_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Label(status_frame, textvariable=self.line_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+
+        line_tools = ttk.LabelFrame(left_panel, text="Line / Edge Preview", padding=6)
+        line_tools.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        ttk.Label(line_tools, text="Mode").grid(row=0, column=0, sticky=tk.W)
+        ttk.Combobox(
+            line_tools,
+            textvariable=self.line_mode_var,
+            values=("Line center", "Edge near center"),
+            width=17,
+            state="readonly",
+        ).grid(row=0, column=1, columnspan=2, sticky="ew", padx=(4, 0))
+        ttk.Label(line_tools, text="Search px").grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(line_tools, textvariable=self.line_search_px_var, width=7).grid(row=1, column=1, sticky=tk.W, padx=(4, 0), pady=(5, 0))
+        ttk.Checkbutton(
+            line_tools,
+            text="Overlay",
+            variable=self.show_line_preview_var,
+            command=self._show_current_frame,
+        ).grid(row=1, column=2, sticky=tk.W, pady=(5, 0))
+        ttk.Button(line_tools, text="Find Line / Edge", command=self.find_line_once).grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0)
+        )
+        line_tools.columnconfigure(1, weight=1)
+
+        preview_frame = ttk.LabelFrame(main, text="Live Preview", padding=4)
+        preview_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.preview_box = ttk.Frame(
+            preview_frame,
+            width=self.preview_display_width,
+            height=self.preview_display_height,
+        )
+        self.preview_box.pack(side=tk.TOP, expand=True)
+        self.preview_box.pack_propagate(False)
+        self.preview_label = ttk.Label(self.preview_box, anchor=tk.CENTER)
+        self.preview_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        right_panel = ttk.Frame(main, width=285)
+        right_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 0))
+        right_panel.pack_propagate(False)
+
+        jog = ttk.LabelFrame(right_panel, text="Dot Center Jog", padding=6)
+        jog.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(jog, text="Step").grid(row=0, column=0, sticky=tk.W)
         ttk.Entry(jog, textvariable=self.jog_step_var, width=8).grid(row=0, column=1, columnspan=3, sticky="ew", padx=(4, 0))
 
@@ -279,86 +349,36 @@ class CameraCalibrationDialog(tk.Toplevel):
         ttk.Button(jog, text="Center Dot", command=self.center_dot_using_calibration).grid(
             row=7, column=0, columnspan=4, sticky="ew", pady=(6, 0)
         )
-
         for col in range(4):
             jog.columnconfigure(col, weight=1)
 
-        info = ttk.Frame(self, padding=(8, 0, 8, 0))
-        info.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(info, textvariable=self.dot_status_var, anchor=tk.W, wraplength=1120).pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(info, textvariable=self.cal_status_var, anchor=tk.W, wraplength=1120).pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(info, textvariable=self.transform_status_var, anchor=tk.W, wraplength=1120).pack(side=tk.TOP, fill=tk.X)
-
-        line_tools = ttk.LabelFrame(self, text="Edge / Line Detection Preview", padding=6)
-        line_tools.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(6, 0))
-        ttk.Label(line_tools, text="Mode").pack(side=tk.LEFT)
-        ttk.Combobox(
-            line_tools,
-            textvariable=self.line_mode_var,
-            values=("Line center", "Edge near center"),
-            width=17,
-            state="readonly",
-        ).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Label(line_tools, text="Search px").pack(side=tk.LEFT)
-        ttk.Entry(line_tools, textvariable=self.line_search_px_var, width=7).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Checkbutton(
-            line_tools,
-            text="Preview overlay",
-            variable=self.show_line_preview_var,
-            command=self._show_current_frame,
-        ).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(line_tools, text="Find Line / Edge", command=self.find_line_once).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(line_tools, textvariable=self.line_status_var, anchor=tk.W, width=92).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
-
-        follow_tools = ttk.LabelFrame(self, text="Single-Step Line / Edge Follow", padding=6)
-        follow_tools.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(6, 0))
-        ttk.Checkbutton(follow_tools, text="Enable follow", variable=self.follow_enabled_var).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(follow_tools, text="Step").pack(side=tk.LEFT)
-        ttk.Entry(follow_tools, textvariable=self.follow_step_var, width=7).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Label(follow_tools, text="Max correct").pack(side=tk.LEFT)
-        ttk.Entry(follow_tools, textvariable=self.follow_max_correct_var, width=7).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Label(follow_tools, text="Min conf").pack(side=tk.LEFT)
-        ttk.Entry(follow_tools, textvariable=self.follow_min_confidence_var, width=6).pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Label(follow_tools, text="Direction").pack(side=tk.LEFT)
+        follow_tools = ttk.LabelFrame(right_panel, text="Single-Step Follow", padding=6)
+        follow_tools.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        ttk.Checkbutton(follow_tools, text="Enable follow", variable=self.follow_enabled_var).grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(follow_tools, text="Step").grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_step_var, width=8).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Max correct").grid(row=2, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_max_correct_var, width=8).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Min conf").grid(row=3, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_min_confidence_var, width=8).grid(row=3, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Direction").grid(row=4, column=0, sticky=tk.W, pady=(5, 0))
         ttk.Combobox(
             follow_tools,
             textvariable=self.follow_direction_var,
             values=("Forward", "Reverse"),
             width=9,
             state="readonly",
-        ).pack(side=tk.LEFT, padx=(4, 12))
+        ).grid(row=4, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
         ttk.Checkbutton(
             follow_tools,
             text="Capture after move",
             variable=self.follow_capture_point_var,
-        ).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(follow_tools, text="Follow Step", command=self.follow_line_single_step).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).pack(side=tk.LEFT)
-
-        preview_frame = ttk.LabelFrame(self, text="Live Preview", padding=4)
-        preview_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self.preview_box = ttk.Frame(
-            preview_frame,
-            width=self.preview_display_width,
-            height=self.preview_display_height,
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ttk.Button(follow_tools, text="Follow Step", command=self.follow_line_single_step).grid(
+            row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
-        self.preview_box.pack(side=tk.TOP, expand=True)
-        self.preview_box.pack_propagate(False)
-        self.preview_label = ttk.Label(self.preview_box, anchor=tk.CENTER)
-        self.preview_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        footer = ttk.Label(
-            self,
-            text=(
-                "Calibration, dot-centering, single-step follow, and screen jogs use guarded X/Y incremental jogs through LinuxCNC MANUAL mode. Torch/plasma should stay disabled. "
-                "The camera steers; LinuxCNC remains the ruler."
-            ),
-            anchor=tk.W,
-            padding=(8, 0, 8, 8),
-        )
-        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        follow_tools.columnconfigure(1, weight=1)
 
     def _register_traces(self) -> None:
         watched_vars: tuple[tk.Variable, ...] = (

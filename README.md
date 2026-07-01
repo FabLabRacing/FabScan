@@ -1,61 +1,56 @@
-# FabScan v0.5.6 - Single-Step Edge Follow
+# FabScan v0.5.7 - Calibration Window Layout Cleanup
 
-This release adds the first camera-driven line/edge follow move to Camera Calibration Lite.
+This release cleans up the Camera Calibration Lite window layout after the first single-step edge-following test.
 
-The important guardrail is that this is **not continuous following**. One button press performs one bounded move:
+## What changed
 
-1. Detect the current line/edge near the crosshair.
-2. Convert the line offset to a limited X/Y correction using the saved camera calibration.
-3. Convert the detected line angle to a small tangent move.
-4. Send guarded X/Y incremental jogs through LinuxCNC MANUAL/JOG mode.
-5. Stop and re-read the camera.
+The motion and camera behavior is unchanged from v0.5.6. This is a GUI/layout patch only.
 
-LinuxCNC remains the motion controller and the position ruler. FabScan only uses the camera to choose the next small correction.
+Changes:
 
-## New controls
+- Shortened the top camera/setup area.
+- Moved Dot / Camera / Calibration / Line status to the left side of the live preview.
+- Moved Dot Center Jog controls to the right side of the live preview.
+- Moved Single-Step Follow controls to the right side of the live preview.
+- Kept Line / Edge Preview controls near the status area.
+- Reduced the starting window height so the lower preview area is less likely to be cut off on the plasma PC display.
+- Increased the live preview box slightly while keeping it fixed-size so the window does not resize while video updates.
 
-The Camera Calibration Lite window now has a **Single-Step Line / Edge Follow** panel:
+## Install
 
-- **Enable follow** - must be checked before Follow Step will move.
-- **Step** - distance to move along the detected line/edge tangent.
-- **Max correct** - maximum side correction allowed toward the crosshair.
-- **Min conf** - minimum detection confidence required before movement.
-- **Direction** - Forward or Reverse along the detected line.
-- **Capture after move** - optionally capture the post-move LinuxCNC position into the active manual trace.
-- **Follow Step** - performs one bounded follow move.
-- **STOP Move** - sends LinuxCNC abort.
+Copy the drop-in files over your existing project:
 
-## Suggested first test
+```bash
+cd ~/projects/FabScan
 
-Use conservative values:
-
-```text
-Step: 0.010 or 0.025
-Max correct: 0.010 or 0.025
-Min conf: 45
-Feed/min: 5
+cp /path/to/unzipped/FabScan_v057_cal_layout_dropin/fabscan/app.py fabscan/app.py
+cp /path/to/unzipped/FabScan_v057_cal_layout_dropin/fabscan/camera_calibration.py fabscan/camera_calibration.py
+cp /path/to/unzipped/FabScan_v057_cal_layout_dropin/README_v0.5.7.md README.md
 ```
 
-Workflow:
+Then test:
 
-1. Open LinuxCNC/QtPlasmaC and switch to MANUAL/JOG mode.
-2. Home X/Y/Z.
-3. Keep torch/plasma disabled.
-4. Open Camera Calibrate.
-5. Run camera calibration if not already loaded.
-6. Place a high-contrast line/edge under the camera.
-7. Use Find Line / Edge and verify the overlay and confidence look sane.
-8. Check Enable follow.
-9. Click Follow Step once.
-10. If it moves the wrong way along the line, change Direction.
+```bash
+source .venv/bin/activate
+python3 -m py_compile fabscan/*.py fabscan.py
+python3 fabscan.py
+```
 
-## Files changed
+## Test notes
 
-- `fabscan/app.py`
-- `fabscan/camera_calibration.py`
-- `fabscan/settings.py`
-- `README.md`
+Open **Camera Calibrate** and verify:
 
-## Notes
+- The top controls no longer burn up so much vertical space.
+- The Dot / Camera / Calibration info is visible to the left of the preview.
+- The jog and follow controls are on the right of the preview.
+- The bottom of the live preview is no longer cut off.
+- Dot calibration, Center Dot, Find Line / Edge, and Follow Step behave the same as v0.5.6.
 
-This is still a proof step. It does not chase the edge continuously. It moves once, stops, and waits for the next button press.
+## Commit
+
+```bash
+git status
+git add fabscan/app.py fabscan/camera_calibration.py README.md
+git commit -m "Clean up camera calibration window layout"
+git push
+```
