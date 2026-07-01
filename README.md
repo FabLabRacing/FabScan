@@ -1,79 +1,51 @@
-# FabScan v0.4.0 - Controlled X/Y Motion
+# FabScan v0.4.1 - Point / Trace Navigation
 
-FabScan v0.4.0 adds the first controlled motion workflow for LinuxCNC.
+FabScan v0.4.1 adds point navigation and trace editing tools on top of the v0.4.0 controlled X/Y motion workflow.
 
-This is intentionally conservative:
+## Added
 
-- X/Y only
-- one point-to-point move at a time
-- G1 feed move, not rapid-only motion
-- no Z motion
-- no torch/plasma commands
-- no program start
-- no automatic trace following
-- explicit enable checkbox required each session
-- confirmation dialog before each controlled move
-- STOP Move button sends a LinuxCNC abort command
+- Point / Trace Navigation panel.
+- First Pt / Prev Pt / Next Pt / Last Pt selection buttons.
+- Selecting a point makes that trace the active trace.
+- Selected point is highlighted in the Manual Trace Preview.
+- Move Pt button copies the selected point to the controlled-motion target and uses the existing guarded Move to Target workflow.
+- Replace button replaces the selected captured point with the current LinuxCNC position.
+- Insert After button inserts the current LinuxCNC position after the selected point.
+- Delete Pt button removes the selected point and keeps trace groups valid.
 
-## Controlled Motion panel
+## Safety behavior
 
-The new panel is named:
+Motion behavior is unchanged from v0.4.0:
 
-```text
-Controlled Motion - X/Y Point Move
+- X/Y only.
+- No Z motion.
+- No torch commands.
+- No program start.
+- Controlled moves require explicit enable.
+- Each controlled move still asks for confirmation.
+- LinuxCNC state checks are still handled by the LinuxCNC adapter before motion.
+
+## Typical correction workflow
+
+1. Capture a trace.
+2. Select a point in the trace list or use Prev/Next.
+3. Click Move Pt to return to that point.
+4. Jog/fine move to the corrected location.
+5. Click Replace to update that point.
+6. Export Manual Trace DXF.
+
+## Install drop-in files
+
+```bash
+cd ~/projects/FabScan
+cp /path/to/unzipped/FabScan_v041_point_navigation_dropin/fabscan/app.py fabscan/app.py
+cp /path/to/unzipped/FabScan_v041_point_navigation_dropin/README_v0.4.1.md README.md
 ```
 
-It includes:
+Then test:
 
-```text
-Enable controlled moves
-Target X
-Target Y
-Feed/min
-Use Current
-Use Selected Pt
-Move to Target
-STOP Move
+```bash
+source .venv/bin/activate
+python3 -m py_compile fabscan/*.py fabscan.py
+python3 fabscan.py
 ```
-
-## Basic workflow
-
-1. Start LinuxCNC/QtPlasmaC normally.
-2. Home the machine.
-3. Keep the torch/plasma disabled while testing.
-4. Refresh LinuxCNC in FabScan.
-5. Enable controlled moves.
-6. Set a small feed/min value.
-7. Set a target using either:
-   - `Use Current`, then edit X/Y manually, or
-   - select a captured trace point and click `Use Selected Pt`.
-8. Click `Move to Target`.
-9. Confirm the move.
-10. Use the physical E-stop if anything unexpected happens. `STOP Move` is only a software abort.
-
-## Coordinate behavior
-
-Controlled moves use the current FabScan coordinate source:
-
-- `Work coordinates` sends a normal absolute work-coordinate `G90 G1 X... Y... F...` move.
-- `Machine coordinates` sends a machine-coordinate `G90 G53 G1 X... Y... F...` move.
-
-For normal tracing, `Work coordinates` is usually the preferred mode.
-
-## Safety checks
-
-FabScan refuses controlled moves unless LinuxCNC is:
-
-- connected
-- task state ON
-- interpreter IDLE
-- task mode MANUAL or MDI
-- X/Y/Z homed
-
-FabScan also limits controlled move feed to 120 units/minute.
-
-## Notes
-
-This version does not follow an entire contour automatically. It only moves to one X/Y target at a time.
-
-The next likely step is an assisted point-to-point workflow, such as `Move to Next Trace Point`, after this version is proven stable.

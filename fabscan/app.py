@@ -26,8 +26,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.4.0"
-APP_TITLE = f"FabScan v{APP_VERSION} - Controlled X/Y Motion"
+APP_VERSION = "0.4.1"
+APP_TITLE = f"FabScan v{APP_VERSION} - Point / Trace Navigation"
 
 
 class FabScanApp(tk.Tk):
@@ -624,6 +624,46 @@ class FabScanApp(tk.Tk):
         self.trace_tree.column("y", width=70, anchor=tk.E, stretch=True)
         self.trace_tree.column("z", width=70, anchor=tk.E, stretch=True)
         self.trace_tree.pack(fill=tk.X, pady=(6, 0))
+        self.trace_tree.bind("<<TreeviewSelect>>", self.on_trace_tree_select)
+
+        nav_frame = ttk.LabelFrame(trace_frame, text="Point / Trace Navigation", padding=6)
+        nav_frame.pack(fill=tk.X, pady=(8, 0))
+
+        nav_row1 = ttk.Frame(nav_frame)
+        nav_row1.pack(fill=tk.X)
+        ttk.Button(nav_row1, text="First Pt", command=self.select_first_trace_point).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2)
+        )
+        ttk.Button(nav_row1, text="Prev Pt", command=lambda: self.select_relative_trace_point(-1)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2
+        )
+        ttk.Button(nav_row1, text="Next Pt", command=lambda: self.select_relative_trace_point(+1)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2
+        )
+        ttk.Button(nav_row1, text="Last Pt", command=self.select_last_trace_point).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0)
+        )
+
+        nav_row2 = ttk.Frame(nav_frame)
+        nav_row2.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(nav_row2, text="Move Pt", command=self.move_to_selected_trace_point).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2)
+        )
+        ttk.Button(nav_row2, text="Replace", command=self.replace_selected_trace_point_with_current).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2
+        )
+        ttk.Button(nav_row2, text="Insert After", command=self.insert_trace_point_after_selected).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2
+        )
+        ttk.Button(nav_row2, text="Delete Pt", command=self.delete_selected_trace_point).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0)
+        )
+
+        ttk.Label(
+            nav_frame,
+            text="Select a point to make its trace active. Move Pt uses the controlled-motion target and safety checks.",
+            wraplength=300,
+        ).pack(anchor=tk.W, pady=(5, 0))
 
         trace_footer = ttk.Frame(trace_frame)
         trace_footer.pack(fill=tk.X, pady=(6, 0))
@@ -694,7 +734,7 @@ class FabScanApp(tk.Tk):
 
         ttk.Label(
             trace_frame,
-            text="v0.4.0: Controlled Motion can send one guarded X/Y point move to a typed or selected target. Jog remains guarded X/Y incremental only.",
+            text="v0.4.1: Point navigation lets you move to, replace, insert, and delete captured trace points. Motion remains guarded X/Y only.",
             wraplength=300,
         ).pack(anchor=tk.W, pady=(6, 0))
 
@@ -959,6 +999,207 @@ class FabScanApp(tk.Tk):
         self.motion_status_var.set(f"Target set from current position: X{x:.4f} Y{y:.4f}")
         self.queue_save_settings()
 
+    def get_trace_point_iids(self) -> list[str]:
+        """Return all point item IDs currently shown in the trace point tree."""
+
+        if not hasattr(self, "trace_tree"):
+            return []
+        return [str(item) for item in self.trace_tree.get_children("")]
+
+    def parse_trace_iid(self, iid: str) -> Optional[tuple[int, int]]:
+        """Parse a trace tree item id into zero-based trace/point indexes."""
+
+        try:
+            trace_text, point_text = str(iid).split(":", 1)
+            trace_index = int(trace_text)
+            point_index = int(point_text)
+        except (TypeError, ValueError):
+            return None
+        if trace_index < 0 or trace_index >= len(self.trace_groups):
+            return None
+        if point_index < 0 or point_index >= len(self.trace_groups[trace_index]):
+            return None
+        return trace_index, point_index
+
+    def select_trace_point_iid(self, iid: str) -> bool:
+        """Select a trace point in the list and make its trace active."""
+
+        parsed = self.parse_trace_iid(iid)
+        if parsed is None or not hasattr(self, "trace_tree"):
+            return False
+        trace_index, _point_index = parsed
+        self.active_trace_index = trace_index
+        self.trace_tree.selection_set(iid)
+        self.trace_tree.focus(iid)
+        self.trace_tree.see(iid)
+        self.redraw_preview()
+        return True
+
+    def on_trace_tree_select(self, _event: object | None = None) -> None:
+        """Make the selected point's trace active and redraw the preview."""
+
+        selected = self.get_selected_trace_point()
+        if selected is None:
+            return
+        trace_index, _point_index, _point = selected
+        self.active_trace_index = trace_index
+        self.redraw_preview()
+
+    def select_relative_trace_point(self, delta: int) -> None:
+        """Select the previous or next point in the trace list."""
+
+        iids = self.get_trace_point_iids()
+        if not iids:
+            self.append_status("\nNo trace points to select.")
+            return
+
+        selection = self.trace_tree.selection() if hasattr(self, "trace_tree") else ()
+        if selection and str(selection[0]) in iids:
+            current_index = iids.index(str(selection[0]))
+        elif delta >= 0:
+            current_index = -1
+        else:
+            current_index = 0
+
+        new_index = (current_index + delta) % len(iids)
+        self.select_trace_point_iid(iids[new_index])
+
+    def select_first_trace_point(self) -> None:
+        """Select the first point in the selected/active trace, falling back to the first trace point overall."""
+
+        selected = self.get_selected_trace_point()
+        target_trace = selected[0] if selected is not None else self.active_trace_index
+        group = self.trace_groups[target_trace] if 0 <= target_trace < len(self.trace_groups) else []
+        if group:
+            self.select_trace_point_iid(f"{target_trace}:0")
+            return
+
+        iids = self.get_trace_point_iids()
+        if iids:
+            self.select_trace_point_iid(iids[0])
+        else:
+            self.append_status("\nNo trace points to select.")
+
+    def select_last_trace_point(self) -> None:
+        """Select the last point in the selected/active trace, falling back to the last point overall."""
+
+        selected = self.get_selected_trace_point()
+        target_trace = selected[0] if selected is not None else self.active_trace_index
+        group = self.trace_groups[target_trace] if 0 <= target_trace < len(self.trace_groups) else []
+        if group:
+            self.select_trace_point_iid(f"{target_trace}:{len(group) - 1}")
+            return
+
+        iids = self.get_trace_point_iids()
+        if iids:
+            self.select_trace_point_iid(iids[-1])
+        else:
+            self.append_status("\nNo trace points to select.")
+
+    def read_current_trace_position_or_warn(self, title: str) -> Optional[tuple[float, float, float]]:
+        """Refresh and return the active LinuxCNC position for trace editing."""
+
+        self.refresh_linuxcnc_status(show_errors=False)
+        status = self.latest_linuxcnc_status
+        if status is None or not status.connected:
+            messagebox.showinfo(
+                title,
+                (status.error if status is not None else None)
+                or "Could not read LinuxCNC position. Start LinuxCNC and try Refresh Position.",
+                parent=self,
+            )
+            return None
+        return self.get_active_linuxcnc_position(status)
+
+    def move_to_selected_trace_point(self) -> None:
+        """Move to the currently selected trace point using the guarded controlled-motion path."""
+
+        if self.get_selected_trace_point() is None:
+            messagebox.showinfo("No trace point selected", "Select a captured trace point first.", parent=self)
+            return
+        self.set_motion_target_from_selected_trace_point()
+        self.controlled_move_to_target()
+
+    def replace_selected_trace_point_with_current(self) -> None:
+        """Replace the selected trace point with the current LinuxCNC position."""
+
+        selected = self.get_selected_trace_point()
+        if selected is None:
+            messagebox.showinfo("No trace point selected", "Select a captured trace point first.", parent=self)
+            return
+
+        position = self.read_current_trace_position_or_warn("Replace trace point")
+        if position is None:
+            return
+
+        trace_index, point_index, old_point = selected
+        self.trace_groups[trace_index][point_index] = position
+        iid = f"{trace_index}:{point_index}"
+        self.active_trace_index = trace_index
+        self.refresh_trace_point_list(select_iid=iid)
+        self.append_status(
+            f"\nReplaced trace {trace_index + 1}.{point_index + 1}: "
+            f"old X {old_point[0]:.4f}, Y {old_point[1]:.4f} -> "
+            f"new X {position[0]:.4f}, Y {position[1]:.4f}."
+        )
+
+    def insert_trace_point_after_selected(self) -> None:
+        """Insert the current LinuxCNC position after the selected trace point."""
+
+        selected = self.get_selected_trace_point()
+        if selected is None:
+            messagebox.showinfo("No trace point selected", "Select a captured trace point first.", parent=self)
+            return
+
+        position = self.read_current_trace_position_or_warn("Insert trace point")
+        if position is None:
+            return
+
+        trace_index, point_index, _old_point = selected
+        insert_index = point_index + 1
+        self.trace_groups[trace_index].insert(insert_index, position)
+        iid = f"{trace_index}:{insert_index}"
+        self.active_trace_index = trace_index
+        self.refresh_trace_point_list(select_iid=iid)
+        self.append_status(
+            f"\nInserted trace {trace_index + 1}.{insert_index + 1}: "
+            f"X {position[0]:.4f}, Y {position[1]:.4f}, Z {position[2]:.4f}."
+        )
+
+    def delete_selected_trace_point(self) -> None:
+        """Delete the selected trace point and keep the rest of the trace groups valid."""
+
+        selected = self.get_selected_trace_point()
+        if selected is None:
+            messagebox.showinfo("No trace point selected", "Select a captured trace point first.", parent=self)
+            return
+
+        trace_index, point_index, point = selected
+        deleted_label = f"trace {trace_index + 1}.{point_index + 1}"
+        removed = self.trace_groups[trace_index].pop(point_index)
+
+        if not self.trace_groups[trace_index] and len(self.trace_groups) > 1:
+            del self.trace_groups[trace_index]
+            self.active_trace_index = max(0, min(trace_index, len(self.trace_groups) - 1))
+            select_iid = None
+        else:
+            self.active_trace_index = trace_index
+            if self.trace_groups[trace_index]:
+                new_point_index = min(point_index, len(self.trace_groups[trace_index]) - 1)
+                select_iid = f"{trace_index}:{new_point_index}"
+            else:
+                select_iid = None
+
+        if not self.trace_groups:
+            self.trace_groups = [[]]
+            self.active_trace_index = 0
+            select_iid = None
+
+        self.refresh_trace_point_list(select_iid=select_iid)
+        self.append_status(
+            f"\nDeleted {deleted_label}: X {removed[0]:.4f}, Y {removed[1]:.4f}, Z {removed[2]:.4f}."
+        )
+
     def get_selected_trace_point(self) -> Optional[tuple[int, int, tuple[float, float, float]]]:
         """Return selected trace point as (trace_index, point_index, point)."""
 
@@ -1105,7 +1346,7 @@ class FabScanApp(tk.Tk):
         position = self.get_active_linuxcnc_position(status)
         active_points = self.get_active_trace_points()
         active_points.append(position)
-        self.refresh_trace_point_list()
+        self.refresh_trace_point_list(select_iid=f"{self.active_trace_index}:{len(active_points) - 1}")
         self.append_status(
             f"\nCaptured {self.get_active_trace_label()} point {len(active_points)}: "
             f"X {position[0]:.4f}, Y {position[1]:.4f}, Z {position[2]:.4f} "
@@ -1348,9 +1589,18 @@ class FabScanApp(tk.Tk):
         sampled[-1] = (float(x3), float(y3), float(z3))
         return sampled
 
-    def refresh_trace_point_list(self) -> None:
+    def refresh_trace_point_list(self, select_iid: Optional[str] = None) -> None:
+        previous_selection: Optional[str] = None
+        if hasattr(self, "trace_tree"):
+            selection = self.trace_tree.selection()
+            if selection:
+                previous_selection = str(selection[0])
+
         for item in self.trace_tree.get_children():
             self.trace_tree.delete(item)
+
+        if select_iid is None:
+            select_iid = previous_selection
 
         last_iid: Optional[str] = None
         for group_index, group in enumerate(self.trace_groups, start=1):
@@ -1381,7 +1631,10 @@ class FabScanApp(tk.Tk):
             f"{len(nonempty_groups)} {trace_word}, {total_points} {point_word} | "
             f"Active {self.active_trace_index + 1}: {len(active_points)}"
         )
-        if last_iid is not None:
+        tree_iids = set(self.trace_tree.get_children(""))
+        if select_iid is not None and select_iid in tree_iids:
+            self.select_trace_point_iid(select_iid)
+        elif last_iid is not None:
             self.trace_tree.see(last_iid)
 
         self.redraw_preview()
@@ -1635,7 +1888,7 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
-            "v0.3.4 LinuxCNC support adds guarded X/Y incremental jog buttons, MANUAL-mode checks, multi-contour position capture, and live trace preview.\n\n"
+            "v0.4.1 LinuxCNC support adds guarded X/Y jogs, controlled point moves, multi-contour trace capture, assisted line/arc tools, and point/trace navigation.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )
@@ -2618,16 +2871,25 @@ class FabScanApp(tk.Tk):
                         width=2,
                     )
 
+            selected_trace_point = self.get_selected_trace_point()
+            selected_trace_index = selected_trace_point[0] if selected_trace_point is not None else None
+            selected_point_index = selected_trace_point[1] if selected_trace_point is not None else None
+
             for point_index, (x, y, z) in enumerate(group, start=1):
                 cx, cy = world_to_canvas(float(x), float(y))
-                radius = 5
+                is_selected = (
+                    selected_trace_index == (group_index - 1)
+                    and selected_point_index == (point_index - 1)
+                )
+                radius = 8 if is_selected else 5
                 self.canvas.create_oval(
                     cx - radius,
                     cy - radius,
                     cx + radius,
                     cy + radius,
-                    fill=point_fill,
-                    outline="black",
+                    fill="orange" if is_selected else point_fill,
+                    outline="white" if is_selected else "black",
+                    width=3 if is_selected else 1,
                 )
                 if bool(self.trace_show_point_numbers_var.get()):
                     self.canvas.create_text(
