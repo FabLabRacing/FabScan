@@ -26,8 +26,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.4.1"
-APP_TITLE = f"FabScan v{APP_VERSION} - Point / Trace Navigation"
+APP_VERSION = "0.4.3"
+APP_TITLE = f"FabScan v{APP_VERSION} - Native Trace Continuation"
 
 
 class FabScanApp(tk.Tk):
@@ -66,7 +66,9 @@ class FabScanApp(tk.Tk):
         self.motion_busy = False
         self.motion_monitor_job: Optional[str] = None
         self.trace_groups: list[list[tuple[float, float, float]]] = [[]]
+        self.trace_entities: list[Optional[dict[str, object]]] = [None]
         self.active_trace_index = 0
+        self.trace_arc_center: Optional[tuple[float, float, float]] = None
 
         self.display_scale = 1.0
         self.display_offset_x = 0.0
@@ -118,6 +120,7 @@ class FabScanApp(tk.Tk):
         self.linuxcnc_y_var = tk.StringVar(value="—")
         self.linuxcnc_z_var = tk.StringVar(value="—")
         self.trace_count_var = tk.StringVar(value="Trace 1: 0 points")
+        self.trace_arc_center_var = tk.StringVar(value="Arc center: —")
 
         contour_filter_label = str(self.settings.get("contour_filter_label", "All"))
         if contour_filter_label not in ("All", "Enabled only", "Disabled only", "OUTSIDE", "INSIDE"):
@@ -718,13 +721,26 @@ class FabScanApp(tk.Tk):
         ttk.Button(fit_row2, text="Circle Fit", command=self.fit_active_trace_circle).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
         )
-        ttk.Button(fit_row2, text="Arc Last 3", command=self.fit_active_trace_arc_last3).pack(
+        ttk.Button(fit_row2, text="3 Pt Arc", command=self.fit_active_trace_arc_3_point).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
         )
 
+        fit_row3 = ttk.Frame(fit_frame)
+        fit_row3.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(fit_row3, text="Set Center", command=self.set_trace_arc_center_from_current).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3)
+        )
+        ttk.Button(fit_row3, text="Center Arc", command=self.fit_active_trace_center_arc).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 3)
+        )
+        ttk.Button(fit_row3, text="Clear Center", command=self.clear_trace_arc_center).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0)
+        )
+
+        ttk.Label(fit_frame, textvariable=self.trace_arc_center_var, wraplength=300).pack(anchor=tk.W, pady=(5, 0))
         ttk.Label(
             fit_frame,
-            text="Tools modify the active trace only. Arc Last 3 replaces the last 3 captured points with a sampled arc.",
+            text="Circle/arc tools export native DXF geometry. 3 Pt Arc uses exactly 3 points; Center Arc uses stored center + 2 active points.",
             wraplength=300,
         ).pack(anchor=tk.W, pady=(5, 0))
 
@@ -734,9 +750,122 @@ class FabScanApp(tk.Tk):
 
         ttk.Label(
             trace_frame,
-            text="v0.4.1: Point navigation lets you move to, replace, insert, and delete captured trace points. Motion remains guarded X/Y only.",
+            text="v0.4.3: Native DXF arcs/circles stay intact when you continue tracing from their endpoint.",
             wraplength=300,
         ).pack(anchor=tk.W, pady=(6, 0))
+
+
+    def ensure_trace_entity_list(self) -> None:
+        """Keep trace entity metadata aligned with trace_groups."""
+
+        while len(self.trace_entities) < len(self.trace_groups):
+            self.trace_entities.append(None)
+        if len(self.trace_entities) > len(self.trace_groups):
+            self.trace_entities = self.trace_entities[: len(self.trace_groups)]
+
+    def get_trace_entity(self, trace_index: int) -> Optional[dict[str, object]]:
+        self.ensure_trace_entity_list()
+        if 0 <= trace_index < len(self.trace_entities):
+            return self.trace_entities[trace_index]
+        return None
+
+    def set_trace_entity(self, trace_index: int, entity: Optional[dict[str, object]]) -> None:
+        self.ensure_trace_entity_list()
+        if 0 <= trace_index < len(self.trace_entities):
+            self.trace_entities[trace_index] = entity
+
+    def clear_trace_entity(self, trace_index: int, reason: str | None = None) -> None:
+        entity = self.get_trace_entity(trace_index)
+        if entity is None:
+            return
+        self.set_trace_entity(trace_index, None)
+        if reason:
+            self.append_status(f"\nTrace {trace_index + 1} native geometry cleared: {reason}.")
+
+    def get_active_trace_entity_label(self) -> str:
+        entity = self.get_trace_entity(self.active_trace_index)
+        if not isinstance(entity, dict):
+            return "polyline"
+        return str(entity.get("label", entity.get("type", "polyline")))
+
+    def angle_degrees_from_center(self, center_x: float, center_y: float, x: float, y: float) -> float:
+        return math.degrees(math.atan2(float(y) - center_y, float(x) - center_x)) % 360.0
+
+    def minor_arc_angles_from_center(
+        self,
+        center: tuple[float, float, float] | tuple[float, float],
+        start: tuple[float, float, float] | tuple[float, float],
+        end: tuple[float, float, float] | tuple[float, float],
+    ) -> tuple[float, float, float, float]:
+        """Return DXF CCW start/end angles for the short arc plus start/end radii."""
+
+        center_x = float(center[0])
+        center_y = float(center[1])
+        start_angle = self.angle_degrees_from_center(center_x, center_y, float(start[0]), float(start[1]))
+        end_angle = self.angle_degrees_from_center(center_x, center_y, float(end[0]), float(end[1]))
+        ccw_delta = (end_angle - start_angle) % 360.0
+        if ccw_delta <= 180.0:
+            dxf_start = start_angle
+            dxf_end = end_angle
+        else:
+            # DXF ARC is CCW. Swapping start/end draws the same minor arc geometry.
+            dxf_start = end_angle
+            dxf_end = start_angle
+        start_radius = math.hypot(float(start[0]) - center_x, float(start[1]) - center_y)
+        end_radius = math.hypot(float(end[0]) - center_x, float(end[1]) - center_y)
+        return dxf_start, dxf_end, start_radius, end_radius
+
+    def trace_entity_display_points(
+        self,
+        trace_index: int,
+        group: list[tuple[float, float, float]],
+    ) -> list[tuple[float, float, float]]:
+        """Return display points for the trace preview, sampling native entities when needed."""
+
+        entity = self.get_trace_entity(trace_index)
+        if not isinstance(entity, dict):
+            return list(group)
+
+        entity_kind = str(entity.get("type", "polyline"))
+        if entity_kind == "circle":
+            center = entity.get("center")
+            radius = float(entity.get("radius", 0.0))
+            if center is None or radius <= 0.0:
+                return list(group)
+            cx = float(center[0])
+            cy = float(center[1])
+            z = float(group[0][2]) if group else 0.0
+            segments = self.get_trace_fit_segment_count(minimum=24, maximum=360)
+            return [
+                (cx + radius * math.cos(2.0 * math.pi * index / segments),
+                 cy + radius * math.sin(2.0 * math.pi * index / segments),
+                 z)
+                for index in range(segments + 1)
+            ]
+
+        if entity_kind == "arc":
+            center = entity.get("center")
+            radius = float(entity.get("radius", 0.0))
+            if center is None or radius <= 0.0:
+                return list(group)
+            cx = float(center[0])
+            cy = float(center[1])
+            z = float(group[0][2]) if group else 0.0
+            start_angle = math.radians(float(entity.get("start_angle", 0.0)))
+            end_angle = math.radians(float(entity.get("end_angle", 0.0)))
+            sweep = (end_angle - start_angle) % (2.0 * math.pi)
+            if math.isclose(sweep, 0.0, abs_tol=1e-9):
+                sweep = 2.0 * math.pi
+            max_segments = self.get_trace_fit_segment_count(minimum=8, maximum=360)
+            actual_segments = max(4, int(math.ceil(max_segments * (sweep / (2.0 * math.pi)))))
+            return [
+                (cx + radius * math.cos(start_angle + sweep * index / actual_segments),
+                 cy + radius * math.sin(start_angle + sweep * index / actual_segments),
+                 z)
+                for index in range(actual_segments + 1)
+            ]
+
+        return list(group)
 
 
     def get_active_trace_points(self) -> list[tuple[float, float, float]]:
@@ -773,6 +902,7 @@ class FabScanApp(tk.Tk):
             return
 
         self.trace_groups.append([])
+        self.trace_entities.append(None)
         self.active_trace_index = len(self.trace_groups) - 1
         self.refresh_trace_point_list()
         self.append_status(
@@ -1133,6 +1263,7 @@ class FabScanApp(tk.Tk):
             return
 
         trace_index, point_index, old_point = selected
+        self.clear_trace_entity(trace_index, "point was replaced")
         self.trace_groups[trace_index][point_index] = position
         iid = f"{trace_index}:{point_index}"
         self.active_trace_index = trace_index
@@ -1156,6 +1287,7 @@ class FabScanApp(tk.Tk):
             return
 
         trace_index, point_index, _old_point = selected
+        self.clear_trace_entity(trace_index, "point was inserted")
         insert_index = point_index + 1
         self.trace_groups[trace_index].insert(insert_index, position)
         iid = f"{trace_index}:{insert_index}"
@@ -1175,11 +1307,14 @@ class FabScanApp(tk.Tk):
             return
 
         trace_index, point_index, point = selected
+        self.clear_trace_entity(trace_index, "point was deleted")
         deleted_label = f"trace {trace_index + 1}.{point_index + 1}"
         removed = self.trace_groups[trace_index].pop(point_index)
 
         if not self.trace_groups[trace_index] and len(self.trace_groups) > 1:
             del self.trace_groups[trace_index]
+            if trace_index < len(self.trace_entities):
+                del self.trace_entities[trace_index]
             self.active_trace_index = max(0, min(trace_index, len(self.trace_groups) - 1))
             select_iid = None
         else:
@@ -1192,6 +1327,7 @@ class FabScanApp(tk.Tk):
 
         if not self.trace_groups:
             self.trace_groups = [[]]
+            self.trace_entities = [None]
             self.active_trace_index = 0
             select_iid = None
 
@@ -1330,7 +1466,14 @@ class FabScanApp(tk.Tk):
             messagebox.showinfo("FabScan stop/abort", result.message, parent=self)
 
     def capture_trace_point(self) -> None:
-        """Capture the current LinuxCNC X/Y/Z position into the active manual trace."""
+        """Capture the current LinuxCNC X/Y/Z position into the active manual trace.
+
+        If the active trace has already been fitted to a native DXF entity,
+        preserve that entity and automatically start a continuation trace from
+        its last defining point. This lets a user create, for example, a native
+        arc and then capture the next tangent line point without converting the
+        arc back into a two-point polyline.
+        """
 
         self.refresh_linuxcnc_status(show_errors=False)
         status = self.latest_linuxcnc_status
@@ -1345,6 +1488,27 @@ class FabScanApp(tk.Tk):
 
         position = self.get_active_linuxcnc_position(status)
         active_points = self.get_active_trace_points()
+        active_entity = self.get_trace_entity(self.active_trace_index)
+
+        if active_points and isinstance(active_entity, dict):
+            # Do not destroy a native LINE/ARC/CIRCLE just because the user is
+            # continuing the trace. Start a new trace seeded from the previous
+            # endpoint, then append the newly captured point. The separate DXF
+            # entities will still touch if the endpoint coordinates match.
+            seed_point = active_points[-1]
+            previous_label = self.get_active_trace_label()
+            self.trace_groups.append([seed_point, position])
+            self.trace_entities.append(None)
+            self.active_trace_index = len(self.trace_groups) - 1
+            self.refresh_trace_point_list(select_iid=f"{self.active_trace_index}:1")
+            self.append_status(
+                f"\nPreserved {previous_label} native {active_entity.get('label', active_entity.get('type', 'entity'))}. "
+                f"Started {self.get_active_trace_label()} from the fitted endpoint and captured point 2: "
+                f"X {position[0]:.4f}, Y {position[1]:.4f}, Z {position[2]:.4f} "
+                f"({self.linuxcnc_coord_mode_var.get()})"
+            )
+            return
+
         active_points.append(position)
         self.refresh_trace_point_list(select_iid=f"{self.active_trace_index}:{len(active_points) - 1}")
         self.append_status(
@@ -1357,6 +1521,7 @@ class FabScanApp(tk.Tk):
         active_points = self.get_active_trace_points()
         if not active_points:
             return
+        self.clear_trace_entity(self.active_trace_index, "point was removed")
         removed = active_points.pop()
         self.refresh_trace_point_list()
         self.append_status(
@@ -1365,12 +1530,15 @@ class FabScanApp(tk.Tk):
         )
 
     def clear_trace_points(self) -> None:
-        if self.get_total_trace_point_count() == 0 and len(self.trace_groups) <= 1:
+        if self.get_total_trace_point_count() == 0 and len(self.trace_groups) <= 1 and self.trace_arc_center is None:
             return
         if not messagebox.askyesno("Clear trace points?", "Clear all manually captured trace groups?", parent=self):
             return
         self.trace_groups = [[]]
+        self.trace_entities = [None]
         self.active_trace_index = 0
+        self.trace_arc_center = None
+        self.trace_arc_center_var.set("Arc center: —")
         self.refresh_trace_point_list()
         self.append_status("\nManual trace groups cleared.")
 
@@ -1405,19 +1573,25 @@ class FabScanApp(tk.Tk):
         if not new_points:
             return
         self.trace_groups[self.active_trace_index] = new_points
+        self.set_trace_entity(self.active_trace_index, None)
         self.refresh_trace_point_list()
         self.append_status("\n" + message)
 
     def fit_active_trace_line_endpoints(self) -> None:
-        """Reduce the active trace to a straight line between its first and last point."""
+        """Reduce the active trace to a native DXF line between its first and last point."""
 
         points = self.warn_active_trace_points(2, "Line Endpoints")
         if points is None:
             return
         new_points = [points[0], points[-1]]
-        self.replace_active_trace_points(
-            new_points,
-            f"Line Endpoints replaced {self.get_active_trace_label()} with a 2-point straight line.",
+        self.trace_groups[self.active_trace_index] = new_points
+        self.set_trace_entity(
+            self.active_trace_index,
+            {"type": "line", "label": "LINE", "start": new_points[0], "end": new_points[1]},
+        )
+        self.refresh_trace_point_list()
+        self.append_status(
+            f"\nLine Endpoints replaced {self.get_active_trace_label()} with a native DXF LINE."
         )
 
     def fit_active_trace_rectangle(self) -> None:
@@ -1447,17 +1621,156 @@ class FabScanApp(tk.Tk):
             (float(x1), float(y2), z_mid),
         ]
         self.trace_closed_var.set(True)
-        self.replace_active_trace_points(
-            new_points,
-            f"Rect 2 Pts replaced {self.get_active_trace_label()} with a 4-corner rectangle. Closed trace enabled.",
+        self.trace_groups[self.active_trace_index] = new_points
+        self.set_trace_entity(self.active_trace_index, {"type": "rect", "label": "RECT"})
+        self.refresh_trace_point_list()
+        self.append_status(
+            f"\nRect 2 Pts replaced {self.get_active_trace_label()} with a 4-corner rectangle. Closed trace enabled."
         )
 
     def fit_active_trace_circle(self) -> None:
-        """Fit a circle to the active trace points and replace the trace with sampled circle points."""
+        """Fit a native DXF circle to the active trace points."""
 
         points = self.warn_active_trace_points(3, "Circle Fit")
         if points is None:
             return
+
+        circle = self.calculate_circle_fit(points, tool_name="Circle Fit")
+        if circle is None:
+            return
+        center_x, center_y, radius = circle
+
+        self.set_trace_entity(
+            self.active_trace_index,
+            {
+                "type": "circle",
+                "label": "CIRCLE",
+                "center": (center_x, center_y, 0.0),
+                "radius": radius,
+            },
+        )
+        self.refresh_trace_point_list()
+        self.append_status(
+            f"\nCircle Fit set {self.get_active_trace_label()} to export as a native DXF CIRCLE. "
+            f"Center X {center_x:.4f}, Y {center_y:.4f}, radius {radius:.4f}."
+        )
+
+    def fit_active_trace_arc_3_point(self) -> None:
+        """Fit a native DXF arc through exactly three active trace points."""
+
+        points = self.warn_active_trace_points(3, "3 Pt Arc")
+        if points is None:
+            return
+        if len(points) != 3:
+            messagebox.showinfo(
+                "3 Pt Arc",
+                "3 Pt Arc uses exactly three points in the active trace: start, point on arc, end.\n\n"
+                "Use Start New before capturing the three arc points if this arc is part of a larger shape.",
+                parent=self,
+            )
+            return
+
+        arc_entity = self.calculate_arc_entity_from_3_points(points[0], points[1], points[2], tool_name="3 Pt Arc")
+        if arc_entity is None:
+            return
+
+        self.set_trace_entity(self.active_trace_index, arc_entity)
+        self.refresh_trace_point_list()
+        center = arc_entity["center"]
+        self.append_status(
+            f"\n3 Pt Arc set {self.get_active_trace_label()} to export as a native DXF ARC. "
+            f"Center X {center[0]:.4f}, Y {center[1]:.4f}, radius {float(arc_entity['radius']):.4f}."
+        )
+
+    # Backward-compatible name for old button/function references.
+    def fit_active_trace_arc_last3(self) -> None:
+        self.fit_active_trace_arc_3_point()
+
+    def set_trace_arc_center_from_current(self) -> None:
+        """Store the current LinuxCNC position as the center for Center Arc."""
+
+        position = self.read_current_trace_position_or_warn("Set Arc Center")
+        if position is None:
+            return
+        self.trace_arc_center = position
+        self.trace_arc_center_var.set(f"Arc center: X {position[0]:.4f}  Y {position[1]:.4f}")
+        self.append_status(f"\nArc center set to X {position[0]:.4f}, Y {position[1]:.4f}, Z {position[2]:.4f}.")
+
+    def clear_trace_arc_center(self) -> None:
+        self.trace_arc_center = None
+        self.trace_arc_center_var.set("Arc center: —")
+        self.append_status("\nArc center cleared.")
+
+    def fit_active_trace_center_arc(self) -> None:
+        """Create a native short DXF arc from stored center plus two active trace points."""
+
+        if self.trace_arc_center is None:
+            messagebox.showinfo(
+                "Center Arc",
+                "Set an arc center first. Jog to the center point and click Set Center.",
+                parent=self,
+            )
+            return
+
+        points = self.warn_active_trace_points(2, "Center Arc")
+        if points is None:
+            return
+        if len(points) != 2:
+            messagebox.showinfo(
+                "Center Arc",
+                "Center Arc uses exactly two points in the active trace: arc start and arc end.\n\n"
+                "The stored center is used as the arc center.",
+                parent=self,
+            )
+            return
+
+        center = self.trace_arc_center
+        start = points[0]
+        end = points[1]
+        dxf_start, dxf_end, start_radius, end_radius = self.minor_arc_angles_from_center(center, start, end)
+        if start_radius <= 0.0 or end_radius <= 0.0:
+            messagebox.showinfo("Center Arc", "Start/end points must not be on top of the center point.", parent=self)
+            return
+
+        avg_radius = (start_radius + end_radius) / 2.0
+        radius_tolerance = max(0.005, avg_radius * 0.01)
+        radius_error = abs(start_radius - end_radius)
+        if radius_error > radius_tolerance:
+            messagebox.showinfo(
+                "Center Arc",
+                "Start and end are not the same distance from the stored center.\n\n"
+                f"Start radius: {start_radius:.4f}\n"
+                f"End radius:   {end_radius:.4f}\n"
+                f"Difference:   {radius_error:.4f}\n"
+                f"Allowed:      {radius_tolerance:.4f}\n\n"
+                "Jog/capture the start and end again, or use 3 Pt Arc instead.",
+                parent=self,
+            )
+            return
+
+        self.set_trace_entity(
+            self.active_trace_index,
+            {
+                "type": "arc",
+                "label": "CENTER ARC",
+                "center": (float(center[0]), float(center[1]), float(center[2])),
+                "radius": avg_radius,
+                "start_angle": dxf_start,
+                "end_angle": dxf_end,
+            },
+        )
+        self.refresh_trace_point_list()
+        self.append_status(
+            f"\nCenter Arc set {self.get_active_trace_label()} to export as a native short DXF ARC. "
+            f"Center X {center[0]:.4f}, Y {center[1]:.4f}, radius {avg_radius:.4f}."
+        )
+
+    def calculate_circle_fit(
+        self,
+        points: list[tuple[float, float, float]],
+        tool_name: str,
+    ) -> Optional[tuple[float, float, float]]:
+        """Return least-squares circle center/radius for CNC points."""
 
         xy = np.array([(float(point[0]), float(point[1])) for point in points], dtype=float)
         x = xy[:, 0]
@@ -1468,61 +1781,26 @@ class FabScanApp(tk.Tk):
         try:
             d, e, f = np.linalg.lstsq(a, b, rcond=None)[0]
         except np.linalg.LinAlgError as exc:
-            messagebox.showinfo("Circle Fit", f"Could not fit a circle: {exc}", parent=self)
-            return
+            messagebox.showinfo(tool_name, f"Could not fit a circle: {exc}", parent=self)
+            return None
 
-        center_x = -d / 2.0
-        center_y = -e / 2.0
-        radius_sq = (d * d + e * e) / 4.0 - f
+        center_x = float(-d / 2.0)
+        center_y = float(-e / 2.0)
+        radius_sq = float((d * d + e * e) / 4.0 - f)
         if radius_sq <= 0.0:
-            messagebox.showinfo("Circle Fit", "Could not fit a valid circle to those points.", parent=self)
-            return
+            messagebox.showinfo(tool_name, "Could not fit a valid circle to those points.", parent=self)
+            return None
 
-        radius = math.sqrt(float(radius_sq))
-        segments = self.get_trace_fit_segment_count(minimum=12, maximum=720)
-        z_avg = float(sum(point[2] for point in points) / len(points))
-        new_points = []
-        for index in range(segments):
-            angle = (2.0 * math.pi * index) / segments
-            new_points.append((center_x + radius * math.cos(angle), center_y + radius * math.sin(angle), z_avg))
+        return center_x, center_y, math.sqrt(radius_sq)
 
-        self.trace_closed_var.set(True)
-        self.replace_active_trace_points(
-            new_points,
-            f"Circle Fit replaced {self.get_active_trace_label()} with {segments} sampled points. "
-            f"Center X {center_x:.4f}, Y {center_y:.4f}, radius {radius:.4f}. Closed trace enabled.",
-        )
-
-    def fit_active_trace_arc_last3(self) -> None:
-        """Replace the last three active trace points with a sampled arc through those points."""
-
-        points = self.warn_active_trace_points(3, "Arc Last 3")
-        if points is None:
-            return
-
-        prefix = list(points[:-3])
-        start = points[-3]
-        mid = points[-2]
-        end = points[-1]
-
-        arc_points = self.calculate_arc_points_from_3_points(start, mid, end)
-        if arc_points is None:
-            return
-
-        new_points = prefix + arc_points
-        self.replace_active_trace_points(
-            new_points,
-            f"Arc Last 3 replaced the last three points in {self.get_active_trace_label()} "
-            f"with {len(arc_points)} sampled arc points.",
-        )
-
-    def calculate_arc_points_from_3_points(
+    def calculate_arc_entity_from_3_points(
         self,
         start: tuple[float, float, float],
         mid: tuple[float, float, float],
         end: tuple[float, float, float],
-    ) -> Optional[list[tuple[float, float, float]]]:
-        """Return sampled arc points through start/mid/end, preserving the correct direction."""
+        tool_name: str,
+    ) -> Optional[dict[str, object]]:
+        """Return native DXF arc metadata through start/mid/end."""
 
         x1, y1, z1 = start
         x2, y2, z2 = mid
@@ -1534,7 +1812,7 @@ class FabScanApp(tk.Tk):
             + x3 * (y1 - y2)
         )
         if math.isclose(determinant, 0.0, abs_tol=1e-9):
-            messagebox.showinfo("Arc Last 3", "The last three points are too close to a straight line to fit an arc.", parent=self)
+            messagebox.showinfo(tool_name, "The three points are too close to a straight line to fit an arc.", parent=self)
             return None
 
         ux = (
@@ -1550,7 +1828,7 @@ class FabScanApp(tk.Tk):
 
         radius = math.hypot(x1 - ux, y1 - uy)
         if radius <= 0.0:
-            messagebox.showinfo("Arc Last 3", "Could not fit a valid arc radius.", parent=self)
+            messagebox.showinfo(tool_name, "Could not fit a valid arc radius.", parent=self)
             return None
 
         def angle_of(x_value: float, y_value: float) -> float:
@@ -1566,28 +1844,31 @@ class FabScanApp(tk.Tk):
         start_to_end_ccw = ccw_delta(start_angle, end_angle)
         start_to_mid_ccw = ccw_delta(start_angle, mid_angle)
 
+        # Choose the arc from start to end that passes through the middle point.
         if start_to_mid_ccw <= start_to_end_ccw:
             arc_sweep = start_to_end_ccw
         else:
             arc_sweep = start_to_end_ccw - (2.0 * math.pi)
 
-        segments = self.get_trace_fit_segment_count(minimum=4, maximum=360)
-        # Use fewer segments for tiny arcs but never fewer than 4. Segment count is
-        # interpreted as a maximum for the generated curve.
-        sweep_fraction = abs(arc_sweep) / (2.0 * math.pi)
-        actual_segments = max(4, int(math.ceil(segments * sweep_fraction)))
+        start_degrees = math.degrees(start_angle) % 360.0
+        end_degrees = math.degrees(end_angle) % 360.0
+        if arc_sweep >= 0.0:
+            dxf_start = start_degrees
+            dxf_end = end_degrees
+        else:
+            # DXF ARC is CCW. Swapping start/end draws the same arc geometry.
+            dxf_start = end_degrees
+            dxf_end = start_degrees
+
         z_avg = (float(z1) + float(z2) + float(z3)) / 3.0
-
-        sampled: list[tuple[float, float, float]] = []
-        for index in range(actual_segments + 1):
-            t = index / actual_segments
-            angle = start_angle + arc_sweep * t
-            sampled.append((ux + radius * math.cos(angle), uy + radius * math.sin(angle), z_avg))
-
-        # Force exact CNC-touched endpoints into the generated arc.
-        sampled[0] = (float(x1), float(y1), float(z1))
-        sampled[-1] = (float(x3), float(y3), float(z3))
-        return sampled
+        return {
+            "type": "arc",
+            "label": "3 PT ARC",
+            "center": (float(ux), float(uy), z_avg),
+            "radius": float(radius),
+            "start_angle": float(dxf_start),
+            "end_angle": float(dxf_end),
+        }
 
     def refresh_trace_point_list(self, select_iid: Optional[str] = None) -> None:
         previous_selection: Optional[str] = None
@@ -1627,9 +1908,10 @@ class FabScanApp(tk.Tk):
         active_points = self.get_active_trace_points()
         point_word = "point" if total_points == 1 else "points"
         trace_word = "trace" if len(nonempty_groups) == 1 else "traces"
+        active_entity = self.get_active_trace_entity_label()
         self.trace_count_var.set(
             f"{len(nonempty_groups)} {trace_word}, {total_points} {point_word} | "
-            f"Active {self.active_trace_index + 1}: {len(active_points)}"
+            f"Active {self.active_trace_index + 1}: {len(active_points)} | {active_entity}"
         )
         tree_iids = set(self.trace_tree.get_children(""))
         if select_iid is not None and select_iid in tree_iids:
@@ -1657,11 +1939,16 @@ class FabScanApp(tk.Tk):
 
         close_trace = bool(self.trace_closed_var.get())
         if close_trace:
-            too_short_closed = [index + 1 for index, group in enumerate(self.trace_groups) if group and len(group) < 3]
+            too_short_closed = []
+            for index, group in enumerate(self.trace_groups):
+                entity = self.get_trace_entity(index)
+                native_type = str(entity.get("type", "")) if isinstance(entity, dict) else ""
+                if group and native_type not in ("line", "circle", "arc") and len(group) < 3:
+                    too_short_closed.append(index + 1)
             if too_short_closed:
                 messagebox.showinfo(
                     "Not enough points",
-                    "A closed trace needs at least three CNC points. "
+                    "A closed polyline trace needs at least three CNC points. "
                     f"Check trace(s): {', '.join(str(value) for value in too_short_closed)}",
                     parent=self,
                 )
@@ -1689,10 +1976,11 @@ class FabScanApp(tk.Tk):
 
         try:
             output = export_trace_groups_to_dxf(
-                groups,
+                self.trace_groups,
                 output_path=path,
                 close=close_trace,
                 layer_name="TRACE",
+                trace_entities=self.trace_entities,
             )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Trace DXF export failed", str(exc), parent=self)
@@ -1703,13 +1991,19 @@ class FabScanApp(tk.Tk):
         ys = [point[1] for point in all_points]
         width = max(xs) - min(xs)
         height = max(ys) - min(ys)
+        native_count = sum(
+            1
+            for index, group in enumerate(self.trace_groups)
+            if group and isinstance(self.get_trace_entity(index), dict)
+        )
         export_message = (
             "Manual trace DXF exported successfully.\n"
             f"File: {output}\n"
             f"Layer: TRACE\n"
             f"Traces: {len(groups)}\n"
-            f"Points: {len(all_points)}\n"
-            f"Closed: {'Yes' if close_trace else 'No'}\n"
+            f"Points: {len(all_points)} defining/captured\n"
+            f"Native entities: {native_count}\n"
+            f"Closed polylines: {'Yes' if close_trace else 'No'}\n"
             f"Coordinate source: {self.linuxcnc_coord_mode_var.get()}\n"
             f"Combined trace bbox: {width:.4f} x {height:.4f}\n\n"
             "Next: import the DXF into SheetCam/CAD and verify the measured geometry."
@@ -2768,7 +3062,7 @@ class FabScanApp(tk.Tk):
 
         points: list[tuple[float, float, str]] = []
         for group_index, group in enumerate(self.trace_groups):
-            for point in group:
+            for point in self.trace_entity_display_points(group_index, group):
                 points.append((float(point[0]), float(point[1]), f"trace_{group_index}"))
         live = self.get_live_trace_position()
         if live is not None:
@@ -2854,14 +3148,17 @@ class FabScanApp(tk.Tk):
             if not group:
                 continue
 
-            captured_canvas_points = [world_to_canvas(float(x), float(y)) for x, y, _z in group]
+            display_points = self.trace_entity_display_points(group_index - 1, group)
+            captured_canvas_points = [world_to_canvas(float(x), float(y)) for x, y, _z in display_points]
             line_fill = "lime" if (group_index - 1) == self.active_trace_index else "#35b6ff"
             point_fill = "yellow" if (group_index - 1) == self.active_trace_index else "#9fd8ff"
+            entity = self.get_trace_entity(group_index - 1)
+            native_entity = isinstance(entity, dict) and str(entity.get("type", "polyline")) in ("line", "circle", "arc")
 
             if len(captured_canvas_points) >= 2:
                 flat_points = [coord for point in captured_canvas_points for coord in point]
                 self.canvas.create_line(*flat_points, fill=line_fill, width=2)
-                if bool(self.trace_closed_var.get()) and len(captured_canvas_points) >= 3:
+                if bool(self.trace_closed_var.get()) and not native_entity and len(captured_canvas_points) >= 3:
                     self.canvas.create_line(
                         captured_canvas_points[-1][0],
                         captured_canvas_points[-1][1],
@@ -2869,6 +3166,19 @@ class FabScanApp(tk.Tk):
                         captured_canvas_points[0][1],
                         fill=line_fill,
                         width=2,
+                    )
+
+            if native_entity:
+                label = str(entity.get("label", entity.get("type", ""))) if isinstance(entity, dict) else ""
+                if captured_canvas_points:
+                    lx, ly = captured_canvas_points[0]
+                    self.canvas.create_text(
+                        lx + 10,
+                        ly + 10,
+                        anchor=tk.NW,
+                        text=label,
+                        fill=line_fill,
+                        font=("TkDefaultFont", 9, "bold"),
                     )
 
             selected_trace_point = self.get_selected_trace_point()
@@ -2926,7 +3236,7 @@ class FabScanApp(tk.Tk):
             anchor=tk.SW,
             text=(
                 f"{len(self.get_nonempty_trace_groups())} traces, {self.get_total_trace_point_count()} points  |  "
-                f"Active {self.active_trace_index + 1}  |  {trace_state}  |  {coord_source}  |  "
+                f"Active {self.active_trace_index + 1} ({self.get_active_trace_entity_label()})  |  {trace_state}  |  {coord_source}  |  "
                 "Start New creates a separate contour"
             ),
             fill="#dddddd",

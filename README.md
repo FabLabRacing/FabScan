@@ -1,45 +1,40 @@
-# FabScan v0.4.1 - Point / Trace Navigation
+# FabScan v0.4.3 - Native Trace Continuation
 
-FabScan v0.4.1 adds point navigation and trace editing tools on top of the v0.4.0 controlled X/Y motion workflow.
+FabScan v0.4.3 fixes a workflow issue from v0.4.2 where adding a new captured point after fitting a native arc/circle/line would clear the native entity and revert the active trace to a polyline.
 
-## Added
+## What changed
 
-- Point / Trace Navigation panel.
-- First Pt / Prev Pt / Next Pt / Last Pt selection buttons.
-- Selecting a point makes that trace the active trace.
-- Selected point is highlighted in the Manual Trace Preview.
-- Move Pt button copies the selected point to the controlled-motion target and uses the existing guarded Move to Target workflow.
-- Replace button replaces the selected captured point with the current LinuxCNC position.
-- Insert After button inserts the current LinuxCNC position after the selected point.
-- Delete Pt button removes the selected point and keeps trace groups valid.
+If the active trace has already been fitted to a native DXF entity and you capture another point, FabScan now:
 
-## Safety behavior
+1. Preserves the fitted native entity.
+2. Starts a new trace automatically.
+3. Seeds that new trace with the previous fitted entity endpoint.
+4. Adds the newly captured point as the second point in the new trace.
 
-Motion behavior is unchanged from v0.4.0:
+This makes workflows like this work correctly:
 
-- X/Y only.
-- No Z motion.
-- No torch commands.
-- No program start.
-- Controlled moves require explicit enable.
-- Each controlled move still asks for confirmation.
-- LinuxCNC state checks are still handled by the LinuxCNC adapter before motion.
+```text
+Capture arc start
+Capture arc end
+Center Arc
+Jog to tangent line endpoint
+Capture Point
+```
 
-## Typical correction workflow
+The native DXF ARC remains a real arc, and the new tangent segment becomes a separate trace/polyline starting from the arc endpoint.
 
-1. Capture a trace.
-2. Select a point in the trace list or use Prev/Next.
-3. Click Move Pt to return to that point.
-4. Jog/fine move to the corrected location.
-5. Click Replace to update that point.
-6. Export Manual Trace DXF.
+## Notes
+
+- Editing an existing fitted trace with Replace, Insert After, or Delete still clears that trace's native entity and returns it to point/polyline behavior. That is intentional.
+- Continuing from a native entity uses the last defining point as the continuation start.
+- Motion behavior remains unchanged from v0.4.1/v0.4.0: guarded X/Y-only controlled moves.
 
 ## Install drop-in files
 
 ```bash
 cd ~/projects/FabScan
-cp /path/to/unzipped/FabScan_v041_point_navigation_dropin/fabscan/app.py fabscan/app.py
-cp /path/to/unzipped/FabScan_v041_point_navigation_dropin/README_v0.4.1.md README.md
+cp /path/to/unzipped/FabScan_v043_continue_native_dropin/fabscan/app.py fabscan/app.py
+cp /path/to/unzipped/FabScan_v043_continue_native_dropin/README_v0.4.3.md README.md
 ```
 
 Then test:
@@ -48,4 +43,13 @@ Then test:
 source .venv/bin/activate
 python3 -m py_compile fabscan/*.py fabscan.py
 python3 fabscan.py
+```
+
+## Commit
+
+```bash
+git status
+git add fabscan/app.py README.md
+git commit -m "Preserve native trace geometry when continuing traces"
+git push
 ```
