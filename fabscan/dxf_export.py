@@ -173,6 +173,7 @@ def export_contours_to_dxf(
     doc.saveas(output_path)
     return output_path
 
+
 def export_trace_points_to_dxf(
     points: list[Tuple[float, float, float]] | list[Tuple[float, float]],
     output_path: str | Path,
@@ -186,26 +187,75 @@ def export_trace_points_to_dxf(
     Z is accepted for display/capture history but ignored for 2D DXF export.
     """
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if len(points) < 2:
-        raise ValueError("At least two trace points are required for DXF export")
-
-    doc = ezdxf.new("R2010")
-    doc.units = ezdxf.units.IN
-    msp = doc.modelspace()
-
-    if layer_name not in doc.layers:
-        doc.layers.new(name=layer_name)
-
-    xy_points = [(float(point[0]), float(point[1])) for point in points]
-    msp.add_lwpolyline(xy_points, close=bool(close), dxfattribs={"layer": layer_name})
-
-    doc.saveas(output_path)
-    return output_path
+    return export_trace_groups_to_dxf([points], output_path=output_path, close=close, layer_name=layer_name)
 
 
+def _normalize_angle_degrees(angle: float) -> float:
+    return float(angle) % 360.0
+
+
+def _entity_type(entity: object | None) -> str:
+    if isinstance(entity, dict):
+        return str(entity.get("type", "polyline"))
+    return "polyline"
+
+
+def _xy_point(point: Tuple[float, float, float] | Tuple[float, float]) -> Tuple[float, float]:
+    return (float(point[0]), float(point[1]))
+
+
+def _add_trace_entity_to_modelspace(
+    msp,
+    group: list[Tuple[float, float, float]] | list[Tuple[float, float]],
+    entity: object | None,
+    close: bool,
+    layer_name: str,
+) -> str:
+    """Add one manual trace group to the modelspace and return an entity type label.
+
+    Supported native entities are LINE, CIRCLE, and ARC. Anything unsupported falls
+    back to the previous safe LWPOLYLINE behavior.
+    """
+
+    entity_kind = _entity_type(entity)
+    attribs = {"layer": layer_name}
+
+    if entity_kind == "line" and isinstance(entity, dict):
+        start_point = entity.get("start")
+        end_point = entity.get("end")
+        if start_point is None or end_point is None:
+            xy_points = [_xy_point(point) for point in group]
+            start_point, end_point = xy_points[0], xy_points[-1]
+        msp.add_line(_xy_point(start_point), _xy_point(end_point), dxfattribs=attribs)
+        return "LINE"
+
+    if entity_kind == "circle" and isinstance(entity, dict):
+        center = entity.get("center")
+        radius = float(entity.get("radius", 0.0))
+        if center is None or radius <= 0.0:
+            raise ValueError("Invalid circle trace entity")
+        msp.add_circle(_xy_point(center), radius, dxfattribs=attribs)
+        return "CIRCLE"
+
+    if entity_kind == "arc" and isinstance(entity, dict):
+        center = entity.get("center")
+        radius = float(entity.get("radius", 0.0))
+        if center is None or radius <= 0.0:
+            raise ValueError("Invalid arc trace entity")
+        start_angle = _normalize_angle_degrees(float(entity.get("start_angle", 0.0)))
+        end_angle = _normalize_angle_degrees(float(entity.get("end_angle", 0.0)))
+        msp.add_arc(
+            center=_xy_point(center),
+            radius=radius,
+            start_angle=start_angle,
+            end_angle=end_angle,
+            dxfattribs=attribs,
+        )
+        return "ARC"
+
+    xy_points = [_xy_point(point) for point in group]
+    msp.add_lwpolyline(xy_points, close=bool(close), dxfattribs=attribs)
+    return "LWPOLYLINE"
 
 
 def export_trace_groups_to_dxf(
@@ -213,27 +263,44 @@ def export_trace_groups_to_dxf(
     output_path: str | Path,
     close: bool = True,
     layer_name: str = "TRACE",
+    trace_entities: Optional[list[object | None]] = None,
 ) -> Path:
-    """Export multiple manually captured CNC XY traces as separate DXF polylines.
+    """Export manually captured CNC XY traces as DXF geometry.
 
-    Each non-empty group becomes one independent polyline on the same layer. This
-    lets the user manually trace an outside profile and one or more inside cutouts
-    without FabScan connecting the end of one contour to the start of the next.
+    Normal trace groups become separate LWPOLYLINE entities. Assisted trace tools
+    can provide native entity metadata so fitted lines, circles, and arcs export
+    as real DXF LINE/CIRCLE/ARC entities instead of sampled polylines.
     Z is accepted for capture history but ignored for 2D DXF export.
     """
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    groups = [group for group in trace_groups if group]
-    if not groups:
+    indexed_groups = [(index, group) for index, group in enumerate(trace_groups) if group]
+    if not indexed_groups:
         raise ValueError("At least one trace group is required for DXF export")
 
-    for index, group in enumerate(groups, start=1):
+    for export_index, (group_index, group) in enumerate(indexed_groups, start=1):
+        entity = trace_entities[group_index] if trace_entities is not None and group_index < len(trace_entities) else None
+        entity_kind = _entity_type(entity)
+
+        if entity_kind in ("circle",):
+            if len(group) < 3:
+                raise ValueError(f"Trace {export_index} circle needs at least three captured points")
+            continue
+        if entity_kind in ("arc",):
+            if len(group) < 2:
+                raise ValueError(f"Trace {export_index} arc needs at least two captured points")
+            continue
+        if entity_kind in ("line",):
+            if len(group) < 2:
+                raise ValueError(f"Trace {export_index} line needs at least two captured points")
+            continue
+
         if len(group) < 2:
-            raise ValueError(f"Trace {index} needs at least two points")
+            raise ValueError(f"Trace {export_index} needs at least two points")
         if close and len(group) < 3:
-            raise ValueError(f"Closed trace {index} needs at least three points")
+            raise ValueError(f"Closed trace {export_index} needs at least three points")
 
     doc = ezdxf.new("R2010")
     doc.units = ezdxf.units.IN
@@ -242,9 +309,9 @@ def export_trace_groups_to_dxf(
     if layer_name not in doc.layers:
         doc.layers.new(name=layer_name)
 
-    for group in groups:
-        xy_points = [(float(point[0]), float(point[1])) for point in group]
-        msp.add_lwpolyline(xy_points, close=bool(close), dxfattribs={"layer": layer_name})
+    for _group_index, group in indexed_groups:
+        entity = trace_entities[_group_index] if trace_entities is not None and _group_index < len(trace_entities) else None
+        _add_trace_entity_to_modelspace(msp, group, entity, close=close, layer_name=layer_name)
 
     doc.saveas(output_path)
     return output_path
