@@ -29,6 +29,21 @@ class DotDetection:
 
 
 @dataclass
+class LineDetection:
+    found: bool
+    mode: str = "Line center"
+    x: float = 0.0
+    y: float = 0.0
+    vx: float = 1.0
+    vy: float = 0.0
+    pixel_error_x: float = 0.0
+    pixel_error_y: float = 0.0
+    angle_degrees: float = 0.0
+    confidence: float = 0.0
+    message: str = "No line/edge found"
+
+
+@dataclass
 class CameraCalibrationDialogResult:
     camera_index: int
     requested_width: int
@@ -43,6 +58,9 @@ class CameraCalibrationDialogResult:
     feed_units_per_min: float
     jog_step: float
     center_max_move: float
+    line_mode: str
+    line_search_px: int
+    show_line_preview: bool
     calibration: Optional[dict[str, Any]] = None
 
 
@@ -76,12 +94,18 @@ class CameraCalibrationDialog(tk.Toplevel):
         feed_per_minute: float = 5.0,
         jog_step: float = 0.010,
         center_max_move: float = 0.100,
+        line_mode: str = "Line center",
+        line_search_px: int = 220,
+        show_line_preview: bool = True,
         show_mask: bool = False,
         existing_calibration: Optional[dict[str, Any]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.3")
-        self.minsize(1040, 720)
+        self.title("FabScan Camera Calibration Lite - v0.5.5")
+        self.minsize(1040, 760)
+        # Give the dialog an explicit starting size so Tk does not keep
+        # recomputing the top-level size as live preview/status content changes.
+        self.geometry("1180x860")
         self.transient(parent)
 
         self.linuxcnc_reader = linuxcnc_reader
@@ -90,6 +114,11 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.cap: Optional[cv2.VideoCapture] = None
         self.current_frame_bgr: Optional[np.ndarray] = None
         self.current_dot: DotDetection = DotDetection(False)
+        self.current_line: LineDetection = LineDetection(False)
+        # Fixed live-preview box. Without this, the PhotoImage size can change
+        # during line/edge preview and Tk resizes the whole calibration window.
+        self.preview_display_width = 640
+        self.preview_display_height = 480
         self.after_job: Optional[str] = None
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
         self._motion_active = False
@@ -112,7 +141,11 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.feed_var = tk.DoubleVar(value=max(0.1, float(feed_per_minute)))
         self.jog_step_var = tk.DoubleVar(value=max(0.001, float(jog_step)))
         self.center_max_move_var = tk.DoubleVar(value=max(0.001, float(center_max_move)))
+        self.line_mode_var = tk.StringVar(value=self._normalize_line_mode(line_mode))
+        self.line_search_px_var = tk.IntVar(value=self._clamp_line_search_px(line_search_px))
+        self.show_line_preview_var = tk.BooleanVar(value=bool(show_line_preview))
         self.dot_status_var = tk.StringVar(value="Dot: —")
+        self.line_status_var = tk.StringVar(value="Line/edge: —")
         self.cal_status_var = tk.StringVar(value="Open camera, center the calibration dot, then click Find Dot.")
         self.transform_status_var = tk.StringVar(value="Calibration: not run")
 
@@ -232,12 +265,44 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         info = ttk.Frame(self, padding=(8, 0, 8, 0))
         info.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(info, textvariable=self.dot_status_var, anchor=tk.W).pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(info, textvariable=self.cal_status_var, anchor=tk.W).pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(info, textvariable=self.transform_status_var, anchor=tk.W).pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(info, textvariable=self.dot_status_var, anchor=tk.W, wraplength=1120).pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(info, textvariable=self.cal_status_var, anchor=tk.W, wraplength=1120).pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(info, textvariable=self.transform_status_var, anchor=tk.W, wraplength=1120).pack(side=tk.TOP, fill=tk.X)
 
-        self.preview_label = ttk.Label(self, anchor=tk.CENTER)
-        self.preview_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        line_tools = ttk.LabelFrame(self, text="Edge / Line Detection Preview", padding=6)
+        line_tools.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(6, 0))
+        ttk.Label(line_tools, text="Mode").pack(side=tk.LEFT)
+        ttk.Combobox(
+            line_tools,
+            textvariable=self.line_mode_var,
+            values=("Line center", "Edge near center"),
+            width=17,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(line_tools, text="Search px").pack(side=tk.LEFT)
+        ttk.Entry(line_tools, textvariable=self.line_search_px_var, width=7).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Checkbutton(
+            line_tools,
+            text="Preview overlay",
+            variable=self.show_line_preview_var,
+            command=self._show_current_frame,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(line_tools, text="Find Line / Edge", command=self.find_line_once).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(line_tools, textvariable=self.line_status_var, anchor=tk.W, width=92).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+
+        preview_frame = ttk.LabelFrame(self, text="Live Preview", padding=4)
+        preview_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.preview_box = ttk.Frame(
+            preview_frame,
+            width=self.preview_display_width,
+            height=self.preview_display_height,
+        )
+        self.preview_box.pack(side=tk.TOP, expand=True)
+        self.preview_box.pack_propagate(False)
+        self.preview_label = ttk.Label(self.preview_box, anchor=tk.CENTER)
+        self.preview_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         footer = ttk.Label(
             self,
@@ -258,6 +323,9 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.fine_rotation_var,
             self.threshold_var,
             self.show_mask_var,
+            self.line_mode_var,
+            self.line_search_px_var,
+            self.show_line_preview_var,
         )
         for variable in watched_vars:
             variable.trace_add("write", lambda *_args: self._on_preview_setting_changed())
@@ -356,10 +424,30 @@ class CameraCalibrationDialog(tk.Toplevel):
             move = 0.100
         return max(0.001, min(1.000, move))
 
+    def _normalize_line_mode(self, value: object) -> str:
+        text = str(value or "Line center").strip()
+        if text in {"Line center", "Edge near center"}:
+            return text
+        return "Line center"
+
+    def _get_line_mode(self) -> str:
+        return self._normalize_line_mode(self.line_mode_var.get())
+
+    def _clamp_line_search_px(self, value: object) -> int:
+        try:
+            pixels = int(round(float(value)))
+        except (tk.TclError, TypeError, ValueError):
+            pixels = 220
+        return max(40, min(1000, pixels))
+
+    def _get_line_search_px(self) -> int:
+        return self._clamp_line_search_px(self.line_search_px_var.get())
+
     def open_camera(self) -> None:
         self.release_camera()
         self.current_frame_bgr = None
         self.current_dot = DotDetection(False)
+        self.current_line = LineDetection(False)
         self._update_threshold_label()
 
         index = self._get_camera_index()
@@ -505,6 +593,10 @@ class CameraCalibrationDialog(tk.Toplevel):
     def _show_frame(self, frame_bgr: np.ndarray) -> None:
         transformed = self.get_transformed_frame_bgr(frame_bgr)
         self.current_dot = self.detect_dot_in_frame(transformed)
+        if bool(self.show_line_preview_var.get()):
+            self.current_line = self.detect_line_in_frame(transformed)
+        else:
+            self.current_line = LineDetection(False, message="Line preview disabled")
 
         if bool(self.show_mask_var.get()):
             mask = self._make_mask(transformed)
@@ -514,8 +606,11 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         pil_image = Image.fromarray(preview_rgb)
         original_w, original_h = pil_image.size
-        max_w = max(1, self.preview_label.winfo_width() - 20)
-        max_h = max(1, self.preview_label.winfo_height() - 20)
+        # Scale against a fixed preview box instead of the label's current
+        # requested size. This prevents the live image from changing the dialog
+        # geometry frame-to-frame.
+        max_w = max(1, int(self.preview_display_width))
+        max_h = max(1, int(self.preview_display_height))
         scale = min(max_w / original_w, max_h / original_h, 1.0)
         new_w = max(1, int(original_w * scale))
         new_h = max(1, int(original_h * scale))
@@ -526,6 +621,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         self._tk_preview = ImageTk.PhotoImage(pil_image)
         self.preview_label.configure(image=self._tk_preview)
         self._update_dot_status(original_w, original_h)
+        self._update_line_status(original_w, original_h)
 
     def _draw_overlay(self, pil_image: Image.Image, scale: float, source_w: int, source_h: int) -> None:
         draw = ImageDraw.Draw(pil_image)
@@ -557,6 +653,9 @@ class CameraCalibrationDialog(tk.Toplevel):
         else:
             draw.text((10, 10), "DOT NOT FOUND", fill=missing)
 
+        if bool(self.show_line_preview_var.get()):
+            self._draw_line_overlay(draw, scale, source_w, source_h)
+
         draw.text((10, h - 24), f"Source {source_w}x{source_h}  Threshold {self._get_threshold()}", fill=(255, 255, 255))
 
     def _update_dot_status(self, frame_w: int, frame_h: int) -> None:
@@ -570,6 +669,217 @@ class CameraCalibrationDialog(tk.Toplevel):
             )
         else:
             self.dot_status_var.set(f"Dot: not found - {self.current_dot.message}")
+
+    def _search_box_bounds(self, frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
+        size = self._get_line_search_px()
+        half = max(20, size // 2)
+        cx = frame_w // 2
+        cy = frame_h // 2
+        x1 = max(0, cx - half)
+        y1 = max(0, cy - half)
+        x2 = min(frame_w, cx + half)
+        y2 = min(frame_h, cy + half)
+        return x1, y1, x2, y2
+
+    def detect_line(self) -> LineDetection:
+        if self.current_frame_bgr is None:
+            return LineDetection(False, mode=self._get_line_mode(), message="No camera frame yet")
+        frame = self.get_transformed_frame_bgr(self.current_frame_bgr)
+        return self.detect_line_in_frame(frame)
+
+    def detect_line_in_frame(self, frame_bgr: np.ndarray) -> LineDetection:
+        mode = self._get_line_mode()
+        mask = self._make_mask(frame_bgr)
+        h, w = mask.shape[:2]
+        x1, y1, x2, y2 = self._search_box_bounds(w, h)
+        roi = mask[y1:y2, x1:x2]
+        if roi.size <= 0:
+            return LineDetection(False, mode=mode, message="Line search box is empty")
+
+        points: Optional[np.ndarray] = None
+        score_hint = 0.0
+        if mode == "Edge near center":
+            edges = cv2.Canny(roi, 50, 150)
+            contours, _hierarchy = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            local_cx = (x2 - x1) / 2.0
+            local_cy = (y2 - y1) / 2.0
+            best_contour: Optional[np.ndarray] = None
+            best_score = -1.0
+            for contour in contours:
+                if len(contour) < 8:
+                    continue
+                pts = contour.reshape(-1, 2).astype(np.float32)
+                min_dist = float(np.min(np.hypot(pts[:, 0] - local_cx, pts[:, 1] - local_cy)))
+                span_x = float(np.max(pts[:, 0]) - np.min(pts[:, 0])) if len(pts) else 0.0
+                span_y = float(np.max(pts[:, 1]) - np.min(pts[:, 1])) if len(pts) else 0.0
+                span = math.hypot(span_x, span_y)
+                score = span - (0.45 * min_dist)
+                if score > best_score:
+                    best_score = score
+                    best_contour = contour
+            if best_contour is not None:
+                points = best_contour.reshape(-1, 2).astype(np.float32)
+                score_hint = max(0.0, best_score)
+        else:
+            contours, _hierarchy = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            roi_area = float(max(1, roi.shape[0] * roi.shape[1]))
+            local_cx = (x2 - x1) / 2.0
+            local_cy = (y2 - y1) / 2.0
+            best_contour = None
+            best_score = -1.0
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area < 8.0 or area > roi_area * 0.90:
+                    continue
+                pts = contour.reshape(-1, 2).astype(np.float32)
+                if len(pts) < 5:
+                    continue
+                mean_x = float(np.mean(pts[:, 0]))
+                mean_y = float(np.mean(pts[:, 1]))
+                distance_score = max(0.0, self._get_line_search_px() * 0.75 - math.hypot(mean_x - local_cx, mean_y - local_cy))
+                score = area + (2.0 * distance_score)
+                if score > best_score:
+                    best_score = score
+                    best_contour = contour
+            if best_contour is not None:
+                points = best_contour.reshape(-1, 2).astype(np.float32)
+                score_hint = max(0.0, best_score)
+
+        if points is None or len(points) < 5:
+            return LineDetection(False, mode=mode, message="No usable line/edge found in search box")
+
+        points_global = points.copy()
+        points_global[:, 0] += float(x1)
+        points_global[:, 1] += float(y1)
+        fit = cv2.fitLine(points_global.reshape(-1, 1, 2), cv2.DIST_L2, 0, 0.01, 0.01)
+        vx = float(fit[0][0])
+        vy = float(fit[1][0])
+        x0 = float(fit[2][0])
+        y0 = float(fit[3][0])
+        length = math.hypot(vx, vy)
+        if length < 1e-9:
+            return LineDetection(False, mode=mode, message="Line fit failed")
+        vx /= length
+        vy /= length
+
+        center_x = w / 2.0
+        center_y = h / 2.0
+        t = ((center_x - x0) * vx) + ((center_y - y0) * vy)
+        closest_x = x0 + (t * vx)
+        closest_y = y0 + (t * vy)
+        err_x = closest_x - center_x
+        err_y = closest_y - center_y
+
+        projections = ((points_global[:, 0] - x0) * vx) + ((points_global[:, 1] - y0) * vy)
+        span = float(np.max(projections) - np.min(projections)) if len(projections) else 0.0
+        perpendicular = np.abs((points_global[:, 0] - x0) * (-vy) + (points_global[:, 1] - y0) * vx)
+        width_est = float(np.percentile(perpendicular, 90)) if len(perpendicular) else 0.0
+        aspect_score = 0.0
+        if width_est > 1e-6:
+            aspect_score = min(1.0, span / (width_est * 8.0))
+        span_score = min(1.0, span / max(1.0, self._get_line_search_px() * 0.55))
+        center_score = max(0.0, 1.0 - (math.hypot(err_x, err_y) / max(1.0, self._get_line_search_px() * 0.50)))
+        point_score = min(1.0, math.sqrt(len(points_global)) / 35.0)
+        raw_conf = (0.35 * span_score) + (0.25 * aspect_score) + (0.25 * point_score) + (0.15 * center_score)
+        if score_hint <= 0.0:
+            raw_conf *= 0.85
+        confidence = max(0.0, min(100.0, raw_conf * 100.0))
+        angle = math.degrees(math.atan2(vy, vx))
+        return LineDetection(
+            found=True,
+            mode=mode,
+            x=closest_x,
+            y=closest_y,
+            vx=vx,
+            vy=vy,
+            pixel_error_x=err_x,
+            pixel_error_y=err_y,
+            angle_degrees=angle,
+            confidence=confidence,
+            message="Line/edge found",
+        )
+
+    def _draw_line_overlay(self, draw: ImageDraw.ImageDraw, scale: float, source_w: int, source_h: int) -> None:
+        x1, y1, x2, y2 = self._search_box_bounds(source_w, source_h)
+        sx1 = int(round(x1 * scale))
+        sy1 = int(round(y1 * scale))
+        sx2 = int(round(x2 * scale))
+        sy2 = int(round(y2 * scale))
+        outline = (0, 0, 0)
+        box_color = (0, 190, 255)
+        line_color = (255, 80, 255)
+        point_color = (0, 255, 255)
+        draw.rectangle((sx1, sy1, sx2, sy2), outline=outline, width=4)
+        draw.rectangle((sx1, sy1, sx2, sy2), outline=box_color, width=2)
+
+        if not self.current_line.found:
+            return
+
+        cx = int(round((source_w / 2.0) * scale))
+        cy = int(round((source_h / 2.0) * scale))
+        px = int(round(self.current_line.x * scale))
+        py = int(round(self.current_line.y * scale))
+        span = max(source_w, source_h)
+        lx1 = int(round((self.current_line.x - self.current_line.vx * span) * scale))
+        ly1 = int(round((self.current_line.y - self.current_line.vy * span) * scale))
+        lx2 = int(round((self.current_line.x + self.current_line.vx * span) * scale))
+        ly2 = int(round((self.current_line.y + self.current_line.vy * span) * scale))
+        draw.line((lx1, ly1, lx2, ly2), fill=outline, width=6)
+        draw.line((lx1, ly1, lx2, ly2), fill=line_color, width=3)
+        draw.line((cx, cy, px, py), fill=outline, width=5)
+        draw.line((cx, cy, px, py), fill=point_color, width=2)
+        rr = 8
+        draw.ellipse((px - rr, py - rr, px + rr, py + rr), outline=outline, width=4)
+        draw.ellipse((px - rr, py - rr, px + rr, py + rr), outline=point_color, width=2)
+
+    def _update_line_status(self, frame_w: int, frame_h: int) -> None:
+        if not bool(self.show_line_preview_var.get()):
+            self.line_status_var.set("Line/edge: preview disabled")
+            return
+        line = self.current_line
+        if not line.found:
+            self.line_status_var.set(f"Line/edge: not found - {line.message}")
+            return
+
+        correction = self._machine_correction_from_pixel_error(line.pixel_error_x, line.pixel_error_y)
+        if correction is None:
+            correction_text = "calibration not available"
+        else:
+            move_x, move_y = correction
+            correction_text = f"suggested correction X{move_x:+.4f} Y{move_y:+.4f}"
+        self.line_status_var.set(
+            f"{line.mode}: offset X{line.pixel_error_x:+.1f}px Y{line.pixel_error_y:+.1f}px | "
+            f"angle {line.angle_degrees:+.1f}° | confidence {line.confidence:.0f}% | {correction_text}"
+        )
+
+    def _machine_correction_from_pixel_error(self, err_x: float, err_y: float) -> Optional[tuple[float, float]]:
+        calibration = self._validate_calibration(self.active_calibration)
+        if calibration is None:
+            return None
+        try:
+            inv = calibration["matrix_pixel_to_machine"]
+            move_x = float(inv[0][0]) * (-err_x) + float(inv[0][1]) * (-err_y)
+            move_y = float(inv[1][0]) * (-err_x) + float(inv[1][1]) * (-err_y)
+        except Exception:  # noqa: BLE001
+            return None
+        if not math.isfinite(move_x) or not math.isfinite(move_y):
+            return None
+        return move_x, move_y
+
+    def find_line_once(self) -> None:
+        if self.current_frame_bgr is None:
+            messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
+            return
+        line = self.detect_line()
+        self.current_line = line
+        if line.found:
+            self.cal_status_var.set(
+                f"{line.mode} found. Pixel offset X{line.pixel_error_x:+.1f} Y{line.pixel_error_y:+.1f}; "
+                f"confidence {line.confidence:.0f}%."
+            )
+        else:
+            self.cal_status_var.set(line.message)
+        self._show_current_frame()
 
     def find_dot_once(self) -> None:
         if self.current_frame_bgr is None:
@@ -1143,6 +1453,9 @@ class CameraCalibrationDialog(tk.Toplevel):
             feed_units_per_min=self._get_feed(),
             jog_step=self._get_jog_step(),
             center_max_move=self._get_center_max_move(),
+            line_mode=self._get_line_mode(),
+            line_search_px=self._get_line_search_px(),
+            show_line_preview=bool(self.show_line_preview_var.get()),
             calibration=calibration or self.active_calibration,
         )
 

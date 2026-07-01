@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.3"
-APP_TITLE = f"FabScan v{APP_VERSION} - Center Dot Calibration Test"
+APP_VERSION = "0.5.5"
+APP_TITLE = f"FabScan v{APP_VERSION} - Calibration Window Stability"
 
 
 class FabScanApp(tk.Tk):
@@ -2108,6 +2108,9 @@ class FabScanApp(tk.Tk):
             "camera_calibration_feed_units_per_min": float(self.settings.get("camera_calibration_feed_units_per_min", 5.0)),
             "camera_calibration_jog_step": float(self.settings.get("camera_calibration_jog_step", 0.010)),
             "camera_calibration_center_max_move": float(self.settings.get("camera_calibration_center_max_move", 0.100)),
+            "camera_calibration_line_mode": str(self.settings.get("camera_calibration_line_mode", "Line center")),
+            "camera_calibration_line_search_px": int(self.settings.get("camera_calibration_line_search_px", 220)),
+            "camera_calibration_show_line_preview": bool(self.settings.get("camera_calibration_show_line_preview", True)),
             "camera_calibration_show_mask": bool(self.settings.get("camera_calibration_show_mask", False)),
             "camera_calibration": self.settings.get("camera_calibration", None),
         }
@@ -2399,6 +2402,9 @@ class FabScanApp(tk.Tk):
         cal_feed = self.safe_float_from_settings("camera_calibration_feed_units_per_min", 5.0)
         cal_jog_step = self.safe_float_from_settings("camera_calibration_jog_step", 0.010)
         cal_center_max_move = self.safe_float_from_settings("camera_calibration_center_max_move", 0.100)
+        cal_line_mode = str(self.settings.get("camera_calibration_line_mode", "Line center"))
+        cal_line_search_px = self.safe_int_from_settings("camera_calibration_line_search_px", 220)
+        cal_show_line_preview = self.safe_bool_from_settings("camera_calibration_show_line_preview", True)
         cal_show_mask = self.safe_bool_from_settings("camera_calibration_show_mask", False)
         existing_calibration = self.settings.get("camera_calibration", None)
 
@@ -2418,6 +2424,9 @@ class FabScanApp(tk.Tk):
             feed_per_minute=cal_feed,
             jog_step=cal_jog_step,
             center_max_move=cal_center_max_move,
+            line_mode=cal_line_mode,
+            line_search_px=cal_line_search_px,
+            show_line_preview=cal_show_line_preview,
             show_mask=cal_show_mask,
             existing_calibration=existing_calibration,
         )
@@ -2439,6 +2448,9 @@ class FabScanApp(tk.Tk):
         self.settings["camera_calibration_feed_units_per_min"] = dialog.result.feed_units_per_min
         self.settings["camera_calibration_jog_step"] = dialog.result.jog_step
         self.settings["camera_calibration_center_max_move"] = dialog.result.center_max_move
+        self.settings["camera_calibration_line_mode"] = dialog.result.line_mode
+        self.settings["camera_calibration_line_search_px"] = dialog.result.line_search_px
+        self.settings["camera_calibration_show_line_preview"] = dialog.result.show_line_preview
 
         if dialog.result.calibration:
             self.settings["camera_calibration"] = dialog.result.calibration
