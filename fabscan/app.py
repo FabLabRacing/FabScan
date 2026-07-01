@@ -12,6 +12,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from fabscan.camera_capture import CameraCaptureDialog
+from fabscan.camera_calibration import CameraCalibrationDialog
 from fabscan.dxf_export import (
     ExportOriginMode,
     export_contours_to_dxf,
@@ -26,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.4.3"
-APP_TITLE = f"FabScan v{APP_VERSION} - Native Trace Continuation"
+APP_VERSION = "0.5.2"
+APP_TITLE = f"FabScan v{APP_VERSION} - Calibration Screen Jog Controls"
 
 
 class FabScanApp(tk.Tk):
@@ -163,6 +164,7 @@ class FabScanApp(tk.Tk):
 
         ttk.Button(toolbar, text="Load Image", command=self.load_image).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(toolbar, text="Camera Capture", command=self.capture_camera_image).pack(side=tk.LEFT, padx=6)
+        ttk.Button(toolbar, text="Camera Calibrate", command=self.calibrate_camera_lite).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Find Contours", command=self.process_image).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Set Scale", command=self.start_scale_mode).pack(side=tk.LEFT, padx=6)
         ttk.Button(toolbar, text="Export DXF", command=self.export_dxf).pack(side=tk.LEFT, padx=6)
@@ -2101,6 +2103,12 @@ class FabScanApp(tk.Tk):
             "camera_show_crosshair": bool(self.settings.get("camera_show_crosshair", True)),
             "camera_show_axis_labels": bool(self.settings.get("camera_show_axis_labels", True)),
             "camera_show_grid": bool(self.settings.get("camera_show_grid", False)),
+            "camera_calibration_threshold": int(self.settings.get("camera_calibration_threshold", 90)),
+            "camera_calibration_move_distance": float(self.settings.get("camera_calibration_move_distance", 0.100)),
+            "camera_calibration_feed_units_per_min": float(self.settings.get("camera_calibration_feed_units_per_min", 5.0)),
+            "camera_calibration_jog_step": float(self.settings.get("camera_calibration_jog_step", 0.010)),
+            "camera_calibration_show_mask": bool(self.settings.get("camera_calibration_show_mask", False)),
+            "camera_calibration": self.settings.get("camera_calibration", None),
         }
 
     def queue_save_settings(self) -> None:
@@ -2165,7 +2173,7 @@ class FabScanApp(tk.Tk):
             "3. Jog to each point and click Capture Point.\n"
             "4. Watch captured points in the Trace Preview canvas.\n"
             "5. Use Start New when tracing a separate contour, such as a hole inside an outside profile.\n"
-            "6. Export Manual Trace DXF when done. FabScan can do guarded X/Y incremental jogs in v0.3.4 when jog controls are explicitly enabled and LinuxCNC is already in MANUAL mode.\n\n"
+            "6. Export Manual Trace DXF when done. Camera Calibration Lite can be opened from the toolbar to learn camera/machine direction before later edge-following work.\n\n"
             "Tips:\n"
             "- Keep cleanup values low unless the camera image is ugly.\n"
             "- Use Show Threshold to see what FabScan is actually tracing.\n"
@@ -2182,7 +2190,7 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
-            "v0.4.1 LinuxCNC support adds guarded X/Y jogs, controlled point moves, multi-contour trace capture, assisted line/arc tools, and point/trace navigation.\n\n"
+            "v0.5.2 adds X/Y manual jog buttons directly to the Camera Calibration Lite screen, making it easier to center the dot without switching back to the main FabScan window. Calibration still uses guarded MANUAL-mode incremental jogs and LinuxCNC remains the motion controller and position ruler.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )
@@ -2369,6 +2377,74 @@ class FabScanApp(tk.Tk):
             image_path=image_path,
             source_text=source_text,
         )
+
+    def calibrate_camera_lite(self) -> None:
+        """Open the camera/machine calibration helper.
+
+        This does not create DXF geometry. It teaches FabScan how camera pixel
+        movement relates to LinuxCNC X/Y movement so later v0.5.x edge-following
+        can steer with the camera while LinuxCNC remains the position ruler.
+        """
+
+        camera_index = self.safe_int_from_settings("camera_index", 0)
+        camera_width = self.safe_int_from_settings("camera_width", 1280)
+        camera_height = self.safe_int_from_settings("camera_height", 720)
+        camera_rotate_degrees = self.safe_int_from_settings("camera_rotate_degrees", 0)
+        camera_flip_x = self.safe_bool_from_settings("camera_flip_x", False)
+        camera_flip_y = self.safe_bool_from_settings("camera_flip_y", False)
+        camera_fine_rotation_degrees = self.safe_float_from_settings("camera_fine_rotation_degrees", 0.0)
+        cal_threshold = self.safe_int_from_settings("camera_calibration_threshold", 90)
+        cal_move = self.safe_float_from_settings("camera_calibration_move_distance", 0.100)
+        cal_feed = self.safe_float_from_settings("camera_calibration_feed_units_per_min", 5.0)
+        cal_jog_step = self.safe_float_from_settings("camera_calibration_jog_step", 0.010)
+        cal_show_mask = self.safe_bool_from_settings("camera_calibration_show_mask", False)
+
+        dialog = CameraCalibrationDialog(
+            self,
+            linuxcnc_reader=self.linuxcnc_reader,
+            coordinate_mode_label=str(self.linuxcnc_coord_mode_var.get()),
+            camera_index=camera_index,
+            camera_width=camera_width,
+            camera_height=camera_height,
+            rotate_degrees=camera_rotate_degrees,
+            flip_x=camera_flip_x,
+            flip_y=camera_flip_y,
+            fine_rotation_degrees=camera_fine_rotation_degrees,
+            threshold=cal_threshold,
+            move_distance=cal_move,
+            feed_per_minute=cal_feed,
+            jog_step=cal_jog_step,
+            show_mask=cal_show_mask,
+        )
+        self.wait_window(dialog)
+
+        if dialog.result is None:
+            return
+
+        self.settings["camera_index"] = dialog.result.camera_index
+        self.settings["camera_width"] = dialog.result.requested_width
+        self.settings["camera_height"] = dialog.result.requested_height
+        self.settings["camera_rotate_degrees"] = dialog.result.rotate_degrees
+        self.settings["camera_flip_x"] = dialog.result.flip_x
+        self.settings["camera_flip_y"] = dialog.result.flip_y
+        self.settings["camera_fine_rotation_degrees"] = dialog.result.fine_rotation_degrees
+        self.settings["camera_calibration_threshold"] = dialog.result.threshold
+        self.settings["camera_calibration_show_mask"] = dialog.result.show_mask
+        self.settings["camera_calibration_move_distance"] = dialog.result.move_distance
+        self.settings["camera_calibration_feed_units_per_min"] = dialog.result.feed_units_per_min
+        self.settings["camera_calibration_jog_step"] = dialog.result.jog_step
+
+        if dialog.result.calibration:
+            self.settings["camera_calibration"] = dialog.result.calibration
+            self.append_status(
+                "\nCamera calibration complete: "
+                f"X {dialog.result.calibration['pixels_per_unit_x']:.1f} px/unit, "
+                f"Y {dialog.result.calibration['pixels_per_unit_y']:.1f} px/unit."
+            )
+        else:
+            self.append_status("\nCamera calibration window closed without a completed calibration.")
+
+        self.queue_save_settings()
 
     def safe_int_from_settings(self, key: str, default: int) -> int:
         try:

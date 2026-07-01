@@ -1,55 +1,69 @@
-# FabScan v0.4.3 - Native Trace Continuation
+# FabScan v0.5.2 - Calibration Screen Jog Controls
 
-FabScan v0.4.3 fixes a workflow issue from v0.4.2 where adding a new captured point after fitting a native arc/circle/line would clear the native entity and revert the active trace to a polyline.
+This release adds X/Y jog buttons directly to **Camera Calibration Lite** so you can center the calibration dot without leaving the calibration window.
 
-## What changed
+## Why
 
-If the active trace has already been fitted to a native DXF entity and you capture another point, FabScan now:
-
-1. Preserves the fitted native entity.
-2. Starts a new trace automatically.
-3. Seeds that new trace with the previous fitted entity endpoint.
-4. Adds the newly captured point as the second point in the new trace.
-
-This makes workflows like this work correctly:
+v0.5.1 proved the calibration loop:
 
 ```text
-Capture arc start
-Capture arc end
-Center Arc
-Jog to tangent line endpoint
-Capture Point
+find dot
+jog X+
+find dot again
+jog back
+jog Y+
+find dot again
+jog back
+calculate camera/machine transform
 ```
 
-The native DXF ARC remains a real arc, and the new tangent segment becomes a separate trace/polyline starting from the arc endpoint.
+But the workflow was clunky because centering the dot still required using the main FabScan jog panel or QtPlasmaC jog controls. Since the calibration screen already has the live camera view and dot finder, the small jog controls belong there.
 
-## Notes
+## New behavior
 
-- Editing an existing fitted trace with Replace, Insert After, or Delete still clears that trace's native entity and returns it to point/polyline behavior. That is intentional.
-- Continuing from a native entity uses the last defining point as the continuation start.
-- Motion behavior remains unchanged from v0.4.1/v0.4.0: guarded X/Y-only controlled moves.
+The Camera Calibration Lite screen now includes a **Dot Center Jog** panel:
 
-## Install drop-in files
-
-```bash
-cd ~/projects/FabScan
-cp /path/to/unzipped/FabScan_v043_continue_native_dropin/fabscan/app.py fabscan/app.py
-cp /path/to/unzipped/FabScan_v043_continue_native_dropin/README_v0.4.3.md README.md
+```text
+Step
+.001 .005 .010 .050 .100
+Y+
+X-  Find  X+
+Y-
 ```
 
-Then test:
+The jog buttons use the same guarded LinuxCNC MANUAL-mode incremental jog path as the main FabScan jog controls.
 
-```bash
-source .venv/bin/activate
-python3 -m py_compile fabscan/*.py fabscan.py
-python3 fabscan.py
+## Safety / limits
+
+```text
+X/Y only
+Incremental jogs only
+No Z
+No torch
+No program start
+Requires LinuxCNC ON / IDLE / MANUAL
+Requires X/Y/Z homed
+Feed limited by the same FabScan jog guardrails
 ```
 
-## Commit
+## Suggested workflow
 
-```bash
-git status
-git add fabscan/app.py README.md
-git commit -m "Preserve native trace geometry when continuing traces"
-git push
+```text
+Put the dot under the camera
+Open Camera Calibrate
+Use Mask view / Threshold until FabScan sees the dot
+Use Dot Center Jog to put the crosshair near the dot
+Click Find Dot
+Click Run Calibration
+```
+
+The jog step is saved separately from the calibration move distance.
+
+## Files changed
+
+```text
+fabscan/app.py
+fabscan/settings.py
+fabscan/camera_calibration.py
+README.md
 ```

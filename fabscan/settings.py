@@ -51,6 +51,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "camera_show_crosshair": True,
     "camera_show_axis_labels": True,
     "camera_show_grid": False,
+    "camera_calibration_threshold": 90,
+    "camera_calibration_move_distance": 0.100,
+    "camera_calibration_feed_units_per_min": 5.0,
+    "camera_calibration_jog_step": 0.010,
+    "camera_calibration_show_mask": False,
+    "camera_calibration": None,
 }
 
 
