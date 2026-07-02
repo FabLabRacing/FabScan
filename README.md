@@ -39,30 +39,3 @@ Workflow:
 
 If the first step goes the wrong way, change Direction and click `Find Line / Edge` again before running Follow N.
 
-## Install
-
-From the drop-in zip:
-
-```bash
-cd ~/projects/FabScan
-cp /path/to/unzipped/FabScan_v059_follow_direction_latch_dropin/fabscan/app.py fabscan/app.py
-cp /path/to/unzipped/FabScan_v059_follow_direction_latch_dropin/fabscan/camera_calibration.py fabscan/camera_calibration.py
-cp /path/to/unzipped/FabScan_v059_follow_direction_latch_dropin/README_v0.5.9.md README.md
-```
-
-Then:
-
-```bash
-source .venv/bin/activate
-python3 -m py_compile fabscan/*.py fabscan.py
-python3 fabscan.py
-```
-
-Commit after live test:
-
-```bash
-git status
-git add fabscan/app.py fabscan/camera_calibration.py README.md
-git commit -m "Latch follow direction during multi-step edge following"
-git push
-```
