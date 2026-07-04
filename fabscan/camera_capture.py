@@ -9,6 +9,17 @@ from PIL import Image, ImageDraw, ImageTk
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from fabscan.camera_device import (
+    CAMERA_RESOLUTION_PRESETS,
+    DEFAULT_CAMERA_HEIGHT,
+    DEFAULT_CAMERA_WIDTH,
+    CameraStream,
+    open_camera_capture,
+    parse_preset_label,
+    preset_labels,
+    size_to_preset_label,
+)
+
 
 ROTATE_VALUES = (0, 90, 180, 270)
 
@@ -47,8 +58,8 @@ class CameraCaptureDialog(tk.Toplevel):
         parent: tk.Misc,
         *,
         camera_index: int = 0,
-        camera_width: int = 1280,
-        camera_height: int = 720,
+        camera_width: int = DEFAULT_CAMERA_WIDTH,
+        camera_height: int = DEFAULT_CAMERA_HEIGHT,
         rotate_degrees: int = 0,
         flip_x: bool = False,
         flip_y: bool = False,
@@ -63,10 +74,11 @@ class CameraCaptureDialog(tk.Toplevel):
         self.transient(parent)
 
         self.result: Optional[CameraCaptureResult] = None
-        self.cap: Optional[cv2.VideoCapture] = None
+        self.cap: Optional[CameraStream] = None
         self.current_frame_bgr: Optional[np.ndarray] = None
         self.after_job: Optional[str] = None
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
+        self._closing = False
 
         if int(rotate_degrees) not in ROTATE_VALUES:
             rotate_degrees = 0
@@ -74,6 +86,7 @@ class CameraCaptureDialog(tk.Toplevel):
         self.camera_index_var = tk.IntVar(value=max(0, int(camera_index)))
         self.camera_width_var = tk.IntVar(value=max(0, int(camera_width)))
         self.camera_height_var = tk.IntVar(value=max(0, int(camera_height)))
+        self.camera_preset_var = tk.StringVar(value=size_to_preset_label(camera_width, camera_height))
         self.rotate_var = tk.StringVar(value=str(int(rotate_degrees)))
         self.flip_x_var = tk.BooleanVar(value=bool(flip_x))
         self.flip_y_var = tk.BooleanVar(value=bool(flip_y))
@@ -116,6 +129,17 @@ class CameraCaptureDialog(tk.Toplevel):
         ttk.Label(connection, text="Height").pack(side=tk.LEFT)
         height_entry = ttk.Entry(connection, textvariable=self.camera_height_var, width=8)
         height_entry.pack(side=tk.LEFT, padx=(4, 12))
+
+        ttk.Label(connection, text="Preset").pack(side=tk.LEFT)
+        preset_combo = ttk.Combobox(
+            connection,
+            textvariable=self.camera_preset_var,
+            values=preset_labels(),
+            width=11,
+            state="readonly",
+        )
+        preset_combo.pack(side=tk.LEFT, padx=(4, 8))
+        preset_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_resolution_preset())
 
         ttk.Button(connection, text="Open / Restart Camera", command=self.open_camera).pack(
             side=tk.LEFT, padx=(0, 8)
@@ -240,6 +264,15 @@ class CameraCaptureDialog(tk.Toplevel):
             height = 0
         return max(0, width), max(0, height)
 
+    def apply_resolution_preset(self) -> None:
+        preset = parse_preset_label(self.camera_preset_var.get())
+        if preset is None:
+            return
+        width, height = preset
+        self.camera_width_var.set(width)
+        self.camera_height_var.set(height)
+        self.status_var.set(f"Preset selected: {width} x {height}. Click Open / Restart Camera to apply.")
+
     def _get_camera_index(self) -> int:
         try:
             return max(0, int(self.camera_index_var.get()))
@@ -269,28 +302,26 @@ class CameraCaptureDialog(tk.Toplevel):
 
         index = self._get_camera_index()
         width, height = self._get_requested_size()
+        self.camera_preset_var.set(size_to_preset_label(width, height))
 
-        cap = cv2.VideoCapture(index)
-        if width > 0:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        if height > 0:
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-
-        if not cap.isOpened():
-            cap.release()
+        cap, info, error = open_camera_capture(index, width, height)
+        if cap is None:
             self.cap = None
-            self.status_var.set(
-                f"Camera {index} did not open. Try index 1, check permissions, or verify the camera is connected."
-            )
+            self.status_var.set(f"Camera {index} did not open. {error}")
             return
 
-        self.cap = cap
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.status_var.set(
-            f"Camera {index} open. Actual frame: {actual_w} x {actual_h}. "
+        stream = CameraStream(cap, info)
+        stream.start()
+        self.cap = stream
+
+        status = (
+            f"Camera {index} open via {info.backend_name}. Requested {info.requested_size_text}; "
+            f"actual {info.actual_size_text}; format {info.fourcc}. "
             "X+ is right and Y+ is up in the transformed preview."
         )
+        if info.warning:
+            status += f"  Warning: {info.warning}"
+        self.status_var.set(status)
         self._schedule_next_frame()
 
     def release_camera(self) -> None:
@@ -302,25 +333,29 @@ class CameraCaptureDialog(tk.Toplevel):
             self.after_job = None
 
         if self.cap is not None:
-            self.cap.release()
+            self.cap.close()
             self.cap = None
 
     def _schedule_next_frame(self) -> None:
+        if self._closing:
+            return
         self.after_job = self.after(50, self._update_preview)
 
     def _update_preview(self) -> None:
         self.after_job = None
-        if self.cap is None:
+        if self._closing or self.cap is None:
             return
 
-        ok, frame = self.cap.read()
-        if ok and frame is not None:
+        frame = self.cap.get_latest_frame()
+        if frame is not None:
             self.current_frame_bgr = frame
             self._show_frame(frame)
         else:
-            self.status_var.set("Camera read failed. Try Open / Restart Camera.")
+            message = self.cap.status_message()
+            if message:
+                self.status_var.set(message)
 
-        if self.cap is not None:
+        if self.cap is not None and not self._closing:
             self._schedule_next_frame()
 
     def _show_current_frame(self) -> None:
@@ -374,8 +409,13 @@ class CameraCaptureDialog(tk.Toplevel):
             pil_image = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
         self._draw_overlay(pil_image)
-        self._tk_preview = ImageTk.PhotoImage(pil_image)
-        self.preview_label.configure(image=self._tk_preview)
+        if self._closing:
+            return
+        self._tk_preview = ImageTk.PhotoImage(pil_image, master=self)
+        try:
+            self.preview_label.configure(image=self._tk_preview)
+        except tk.TclError:
+            pass
 
     def _draw_overlay(self, pil_image: Image.Image) -> None:
         """Draw live alignment aids on the preview image only."""
@@ -440,5 +480,9 @@ class CameraCaptureDialog(tk.Toplevel):
         self.close()
 
     def close(self) -> None:
+        self._closing = True
         self.release_camera()
-        self.destroy()
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass

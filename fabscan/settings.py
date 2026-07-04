@@ -42,8 +42,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "last_export_dir": str(Path.cwd() / "exports"),
     "last_capture_dir": str(Path.home() / "Pictures" / "FabScan Captures"),
     "camera_index": 0,
-    "camera_width": 1280,
-    "camera_height": 720,
+    "camera_width": 800,
+    "camera_height": 600,
     "camera_rotate_degrees": 0,
     "camera_flip_x": False,
     "camera_flip_y": False,
@@ -101,6 +101,19 @@ def load_settings() -> dict[str, Any]:
     except Exception:
         # Bad settings should never stop FabScan from starting.
         return DEFAULT_SETTINGS.copy()
+
+    def safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    # v0.5.10 migration: the old default was 1280x720, which many UVC
+    # microscope cameras do not support. If a saved profile still has that
+    # exact legacy default, move it to the known-good 800x600 starting point.
+    if safe_int(settings.get("camera_width")) == 1280 and safe_int(settings.get("camera_height")) == 720:
+        settings["camera_width"] = DEFAULT_SETTINGS["camera_width"]
+        settings["camera_height"] = DEFAULT_SETTINGS["camera_height"]
 
     return settings
 

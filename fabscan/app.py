@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.9"
-APP_TITLE = f"FabScan v{APP_VERSION} - Follow Direction Latch"
+APP_VERSION = "0.5.10"
+APP_TITLE = f"FabScan v{APP_VERSION} - Camera Robustness"
 
 
 class FabScanApp(tk.Tk):
@@ -1001,21 +1001,9 @@ class FabScanApp(tk.Tk):
         return status.work_position
 
     def on_jog_controls_enabled_changed(self) -> None:
-        """Require an explicit per-session acknowledgement before jog buttons move the machine."""
+        """Enable/disable guarded X/Y jog buttons without a confirmation popup."""
 
         if bool(self.jog_controls_enabled_var.get()):
-            accepted = messagebox.askyesno(
-                "Enable FabScan jog controls?",
-                "FabScan jog buttons will move the machine in X/Y by the selected step.\n\n"
-                "Use only with the torch disabled, the table clear, and your hand near E-stop.\n\n"
-                "FabScan will still refuse to jog unless LinuxCNC is ON, IDLE, homed, and already in MANUAL mode.\n\n"
-                "Enable jog controls for this session?",
-                parent=self,
-            )
-            if not accepted:
-                self.jog_controls_enabled_var.set(False)
-                self.jog_status_var.set("Jog disabled")
-                return
             self.jog_status_var.set("Jog enabled: X/Y incremental only")
             self.append_status("\nFabScan jog controls enabled for this session.")
         else:
@@ -1088,22 +1076,9 @@ class FabScanApp(tk.Tk):
         self.refresh_linuxcnc_status(show_errors=False)
 
     def on_controlled_motion_enabled_changed(self) -> None:
-        """Require explicit acknowledgement before FabScan can send G-code motion."""
+        """Enable/disable guarded X/Y controlled moves without a confirmation popup."""
 
         if bool(self.controlled_motion_enabled_var.get()):
-            accepted = messagebox.askyesno(
-                "Enable FabScan controlled motion?",
-                "FabScan will be allowed to send one X/Y G1 move to LinuxCNC using the target fields.\n\n"
-                "This can move the table farther than a jog step. Use only with the torch disabled, "
-                "the table clear, and your hand near E-stop.\n\n"
-                "FabScan will still refuse motion unless LinuxCNC is ON, IDLE, homed, and in MANUAL or MDI mode.\n\n"
-                "Enable controlled X/Y moves for this session?",
-                parent=self,
-            )
-            if not accepted:
-                self.controlled_motion_enabled_var.set(False)
-                self.motion_status_var.set("Controlled motion disabled")
-                return
             self.motion_status_var.set("Controlled motion enabled: X/Y G1 only")
             self.append_status("\nFabScan controlled X/Y motion enabled for this session.")
         else:
@@ -2094,8 +2069,8 @@ class FabScanApp(tk.Tk):
             "last_export_dir": str(self.settings.get("last_export_dir", Path.cwd() / "exports")),
             "last_capture_dir": str(self.settings.get("last_capture_dir", Path.home() / "Pictures" / "FabScan Captures")),
             "camera_index": int(self.settings.get("camera_index", 0)),
-            "camera_width": int(self.settings.get("camera_width", 1280)),
-            "camera_height": int(self.settings.get("camera_height", 720)),
+            "camera_width": int(self.settings.get("camera_width", 800)),
+            "camera_height": int(self.settings.get("camera_height", 600)),
             "camera_rotate_degrees": int(self.settings.get("camera_rotate_degrees", 0)),
             "camera_flip_x": bool(self.settings.get("camera_flip_x", False)),
             "camera_flip_y": bool(self.settings.get("camera_flip_y", False)),
@@ -2201,7 +2176,7 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
-            "v0.5.3 adds Center Dot to the Camera Calibration Lite screen. After calibration, FabScan can use the saved camera/machine transform to move the machine so the detected dot lands under the crosshair. This proves the calibration can steer before we try edge following.\n\n"
+            "v0.5.10 makes camera handling more forgiving: default 800x600, presets, requested-vs-actual camera status, V4L2 on Linux, MJPG preference, and threaded preview reads so bad modes are less likely to freeze the UI.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )
@@ -2306,8 +2281,8 @@ class FabScanApp(tk.Tk):
         """Capture a still frame from a camera and load it as the working image."""
 
         camera_index = self.safe_int_from_settings("camera_index", 0)
-        camera_width = self.safe_int_from_settings("camera_width", 1280)
-        camera_height = self.safe_int_from_settings("camera_height", 720)
+        camera_width = self.safe_int_from_settings("camera_width", 800)
+        camera_height = self.safe_int_from_settings("camera_height", 600)
         camera_rotate_degrees = self.safe_int_from_settings("camera_rotate_degrees", 0)
         camera_flip_x = self.safe_bool_from_settings("camera_flip_x", False)
         camera_flip_y = self.safe_bool_from_settings("camera_flip_y", False)
@@ -2398,8 +2373,8 @@ class FabScanApp(tk.Tk):
         """
 
         camera_index = self.safe_int_from_settings("camera_index", 0)
-        camera_width = self.safe_int_from_settings("camera_width", 1280)
-        camera_height = self.safe_int_from_settings("camera_height", 720)
+        camera_width = self.safe_int_from_settings("camera_width", 800)
+        camera_height = self.safe_int_from_settings("camera_height", 600)
         camera_rotate_degrees = self.safe_int_from_settings("camera_rotate_degrees", 0)
         camera_flip_x = self.safe_bool_from_settings("camera_flip_x", False)
         camera_flip_y = self.safe_bool_from_settings("camera_flip_y", False)

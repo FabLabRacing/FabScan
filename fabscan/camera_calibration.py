@@ -12,6 +12,15 @@ from PIL import Image, ImageDraw, ImageTk
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from fabscan.camera_device import (
+    DEFAULT_CAMERA_HEIGHT,
+    DEFAULT_CAMERA_WIDTH,
+    CameraStream,
+    open_camera_capture,
+    parse_preset_label,
+    preset_labels,
+    size_to_preset_label,
+)
 from fabscan.linuxcnc_status import LinuxCNCPositionStatus, LinuxCNCStatusReader
 
 
@@ -86,8 +95,8 @@ class CameraCalibrationDialog(tk.Toplevel):
         linuxcnc_reader: LinuxCNCStatusReader,
         coordinate_mode_label: str,
         camera_index: int = 0,
-        camera_width: int = 1280,
-        camera_height: int = 720,
+        camera_width: int = DEFAULT_CAMERA_WIDTH,
+        camera_height: int = DEFAULT_CAMERA_HEIGHT,
         rotate_degrees: int = 0,
         flip_x: bool = False,
         flip_y: bool = False,
@@ -112,7 +121,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         trace_capture_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.9")
+        self.title("FabScan Camera Calibration Lite - v0.5.10")
         self.minsize(1080, 650)
         # Give the dialog an explicit starting size so Tk does not keep
         # recomputing the top-level size as live preview/status content changes.
@@ -122,7 +131,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.linuxcnc_reader = linuxcnc_reader
         self.coordinate_mode_label = coordinate_mode_label or "Work coordinates"
         self.result: Optional[CameraCalibrationDialogResult] = None
-        self.cap: Optional[cv2.VideoCapture] = None
+        self.cap: Optional[CameraStream] = None
         self.current_frame_bgr: Optional[np.ndarray] = None
         self.current_dot: DotDetection = DotDetection(False)
         self.current_line: LineDetection = LineDetection(False)
@@ -132,6 +141,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.preview_display_height = 420
         self.after_job: Optional[str] = None
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
+        self._closing = False
         self._motion_active = False
         self._manual_jog_active = False
         self._follow_stop_requested = False
@@ -149,6 +159,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.camera_index_var = tk.IntVar(value=max(0, int(camera_index)))
         self.camera_width_var = tk.IntVar(value=max(0, int(camera_width)))
         self.camera_height_var = tk.IntVar(value=max(0, int(camera_height)))
+        self.camera_preset_var = tk.StringVar(value=size_to_preset_label(camera_width, camera_height))
         self.rotate_var = tk.StringVar(value=str(int(rotate_degrees)))
         self.flip_x_var = tk.BooleanVar(value=bool(flip_x))
         self.flip_y_var = tk.BooleanVar(value=bool(flip_y))
@@ -220,8 +231,18 @@ class CameraCalibrationDialog(tk.Toplevel):
         ttk.Entry(camera, textvariable=self.camera_width_var, width=6).grid(row=0, column=3, sticky=tk.W, padx=(4, 10))
         ttk.Label(camera, text="H").grid(row=0, column=4, sticky=tk.W)
         ttk.Entry(camera, textvariable=self.camera_height_var, width=6).grid(row=0, column=5, sticky=tk.W, padx=(4, 10))
-        ttk.Button(camera, text="Open / Restart", command=self.open_camera).grid(row=0, column=6, sticky=tk.W, padx=(0, 6))
-        ttk.Button(camera, text="Close", command=self.close).grid(row=0, column=7, sticky=tk.W)
+        ttk.Label(camera, text="Preset").grid(row=0, column=6, sticky=tk.W)
+        preset_combo = ttk.Combobox(
+            camera,
+            textvariable=self.camera_preset_var,
+            values=preset_labels(),
+            width=11,
+            state="readonly",
+        )
+        preset_combo.grid(row=0, column=7, sticky=tk.W, padx=(4, 10))
+        preset_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_resolution_preset())
+        ttk.Button(camera, text="Open / Restart", command=self.open_camera).grid(row=0, column=8, sticky=tk.W, padx=(0, 6))
+        ttk.Button(camera, text="Close", command=self.close).grid(row=0, column=9, sticky=tk.W)
 
         ttk.Label(camera, text="Rotate").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
         ttk.Combobox(
@@ -240,9 +261,9 @@ class CameraCalibrationDialog(tk.Toplevel):
             to=10.0,
             variable=self.fine_rotation_var,
             command=lambda _value: self._show_current_frame(),
-        ).grid(row=1, column=7, sticky="ew", padx=(4, 8), pady=(6, 0))
+        ).grid(row=1, column=7, columnspan=2, sticky="ew", padx=(4, 8), pady=(6, 0))
         self.fine_rotation_label = ttk.Label(camera, width=7)
-        self.fine_rotation_label.grid(row=1, column=8, sticky=tk.W, pady=(6, 0))
+        self.fine_rotation_label.grid(row=1, column=9, sticky=tk.W, pady=(6, 0))
         camera.columnconfigure(7, weight=1)
         self._update_fine_rotation_label()
 
@@ -451,6 +472,15 @@ class CameraCalibrationDialog(tk.Toplevel):
             height = 0
         return max(0, width), max(0, height)
 
+    def apply_resolution_preset(self) -> None:
+        preset = parse_preset_label(self.camera_preset_var.get())
+        if preset is None:
+            return
+        width, height = preset
+        self.camera_width_var.set(width)
+        self.camera_height_var.set(height)
+        self.cal_status_var.set(f"Preset selected: {width} x {height}. Click Open / Restart to apply.")
+
     def _get_camera_index(self) -> int:
         try:
             return max(0, int(self.camera_index_var.get()))
@@ -573,22 +603,25 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         index = self._get_camera_index()
         width, height = self._get_requested_size()
-        cap = cv2.VideoCapture(index)
-        if width > 0:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        if height > 0:
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.camera_preset_var.set(size_to_preset_label(width, height))
 
-        if not cap.isOpened():
-            cap.release()
+        cap, info, error = open_camera_capture(index, width, height)
+        if cap is None:
             self.cap = None
-            self.cal_status_var.set(f"Camera {index} did not open. Try another index or check the USB camera.")
+            self.cal_status_var.set(f"Camera {index} did not open. {error}")
             return
 
-        self.cap = cap
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.cal_status_var.set(f"Camera {index} open. Actual frame: {actual_w} x {actual_h}.")
+        stream = CameraStream(cap, info)
+        stream.start()
+        self.cap = stream
+
+        status = (
+            f"Camera {index} open via {info.backend_name}. Requested {info.requested_size_text}; "
+            f"actual {info.actual_size_text}; format {info.fourcc}."
+        )
+        if info.warning:
+            status += f" Warning: {info.warning}"
+        self.cal_status_var.set(status)
         self._schedule_next_frame()
 
     def release_camera(self) -> None:
@@ -599,27 +632,31 @@ class CameraCalibrationDialog(tk.Toplevel):
                 pass
             self.after_job = None
         if self.cap is not None:
-            self.cap.release()
+            self.cap.close()
             self.cap = None
 
     def _schedule_next_frame(self) -> None:
+        if self._closing:
+            return
         self.after_job = self.after(50, self._update_preview)
 
     def _update_preview(self) -> None:
         self.after_job = None
         self._pump_camera_frame()
-        if self.cap is not None:
+        if self.cap is not None and not self._closing:
             self._schedule_next_frame()
 
     def _pump_camera_frame(self) -> bool:
-        if self.cap is None:
+        if self._closing or self.cap is None:
             return False
-        ok, frame = self.cap.read()
-        if ok and frame is not None:
+        frame = self.cap.get_latest_frame()
+        if frame is not None:
             self.current_frame_bgr = frame
             self._show_frame(frame)
             return True
-        self.cal_status_var.set("Camera read failed. Try Open / Restart Camera.")
+        message = self.cap.status_message()
+        if message:
+            self.cal_status_var.set(message)
         return False
 
     def _show_current_frame(self) -> None:
@@ -739,8 +776,13 @@ class CameraCalibrationDialog(tk.Toplevel):
             pil_image = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
         self._draw_overlay(pil_image, scale, original_w, original_h)
-        self._tk_preview = ImageTk.PhotoImage(pil_image)
-        self.preview_label.configure(image=self._tk_preview)
+        if self._closing:
+            return
+        self._tk_preview = ImageTk.PhotoImage(pil_image, master=self)
+        try:
+            self.preview_label.configure(image=self._tk_preview)
+        except tk.TclError:
+            return
         self._update_dot_status(original_w, original_h)
         self._update_line_status(original_w, original_h)
 
@@ -1127,20 +1169,9 @@ class CameraCalibrationDialog(tk.Toplevel):
             return
         start_x, start_y, _z = self._active_position(status)
 
-        proceed = messagebox.askyesno(
-            "Run camera calibration?",
-            (
-                "FabScan will command small X/Y incremental jogs through LinuxCNC.\n\n"
-                "Put QtPlasmaC/LinuxCNC in MANUAL/JOG mode before continuing.\n"
-                f"Coordinate source for displayed/saved positions: {coordinate_mode}\n"
-                f"Jog distance: {move_distance:.4f}\n"
-                f"Feed: {feed:.1f} units/min\n\n"
-                "Keep the torch/plasma disabled and keep your hand near E-stop. Continue?"
-            ),
-            parent=self,
+        self.cal_status_var.set(
+            f"Calibration starting: {coordinate_mode}, move {move_distance:.4f}, feed {feed:.1f} units/min."
         )
-        if not proceed:
-            return
 
         self._motion_active = True
         try:
@@ -1851,7 +1882,11 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.cal_status_var.set(result.message)
 
     def close(self) -> None:
+        self._closing = True
         if self.result is None:
             self.result = self._make_result(calibration=None)
         self.release_camera()
-        self.destroy()
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
