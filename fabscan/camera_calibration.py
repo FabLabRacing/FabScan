@@ -49,6 +49,10 @@ class LineDetection:
     pixel_error_y: float = 0.0
     angle_degrees: float = 0.0
     confidence: float = 0.0
+    span_px: float = 0.0
+    width_px: float = 0.0
+    point_count: int = 0
+    search_px: int = 0
     message: str = "No line/edge found"
 
 
@@ -62,6 +66,7 @@ class CameraCalibrationDialogResult:
     flip_y: bool
     fine_rotation_degrees: float
     threshold: int
+    show_dot_marker: bool
     show_mask: bool
     move_distance: float
     feed_units_per_min: float
@@ -71,6 +76,8 @@ class CameraCalibrationDialogResult:
     line_search_px: int
     show_line_preview: bool
     follow_step: float
+    follow_feed_units_per_min: float
+    follow_settle_ms: int
     follow_max_correct: float
     follow_min_confidence: float
     follow_direction: str
@@ -102,6 +109,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         flip_y: bool = False,
         fine_rotation_degrees: float = 0.0,
         threshold: int = 90,
+        show_dot_marker: bool = True,
         move_distance: float = 0.100,
         feed_per_minute: float = 5.0,
         jog_step: float = 0.010,
@@ -111,6 +119,8 @@ class CameraCalibrationDialog(tk.Toplevel):
         show_line_preview: bool = True,
         show_mask: bool = False,
         follow_step: float = 0.050,
+        follow_feed_units_per_min: float = 5.0,
+        follow_settle_ms: int = 150,
         follow_max_correct: float = 0.050,
         follow_min_confidence: float = 45.0,
         follow_direction: str = "Forward",
@@ -121,7 +131,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         trace_capture_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.10")
+        self.title("FabScan Camera Calibration Lite - v0.5.14")
         self.minsize(1080, 650)
         # Give the dialog an explicit starting size so Tk does not keep
         # recomputing the top-level size as live preview/status content changes.
@@ -165,6 +175,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.flip_y_var = tk.BooleanVar(value=bool(flip_y))
         self.fine_rotation_var = tk.DoubleVar(value=self._clamp_fine_rotation(fine_rotation_degrees))
         self.threshold_var = tk.IntVar(value=max(0, min(255, int(threshold))))
+        self.show_dot_marker_var = tk.BooleanVar(value=bool(show_dot_marker))
         self.show_mask_var = tk.BooleanVar(value=bool(show_mask))
         self.move_distance_var = tk.DoubleVar(value=max(0.001, float(move_distance)))
         self.feed_var = tk.DoubleVar(value=max(0.1, float(feed_per_minute)))
@@ -174,6 +185,8 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.line_search_px_var = tk.IntVar(value=self._clamp_line_search_px(line_search_px))
         self.show_line_preview_var = tk.BooleanVar(value=bool(show_line_preview))
         self.follow_step_var = tk.DoubleVar(value=max(0.001, float(follow_step)))
+        self.follow_feed_var = tk.DoubleVar(value=max(0.1, float(follow_feed_units_per_min)))
+        self.follow_settle_ms_var = tk.IntVar(value=self._clamp_follow_settle_ms(follow_settle_ms))
         self.follow_max_correct_var = tk.DoubleVar(value=max(0.0, float(follow_max_correct)))
         self.follow_min_confidence_var = tk.DoubleVar(value=max(0.0, min(100.0, float(follow_min_confidence))))
         self.follow_direction_var = tk.StringVar(value=self._normalize_follow_direction(follow_direction))
@@ -283,6 +296,9 @@ class CameraCalibrationDialog(tk.Toplevel):
         ttk.Checkbutton(vision, text="Mask", variable=self.show_mask_var, command=self._show_current_frame).grid(
             row=1, column=0, sticky=tk.W, pady=(4, 0)
         )
+        ttk.Checkbutton(vision, text="Dot marker", variable=self.show_dot_marker_var, command=self._show_current_frame).grid(
+            row=2, column=0, sticky=tk.W, pady=(4, 0)
+        )
         ttk.Button(vision, text="Find Dot", command=self.find_dot_once).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(4, 0))
         vision.columnconfigure(1, weight=1)
 
@@ -304,13 +320,30 @@ class CameraCalibrationDialog(tk.Toplevel):
         left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
         left_panel.pack_propagate(False)
 
-        status_frame = ttk.LabelFrame(left_panel, text="Status", padding=6)
+        status_frame = ttk.LabelFrame(left_panel, text="Status", padding=6, height=270)
         status_frame.pack(side=tk.TOP, fill=tk.X)
-        wrap = 260
-        ttk.Label(status_frame, textvariable=self.dot_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(status_frame, textvariable=self.cal_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
-        ttk.Label(status_frame, textvariable=self.transform_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
-        ttk.Label(status_frame, textvariable=self.line_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        # Keep the live status area fixed-height so long Line center updates do
+        # not resize the dialog, but make it scrollable so no information is
+        # clipped when a line wraps more than expected.
+        status_frame.pack_propagate(False)
+        status_scroll = ttk.Scrollbar(status_frame, orient=tk.VERTICAL)
+        status_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.status_text = tk.Text(
+            status_frame,
+            height=14,
+            width=34,
+            wrap=tk.WORD,
+            yscrollcommand=status_scroll.set,
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            padx=2,
+            pady=2,
+        )
+        self.status_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.status_text.configure(state=tk.DISABLED)
+        status_scroll.configure(command=self.status_text.yview)
+        self._refresh_status_text()
 
         line_tools = ttk.LabelFrame(left_panel, text="Line / Edge Preview", padding=6)
         line_tools.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
@@ -383,32 +416,36 @@ class CameraCalibrationDialog(tk.Toplevel):
         ttk.Checkbutton(follow_tools, text="Enable follow", variable=self.follow_enabled_var).grid(row=0, column=0, columnspan=2, sticky=tk.W)
         ttk.Label(follow_tools, text="Step").grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
         ttk.Entry(follow_tools, textvariable=self.follow_step_var, width=8).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
-        ttk.Label(follow_tools, text="Max correct").grid(row=2, column=0, sticky=tk.W, pady=(5, 0))
-        ttk.Entry(follow_tools, textvariable=self.follow_max_correct_var, width=8).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
-        ttk.Label(follow_tools, text="Min conf").grid(row=3, column=0, sticky=tk.W, pady=(5, 0))
-        ttk.Entry(follow_tools, textvariable=self.follow_min_confidence_var, width=8).grid(row=3, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
-        ttk.Label(follow_tools, text="Count").grid(row=4, column=0, sticky=tk.W, pady=(5, 0))
-        ttk.Entry(follow_tools, textvariable=self.follow_repeat_count_var, width=8).grid(row=4, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
-        ttk.Label(follow_tools, text="Direction").grid(row=5, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Label(follow_tools, text="Feed").grid(row=2, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_feed_var, width=8).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Settle ms").grid(row=3, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_settle_ms_var, width=8).grid(row=3, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Max correct").grid(row=4, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_max_correct_var, width=8).grid(row=4, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Min conf").grid(row=5, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_min_confidence_var, width=8).grid(row=5, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Count").grid(row=6, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_repeat_count_var, width=8).grid(row=6, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Direction").grid(row=7, column=0, sticky=tk.W, pady=(5, 0))
         ttk.Combobox(
             follow_tools,
             textvariable=self.follow_direction_var,
             values=("Forward", "Reverse"),
             width=9,
             state="readonly",
-        ).grid(row=5, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ).grid(row=7, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
         ttk.Checkbutton(
             follow_tools,
             text="Capture after move",
             variable=self.follow_capture_point_var,
-        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
         ttk.Button(follow_tools, text="Follow Step", command=self.follow_line_single_step).grid(
-            row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+            row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
         ttk.Button(follow_tools, text="Follow N", command=self.follow_line_multiple_steps).grid(
-            row=8, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+            row=10, column=0, columnspan=2, sticky="ew", pady=(4, 0)
         )
-        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=11, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         follow_tools.columnconfigure(1, weight=1)
 
     def _register_traces(self) -> None:
@@ -418,6 +455,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.flip_y_var,
             self.fine_rotation_var,
             self.threshold_var,
+            self.show_dot_marker_var,
             self.show_mask_var,
             self.line_mode_var,
             self.line_search_px_var,
@@ -425,7 +463,36 @@ class CameraCalibrationDialog(tk.Toplevel):
         )
         for variable in watched_vars:
             variable.trace_add("write", lambda *_args: self._on_preview_setting_changed())
+        status_vars: tuple[tk.Variable, ...] = (
+            self.dot_status_var,
+            self.cal_status_var,
+            self.transform_status_var,
+            self.line_status_var,
+        )
+        for variable in status_vars:
+            variable.trace_add("write", lambda *_args: self._refresh_status_text())
         self.follow_direction_var.trace_add("write", lambda *_args: self._clear_follow_heading())
+
+    def _refresh_status_text(self) -> None:
+        status_text = getattr(self, "status_text", None)
+        if status_text is None:
+            return
+        text = "\n\n".join(
+            (
+                str(self.dot_status_var.get()),
+                str(self.cal_status_var.get()),
+                str(self.transform_status_var.get()),
+                str(self.line_status_var.get()),
+            )
+        )
+        try:
+            status_text.configure(state=tk.NORMAL)
+            status_text.delete("1.0", tk.END)
+            status_text.insert("1.0", text)
+            status_text.configure(state=tk.DISABLED)
+            status_text.see("end-1c")
+        except tk.TclError:
+            return
 
     def _clear_follow_heading(self) -> None:
         self._follow_heading_unit = None
@@ -542,6 +609,31 @@ class CameraCalibrationDialog(tk.Toplevel):
         except (tk.TclError, TypeError, ValueError):
             step = 0.050
         return max(0.001, min(1.000, step))
+
+    def _get_follow_feed(self) -> float:
+        try:
+            feed = abs(float(self.follow_feed_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            feed = 5.0
+        feed = max(0.1, min(120.0, feed))
+        self.follow_feed_var.set(feed)
+        return feed
+
+    def _clamp_follow_settle_ms(self, value: object) -> int:
+        try:
+            settle_ms = int(round(float(value)))
+        except (tk.TclError, TypeError, ValueError):
+            settle_ms = 150
+        return max(0, min(2000, settle_ms))
+
+    def _get_follow_settle_ms(self) -> int:
+        settle_ms = self._clamp_follow_settle_ms(self.follow_settle_ms_var.get())
+        try:
+            if int(self.follow_settle_ms_var.get()) != settle_ms:
+                self.follow_settle_ms_var.set(settle_ms)
+        except (tk.TclError, TypeError, ValueError):
+            self.follow_settle_ms_var.set(settle_ms)
+        return settle_ms
 
     def _get_follow_max_correct(self) -> float:
         try:
@@ -796,6 +888,9 @@ class CameraCalibrationDialog(tk.Toplevel):
         found = (0, 255, 0)
         missing = (255, 80, 80)
 
+        # Keep the yellow calibration crosshair visible all the time. It is
+        # the camera center reference used by both dot centering and edge/line
+        # follow, and it is useful even when the dot marker overlay is hidden.
         draw.line((cx, 0, cx, h), fill=outline, width=5)
         draw.line((0, cy, w, cy), fill=outline, width=5)
         draw.line((cx, 0, cx, h), fill=cross, width=2)
@@ -805,16 +900,17 @@ class CameraCalibrationDialog(tk.Toplevel):
         draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=outline, width=4)
         draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=cross, width=2)
 
-        if self.current_dot.found:
-            dx = int(round(self.current_dot.x * scale))
-            dy = int(round(self.current_dot.y * scale))
-            rr = 12
-            draw.ellipse((dx - rr, dy - rr, dx + rr, dy + rr), outline=outline, width=5)
-            draw.ellipse((dx - rr, dy - rr, dx + rr, dy + rr), outline=found, width=3)
-            draw.line((dx - 18, dy, dx + 18, dy), fill=found, width=2)
-            draw.line((dx, dy - 18, dx, dy + 18), fill=found, width=2)
-        else:
-            draw.text((10, 10), "DOT NOT FOUND", fill=missing)
+        if bool(self.show_dot_marker_var.get()):
+            if self.current_dot.found:
+                dx = int(round(self.current_dot.x * scale))
+                dy = int(round(self.current_dot.y * scale))
+                rr = 12
+                draw.ellipse((dx - rr, dy - rr, dx + rr, dy + rr), outline=outline, width=5)
+                draw.ellipse((dx - rr, dy - rr, dx + rr, dy + rr), outline=found, width=3)
+                draw.line((dx - 18, dy, dx + 18, dy), fill=found, width=2)
+                draw.line((dx, dy - 18, dx, dy + 18), fill=found, width=2)
+            else:
+                draw.text((10, 10), "DOT NOT FOUND", fill=missing)
 
         if bool(self.show_line_preview_var.get()):
             self._draw_line_overlay(draw, scale, source_w, source_h)
@@ -965,6 +1061,10 @@ class CameraCalibrationDialog(tk.Toplevel):
             pixel_error_y=err_y,
             angle_degrees=angle,
             confidence=confidence,
+            span_px=span,
+            width_px=width_est * 2.0,
+            point_count=int(len(points_global)),
+            search_px=self._get_line_search_px(),
             message="Line/edge found",
         )
 
@@ -1016,9 +1116,14 @@ class CameraCalibrationDialog(tk.Toplevel):
         else:
             move_x, move_y = correction
             correction_text = f"suggested correction X{move_x:+.4f} Y{move_y:+.4f}"
+        quality_text = (
+            f"span {line.span_px:.0f}px | width {line.width_px:.1f}px | "
+            f"points {line.point_count} | search {line.search_px}px"
+        )
         self.line_status_var.set(
             f"{line.mode}: offset X{line.pixel_error_x:+.1f}px Y{line.pixel_error_y:+.1f}px | "
-            f"angle {line.angle_degrees:+.1f}° | confidence {line.confidence:.0f}% | {correction_text}"
+            f"angle {line.angle_degrees:+.1f}° | confidence {line.confidence:.0f}% | "
+            f"{quality_text} | {correction_text}"
         )
 
     def _machine_correction_from_pixel_error(self, err_x: float, err_y: float) -> Optional[tuple[float, float]]:
@@ -1567,7 +1672,6 @@ class CameraCalibrationDialog(tk.Toplevel):
             if not ok:
                 break
             completed += 1
-            self._wait_and_pump_camera(0.08)
 
         last = self.cal_status_var.get()
         if self._follow_stop_requested:
@@ -1669,7 +1773,8 @@ class CameraCalibrationDialog(tk.Toplevel):
         start_x, start_y, _z = self._active_position(status)
         target_x = start_x + move_x
         target_y = start_y + move_y
-        feed = self._get_feed()
+        feed = self._get_follow_feed()
+        settle_ms = self._get_follow_settle_ms()
         coordinate_mode = self.coordinate_mode_label
 
         self._manual_jog_active = True
@@ -1681,7 +1786,8 @@ class CameraCalibrationDialog(tk.Toplevel):
                 limit_bits.append("total move limited")
             limit_text = f" ({', '.join(limit_bits)})" if limit_bits else ""
             self.cal_status_var.set(
-                f"{step_label}{limit_text}: {heading_state}, tangent X{tangent_x:+.4f} Y{tangent_y:+.4f}, "
+                f"{step_label}{limit_text}: F{feed:.1f}, settle {settle_ms} ms, {heading_state}, "
+                f"tangent X{tangent_x:+.4f} Y{tangent_y:+.4f}, "
                 f"correct X{correct_x:+.4f} Y{correct_y:+.4f}, "
                 f"total X{move_x:+.4f} Y{move_y:+.4f}."
             )
@@ -1692,7 +1798,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             # Motion succeeded. Latch the machine-space heading used for this
             # step so the next detection cannot flip 180 degrees.
             self._follow_heading_unit = heading
-            self._wait_and_pump_camera(0.20)
+            self._wait_and_pump_camera(settle_ms / 1000.0)
             new_line = self.detect_line()
             self.current_line = new_line
             capture_text = ""
@@ -1857,6 +1963,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             flip_y=bool(self.flip_y_var.get()),
             fine_rotation_degrees=self._get_fine_rotation_degrees(),
             threshold=self._get_threshold(),
+            show_dot_marker=bool(self.show_dot_marker_var.get()),
             show_mask=bool(self.show_mask_var.get()),
             move_distance=self._get_move_distance(),
             feed_units_per_min=self._get_feed(),
@@ -1866,6 +1973,8 @@ class CameraCalibrationDialog(tk.Toplevel):
             line_search_px=self._get_line_search_px(),
             show_line_preview=bool(self.show_line_preview_var.get()),
             follow_step=self._get_follow_step(),
+            follow_feed_units_per_min=self._get_follow_feed(),
+            follow_settle_ms=self._get_follow_settle_ms(),
             follow_max_correct=self._get_follow_max_correct(),
             follow_min_confidence=self._get_follow_min_confidence(),
             follow_direction=self._normalize_follow_direction(self.follow_direction_var.get()),

@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.10"
-APP_TITLE = f"FabScan v{APP_VERSION} - Camera Robustness"
+APP_VERSION = "0.5.14"
+APP_TITLE = f"FabScan v{APP_VERSION} - Follow Settle / Line Quality"
 
 
 class FabScanApp(tk.Tk):
@@ -2083,11 +2083,15 @@ class FabScanApp(tk.Tk):
             "camera_calibration_feed_units_per_min": float(self.settings.get("camera_calibration_feed_units_per_min", 5.0)),
             "camera_calibration_jog_step": float(self.settings.get("camera_calibration_jog_step", 0.010)),
             "camera_calibration_center_max_move": float(self.settings.get("camera_calibration_center_max_move", 0.100)),
+            "camera_calibration_show_crosshair": bool(self.settings.get("camera_calibration_show_crosshair", True)),
+            "camera_calibration_show_dot_marker": bool(self.settings.get("camera_calibration_show_dot_marker", self.settings.get("camera_calibration_show_crosshair", True))),
             "camera_calibration_line_mode": str(self.settings.get("camera_calibration_line_mode", "Line center")),
             "camera_calibration_line_search_px": int(self.settings.get("camera_calibration_line_search_px", 220)),
             "camera_calibration_show_line_preview": bool(self.settings.get("camera_calibration_show_line_preview", True)),
             "camera_calibration_show_mask": bool(self.settings.get("camera_calibration_show_mask", False)),
             "camera_follow_step": float(self.settings.get("camera_follow_step", 0.050)),
+            "camera_follow_feed_units_per_min": float(self.settings.get("camera_follow_feed_units_per_min", 5.0)),
+            "camera_follow_settle_ms": int(self.settings.get("camera_follow_settle_ms", 150)),
             "camera_follow_max_correct": float(self.settings.get("camera_follow_max_correct", 0.050)),
             "camera_follow_min_confidence": float(self.settings.get("camera_follow_min_confidence", 45.0)),
             "camera_follow_direction": str(self.settings.get("camera_follow_direction", "Forward")),
@@ -2176,7 +2180,7 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
-            "v0.5.10 makes camera handling more forgiving: default 800x600, presets, requested-vs-actual camera status, V4L2 on Linux, MJPG preference, and threaded preview reads so bad modes are less likely to freeze the UI.\n\n"
+            "v0.5.14 adds a user-settable follow settle delay and live line-quality feedback for camera setup.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )
@@ -2384,11 +2388,14 @@ class FabScanApp(tk.Tk):
         cal_feed = self.safe_float_from_settings("camera_calibration_feed_units_per_min", 5.0)
         cal_jog_step = self.safe_float_from_settings("camera_calibration_jog_step", 0.010)
         cal_center_max_move = self.safe_float_from_settings("camera_calibration_center_max_move", 0.100)
+        cal_show_dot_marker = self.safe_bool_from_settings("camera_calibration_show_dot_marker", self.safe_bool_from_settings("camera_calibration_show_crosshair", True))
         cal_line_mode = str(self.settings.get("camera_calibration_line_mode", "Line center"))
         cal_line_search_px = self.safe_int_from_settings("camera_calibration_line_search_px", 220)
         cal_show_line_preview = self.safe_bool_from_settings("camera_calibration_show_line_preview", True)
         cal_show_mask = self.safe_bool_from_settings("camera_calibration_show_mask", False)
         follow_step = self.safe_float_from_settings("camera_follow_step", 0.050)
+        follow_feed = self.safe_float_from_settings("camera_follow_feed_units_per_min", cal_feed)
+        follow_settle_ms = self.safe_int_from_settings("camera_follow_settle_ms", 150)
         follow_max_correct = self.safe_float_from_settings("camera_follow_max_correct", 0.050)
         follow_min_confidence = self.safe_float_from_settings("camera_follow_min_confidence", 45.0)
         follow_direction = str(self.settings.get("camera_follow_direction", "Forward"))
@@ -2409,6 +2416,7 @@ class FabScanApp(tk.Tk):
             flip_y=camera_flip_y,
             fine_rotation_degrees=camera_fine_rotation_degrees,
             threshold=cal_threshold,
+            show_dot_marker=cal_show_dot_marker,
             move_distance=cal_move,
             feed_per_minute=cal_feed,
             jog_step=cal_jog_step,
@@ -2418,6 +2426,8 @@ class FabScanApp(tk.Tk):
             show_line_preview=cal_show_line_preview,
             show_mask=cal_show_mask,
             follow_step=follow_step,
+            follow_feed_units_per_min=follow_feed,
+            follow_settle_ms=follow_settle_ms,
             follow_max_correct=follow_max_correct,
             follow_min_confidence=follow_min_confidence,
             follow_direction=follow_direction,
@@ -2440,6 +2450,7 @@ class FabScanApp(tk.Tk):
         self.settings["camera_flip_y"] = dialog.result.flip_y
         self.settings["camera_fine_rotation_degrees"] = dialog.result.fine_rotation_degrees
         self.settings["camera_calibration_threshold"] = dialog.result.threshold
+        self.settings["camera_calibration_show_dot_marker"] = dialog.result.show_dot_marker
         self.settings["camera_calibration_show_mask"] = dialog.result.show_mask
         self.settings["camera_calibration_move_distance"] = dialog.result.move_distance
         self.settings["camera_calibration_feed_units_per_min"] = dialog.result.feed_units_per_min
@@ -2449,6 +2460,8 @@ class FabScanApp(tk.Tk):
         self.settings["camera_calibration_line_search_px"] = dialog.result.line_search_px
         self.settings["camera_calibration_show_line_preview"] = dialog.result.show_line_preview
         self.settings["camera_follow_step"] = dialog.result.follow_step
+        self.settings["camera_follow_feed_units_per_min"] = dialog.result.follow_feed_units_per_min
+        self.settings["camera_follow_settle_ms"] = dialog.result.follow_settle_ms
         self.settings["camera_follow_max_correct"] = dialog.result.follow_max_correct
         self.settings["camera_follow_min_confidence"] = dialog.result.follow_min_confidence
         self.settings["camera_follow_direction"] = dialog.result.follow_direction
