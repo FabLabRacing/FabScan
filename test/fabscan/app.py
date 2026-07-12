@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.26"
-APP_TITLE = f"FabScan v{APP_VERSION} - Safe Preview / Frame Dropping"
+APP_VERSION = "0.5.11"
+APP_TITLE = f"FabScan v{APP_VERSION} - Calibration UI / Follow Feed"
 
 
 class FabScanApp(tk.Tk):
@@ -2071,10 +2071,6 @@ class FabScanApp(tk.Tk):
             "camera_index": int(self.settings.get("camera_index", 0)),
             "camera_width": int(self.settings.get("camera_width", 800)),
             "camera_height": int(self.settings.get("camera_height", 600)),
-            "camera_stream_max_fps": float(self.settings.get("camera_stream_max_fps", 20.0)),
-            "camera_preview_max_fps": float(self.settings.get("camera_preview_max_fps", 10.0)),
-            "camera_linuxcnc_safe_preview": bool(self.settings.get("camera_linuxcnc_safe_preview", False)),
-            "camera_profile_preview": bool(self.settings.get("camera_profile_preview", False)),
             "camera_rotate_degrees": int(self.settings.get("camera_rotate_degrees", 0)),
             "camera_flip_x": bool(self.settings.get("camera_flip_x", False)),
             "camera_flip_y": bool(self.settings.get("camera_flip_y", False)),
@@ -2087,29 +2083,14 @@ class FabScanApp(tk.Tk):
             "camera_calibration_feed_units_per_min": float(self.settings.get("camera_calibration_feed_units_per_min", 5.0)),
             "camera_calibration_jog_step": float(self.settings.get("camera_calibration_jog_step", 0.010)),
             "camera_calibration_center_max_move": float(self.settings.get("camera_calibration_center_max_move", 0.100)),
-            "camera_calibration_show_crosshair": bool(self.settings.get("camera_calibration_show_crosshair", True)),
-            "camera_calibration_show_dot_marker": bool(self.settings.get("camera_calibration_show_dot_marker", self.settings.get("camera_calibration_show_crosshair", True))),
             "camera_calibration_line_mode": str(self.settings.get("camera_calibration_line_mode", "Line center")),
             "camera_calibration_line_search_px": int(self.settings.get("camera_calibration_line_search_px", 220)),
             "camera_calibration_show_line_preview": bool(self.settings.get("camera_calibration_show_line_preview", True)),
             "camera_calibration_show_mask": bool(self.settings.get("camera_calibration_show_mask", False)),
             "camera_follow_step": float(self.settings.get("camera_follow_step", 0.050)),
-            "camera_follow_feed_units_per_min": float(self.settings.get("camera_follow_feed_units_per_min", 5.0)),
-            "camera_follow_settle_ms": int(self.settings.get("camera_follow_settle_ms", 150)),
-            "camera_follow_max_heading_change_degrees": float(self.settings.get("camera_follow_max_heading_change_degrees", 70.0)),
-            "camera_follow_corner_pause_enabled": bool(self.settings.get("camera_follow_corner_pause_enabled", True)),
-            "camera_follow_corner_angle_degrees": float(self.settings.get("camera_follow_corner_angle_degrees", 55.0)),
-            "camera_follow_corner_assist_enabled": bool(self.settings.get("camera_follow_corner_assist_enabled", True)),
-            "camera_follow_corner_lookahead_steps": int(self.settings.get("camera_follow_corner_lookahead_steps", 5)),
             "camera_follow_max_correct": float(self.settings.get("camera_follow_max_correct", 0.050)),
-            "camera_follow_deadband": float(self.settings.get("camera_follow_deadband", 0.003)),
-            "camera_follow_gain": float(self.settings.get("camera_follow_gain", 0.50)),
-            "camera_follow_stabilize_enabled": bool(self.settings.get("camera_follow_stabilize_enabled", True)),
-            "camera_follow_filter_offset_alpha": float(self.settings.get("camera_follow_filter_offset_alpha", 0.35)),
-            "camera_follow_filter_angle_alpha": float(self.settings.get("camera_follow_filter_angle_alpha", 0.25)),
-            "camera_follow_sanity_angle_degrees": float(self.settings.get("camera_follow_sanity_angle_degrees", 30.0)),
             "camera_follow_min_confidence": float(self.settings.get("camera_follow_min_confidence", 45.0)),
-            "camera_follow_direction": str(self.settings.get("camera_follow_direction", "Y+")),
+            "camera_follow_direction": str(self.settings.get("camera_follow_direction", "Forward")),
             "camera_follow_capture_point": bool(self.settings.get("camera_follow_capture_point", False)),
             "camera_follow_enabled": bool(self.settings.get("camera_follow_enabled", False)),
             "camera_follow_repeat_count": int(self.settings.get("camera_follow_repeat_count", 5)),
@@ -2195,8 +2176,7 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
-            "v0.5.22 adds Follow Stabilization: contour continuity scoring, EMA filtering for offset/angle, and a heading sanity reject so one bad frame is less likely to become motion.\n\n"
-            "Corner Assist remains available from v0.5.21, and Follow N still allows large tests up to 9999 steps.\n\n"
+            "v0.5.11 keeps the v0.5.10 camera robustness work and adds a steadier Camera Calibration status panel plus a dedicated Single-Step Follow feedrate setting.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )
@@ -2303,10 +2283,6 @@ class FabScanApp(tk.Tk):
         camera_index = self.safe_int_from_settings("camera_index", 0)
         camera_width = self.safe_int_from_settings("camera_width", 800)
         camera_height = self.safe_int_from_settings("camera_height", 600)
-        camera_stream_max_fps = self.safe_float_from_settings("camera_stream_max_fps", 20.0)
-        camera_preview_max_fps = self.safe_float_from_settings("camera_preview_max_fps", 10.0)
-        camera_linuxcnc_safe_preview = self.safe_bool_from_settings("camera_linuxcnc_safe_preview", False)
-        camera_profile_preview = self.safe_bool_from_settings("camera_profile_preview", False)
         camera_rotate_degrees = self.safe_int_from_settings("camera_rotate_degrees", 0)
         camera_flip_x = self.safe_bool_from_settings("camera_flip_x", False)
         camera_flip_y = self.safe_bool_from_settings("camera_flip_y", False)
@@ -2320,10 +2296,6 @@ class FabScanApp(tk.Tk):
             camera_index=camera_index,
             camera_width=camera_width,
             camera_height=camera_height,
-            camera_stream_max_fps=camera_stream_max_fps,
-            camera_preview_max_fps=camera_preview_max_fps,
-            linuxcnc_safe_preview=camera_linuxcnc_safe_preview,
-            profile_preview=camera_profile_preview,
             rotate_degrees=camera_rotate_degrees,
             flip_x=camera_flip_x,
             flip_y=camera_flip_y,
@@ -2340,10 +2312,6 @@ class FabScanApp(tk.Tk):
         self.settings["camera_index"] = dialog.result.camera_index
         self.settings["camera_width"] = dialog.result.requested_width
         self.settings["camera_height"] = dialog.result.requested_height
-        self.settings["camera_stream_max_fps"] = dialog.result.camera_stream_max_fps
-        self.settings["camera_preview_max_fps"] = dialog.result.camera_preview_max_fps
-        self.settings["camera_linuxcnc_safe_preview"] = dialog.result.linuxcnc_safe_preview
-        self.settings["camera_profile_preview"] = dialog.result.profile_preview
         self.settings["camera_rotate_degrees"] = dialog.result.rotate_degrees
         self.settings["camera_flip_x"] = dialog.result.flip_x
         self.settings["camera_flip_y"] = dialog.result.flip_y
@@ -2407,10 +2375,6 @@ class FabScanApp(tk.Tk):
         camera_index = self.safe_int_from_settings("camera_index", 0)
         camera_width = self.safe_int_from_settings("camera_width", 800)
         camera_height = self.safe_int_from_settings("camera_height", 600)
-        camera_stream_max_fps = self.safe_float_from_settings("camera_stream_max_fps", 20.0)
-        camera_preview_max_fps = self.safe_float_from_settings("camera_preview_max_fps", 10.0)
-        camera_linuxcnc_safe_preview = self.safe_bool_from_settings("camera_linuxcnc_safe_preview", False)
-        camera_profile_preview = self.safe_bool_from_settings("camera_profile_preview", False)
         camera_rotate_degrees = self.safe_int_from_settings("camera_rotate_degrees", 0)
         camera_flip_x = self.safe_bool_from_settings("camera_flip_x", False)
         camera_flip_y = self.safe_bool_from_settings("camera_flip_y", False)
@@ -2420,28 +2384,15 @@ class FabScanApp(tk.Tk):
         cal_feed = self.safe_float_from_settings("camera_calibration_feed_units_per_min", 5.0)
         cal_jog_step = self.safe_float_from_settings("camera_calibration_jog_step", 0.010)
         cal_center_max_move = self.safe_float_from_settings("camera_calibration_center_max_move", 0.100)
-        cal_show_dot_marker = self.safe_bool_from_settings("camera_calibration_show_dot_marker", self.safe_bool_from_settings("camera_calibration_show_crosshair", True))
         cal_line_mode = str(self.settings.get("camera_calibration_line_mode", "Line center"))
         cal_line_search_px = self.safe_int_from_settings("camera_calibration_line_search_px", 220)
         cal_show_line_preview = self.safe_bool_from_settings("camera_calibration_show_line_preview", True)
         cal_show_mask = self.safe_bool_from_settings("camera_calibration_show_mask", False)
         follow_step = self.safe_float_from_settings("camera_follow_step", 0.050)
         follow_feed = self.safe_float_from_settings("camera_follow_feed_units_per_min", cal_feed)
-        follow_settle_ms = self.safe_int_from_settings("camera_follow_settle_ms", 150)
-        follow_max_heading_change = self.safe_float_from_settings("camera_follow_max_heading_change_degrees", 70.0)
-        follow_corner_pause = self.safe_bool_from_settings("camera_follow_corner_pause_enabled", True)
-        follow_corner_angle = self.safe_float_from_settings("camera_follow_corner_angle_degrees", 55.0)
-        follow_corner_assist = self.safe_bool_from_settings("camera_follow_corner_assist_enabled", True)
-        follow_corner_lookahead_steps = self.safe_int_from_settings("camera_follow_corner_lookahead_steps", 5)
         follow_max_correct = self.safe_float_from_settings("camera_follow_max_correct", 0.050)
-        follow_deadband = self.safe_float_from_settings("camera_follow_deadband", 0.003)
-        follow_gain = self.safe_float_from_settings("camera_follow_gain", 0.50)
-        follow_stabilize = self.safe_bool_from_settings("camera_follow_stabilize_enabled", True)
-        follow_filter_offset_alpha = self.safe_float_from_settings("camera_follow_filter_offset_alpha", 0.35)
-        follow_filter_angle_alpha = self.safe_float_from_settings("camera_follow_filter_angle_alpha", 0.25)
-        follow_sanity_angle = self.safe_float_from_settings("camera_follow_sanity_angle_degrees", 30.0)
         follow_min_confidence = self.safe_float_from_settings("camera_follow_min_confidence", 45.0)
-        follow_direction = str(self.settings.get("camera_follow_direction", "Y+"))
+        follow_direction = str(self.settings.get("camera_follow_direction", "Forward"))
         follow_capture_point = self.safe_bool_from_settings("camera_follow_capture_point", False)
         follow_enabled = self.safe_bool_from_settings("camera_follow_enabled", False)
         follow_repeat_count = self.safe_int_from_settings("camera_follow_repeat_count", 5)
@@ -2454,16 +2405,11 @@ class FabScanApp(tk.Tk):
             camera_index=camera_index,
             camera_width=camera_width,
             camera_height=camera_height,
-            camera_stream_max_fps=camera_stream_max_fps,
-            camera_preview_max_fps=camera_preview_max_fps,
-            linuxcnc_safe_preview=camera_linuxcnc_safe_preview,
-            profile_preview=camera_profile_preview,
             rotate_degrees=camera_rotate_degrees,
             flip_x=camera_flip_x,
             flip_y=camera_flip_y,
             fine_rotation_degrees=camera_fine_rotation_degrees,
             threshold=cal_threshold,
-            show_dot_marker=cal_show_dot_marker,
             move_distance=cal_move,
             feed_per_minute=cal_feed,
             jog_step=cal_jog_step,
@@ -2474,19 +2420,7 @@ class FabScanApp(tk.Tk):
             show_mask=cal_show_mask,
             follow_step=follow_step,
             follow_feed_units_per_min=follow_feed,
-            follow_settle_ms=follow_settle_ms,
-            follow_max_heading_change_degrees=follow_max_heading_change,
-            follow_corner_pause_enabled=follow_corner_pause,
-            follow_corner_angle_degrees=follow_corner_angle,
-            follow_corner_assist_enabled=follow_corner_assist,
-            follow_corner_lookahead_steps=follow_corner_lookahead_steps,
             follow_max_correct=follow_max_correct,
-            follow_deadband=follow_deadband,
-            follow_gain=follow_gain,
-            follow_stabilize_enabled=follow_stabilize,
-            follow_filter_offset_alpha=follow_filter_offset_alpha,
-            follow_filter_angle_alpha=follow_filter_angle_alpha,
-            follow_sanity_angle_degrees=follow_sanity_angle,
             follow_min_confidence=follow_min_confidence,
             follow_direction=follow_direction,
             follow_capture_point=follow_capture_point,
@@ -2503,16 +2437,11 @@ class FabScanApp(tk.Tk):
         self.settings["camera_index"] = dialog.result.camera_index
         self.settings["camera_width"] = dialog.result.requested_width
         self.settings["camera_height"] = dialog.result.requested_height
-        self.settings["camera_stream_max_fps"] = dialog.result.camera_stream_max_fps
-        self.settings["camera_preview_max_fps"] = dialog.result.camera_preview_max_fps
-        self.settings["camera_linuxcnc_safe_preview"] = dialog.result.linuxcnc_safe_preview
-        self.settings["camera_profile_preview"] = dialog.result.profile_preview
         self.settings["camera_rotate_degrees"] = dialog.result.rotate_degrees
         self.settings["camera_flip_x"] = dialog.result.flip_x
         self.settings["camera_flip_y"] = dialog.result.flip_y
         self.settings["camera_fine_rotation_degrees"] = dialog.result.fine_rotation_degrees
         self.settings["camera_calibration_threshold"] = dialog.result.threshold
-        self.settings["camera_calibration_show_dot_marker"] = dialog.result.show_dot_marker
         self.settings["camera_calibration_show_mask"] = dialog.result.show_mask
         self.settings["camera_calibration_move_distance"] = dialog.result.move_distance
         self.settings["camera_calibration_feed_units_per_min"] = dialog.result.feed_units_per_min
@@ -2523,19 +2452,7 @@ class FabScanApp(tk.Tk):
         self.settings["camera_calibration_show_line_preview"] = dialog.result.show_line_preview
         self.settings["camera_follow_step"] = dialog.result.follow_step
         self.settings["camera_follow_feed_units_per_min"] = dialog.result.follow_feed_units_per_min
-        self.settings["camera_follow_settle_ms"] = dialog.result.follow_settle_ms
-        self.settings["camera_follow_max_heading_change_degrees"] = dialog.result.follow_max_heading_change_degrees
-        self.settings["camera_follow_corner_pause_enabled"] = dialog.result.follow_corner_pause_enabled
-        self.settings["camera_follow_corner_angle_degrees"] = dialog.result.follow_corner_angle_degrees
-        self.settings["camera_follow_corner_assist_enabled"] = dialog.result.follow_corner_assist_enabled
-        self.settings["camera_follow_corner_lookahead_steps"] = dialog.result.follow_corner_lookahead_steps
         self.settings["camera_follow_max_correct"] = dialog.result.follow_max_correct
-        self.settings["camera_follow_deadband"] = dialog.result.follow_deadband
-        self.settings["camera_follow_gain"] = dialog.result.follow_gain
-        self.settings["camera_follow_stabilize_enabled"] = dialog.result.follow_stabilize_enabled
-        self.settings["camera_follow_filter_offset_alpha"] = dialog.result.follow_filter_offset_alpha
-        self.settings["camera_follow_filter_angle_alpha"] = dialog.result.follow_filter_angle_alpha
-        self.settings["camera_follow_sanity_angle_degrees"] = dialog.result.follow_sanity_angle_degrees
         self.settings["camera_follow_min_confidence"] = dialog.result.follow_min_confidence
         self.settings["camera_follow_direction"] = dialog.result.follow_direction
         self.settings["camera_follow_capture_point"] = dialog.result.follow_capture_point
@@ -2552,7 +2469,7 @@ class FabScanApp(tk.Tk):
         else:
             self.append_status("\nCamera calibration window closed without a completed calibration.")
 
-        self.save_settings_now()
+        self.queue_save_settings()
 
     def safe_int_from_settings(self, key: str, default: int) -> int:
         try:

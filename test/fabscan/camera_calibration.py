@@ -1,0 +1,1912 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+import math
+import time
+from typing import Any, Callable, Optional
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageTk
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+from fabscan.camera_device import (
+    DEFAULT_CAMERA_HEIGHT,
+    DEFAULT_CAMERA_WIDTH,
+    CameraStream,
+    open_camera_capture,
+    parse_preset_label,
+    preset_labels,
+    size_to_preset_label,
+)
+from fabscan.linuxcnc_status import LinuxCNCPositionStatus, LinuxCNCStatusReader
+
+
+ROTATE_VALUES = (0, 90, 180, 270)
+
+
+@dataclass
+class DotDetection:
+    found: bool
+    x: float = 0.0
+    y: float = 0.0
+    area: float = 0.0
+    confidence: float = 0.0
+    message: str = "No dot found"
+
+
+@dataclass
+class LineDetection:
+    found: bool
+    mode: str = "Line center"
+    x: float = 0.0
+    y: float = 0.0
+    vx: float = 1.0
+    vy: float = 0.0
+    pixel_error_x: float = 0.0
+    pixel_error_y: float = 0.0
+    angle_degrees: float = 0.0
+    confidence: float = 0.0
+    message: str = "No line/edge found"
+
+
+@dataclass
+class CameraCalibrationDialogResult:
+    camera_index: int
+    requested_width: int
+    requested_height: int
+    rotate_degrees: int
+    flip_x: bool
+    flip_y: bool
+    fine_rotation_degrees: float
+    threshold: int
+    show_mask: bool
+    move_distance: float
+    feed_units_per_min: float
+    jog_step: float
+    center_max_move: float
+    line_mode: str
+    line_search_px: int
+    show_line_preview: bool
+    follow_step: float
+    follow_feed_units_per_min: float
+    follow_max_correct: float
+    follow_min_confidence: float
+    follow_direction: str
+    follow_capture_point: bool
+    follow_enabled: bool
+    follow_repeat_count: int
+    calibration: Optional[dict[str, Any]] = None
+
+
+class CameraCalibrationDialog(tk.Toplevel):
+    """Camera/machine calibration helper for FabScan.
+
+    This dialog handles the Scanything-style camera/machine calibration and
+    bounded camera-assisted line/edge following. The final DXF is still based
+    on LinuxCNC position. The camera is only used as the steering eye.
+    """
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        linuxcnc_reader: LinuxCNCStatusReader,
+        coordinate_mode_label: str,
+        camera_index: int = 0,
+        camera_width: int = DEFAULT_CAMERA_WIDTH,
+        camera_height: int = DEFAULT_CAMERA_HEIGHT,
+        rotate_degrees: int = 0,
+        flip_x: bool = False,
+        flip_y: bool = False,
+        fine_rotation_degrees: float = 0.0,
+        threshold: int = 90,
+        move_distance: float = 0.100,
+        feed_per_minute: float = 5.0,
+        jog_step: float = 0.010,
+        center_max_move: float = 0.100,
+        line_mode: str = "Line center",
+        line_search_px: int = 220,
+        show_line_preview: bool = True,
+        show_mask: bool = False,
+        follow_step: float = 0.050,
+        follow_feed_units_per_min: float = 5.0,
+        follow_max_correct: float = 0.050,
+        follow_min_confidence: float = 45.0,
+        follow_direction: str = "Forward",
+        follow_capture_point: bool = False,
+        follow_enabled: bool = False,
+        follow_repeat_count: int = 5,
+        existing_calibration: Optional[dict[str, Any]] = None,
+        trace_capture_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.title("FabScan Camera Calibration Lite - v0.5.11")
+        self.minsize(1080, 650)
+        # Give the dialog an explicit starting size so Tk does not keep
+        # recomputing the top-level size as live preview/status content changes.
+        self.geometry("1240x760")
+        self.transient(parent)
+
+        self.linuxcnc_reader = linuxcnc_reader
+        self.coordinate_mode_label = coordinate_mode_label or "Work coordinates"
+        self.result: Optional[CameraCalibrationDialogResult] = None
+        self.cap: Optional[CameraStream] = None
+        self.current_frame_bgr: Optional[np.ndarray] = None
+        self.current_dot: DotDetection = DotDetection(False)
+        self.current_line: LineDetection = LineDetection(False)
+        # Fixed live-preview box. Without this, the PhotoImage size can change
+        # during line/edge preview and Tk resizes the whole calibration window.
+        self.preview_display_width = 700
+        self.preview_display_height = 420
+        self.after_job: Optional[str] = None
+        self._tk_preview: Optional[ImageTk.PhotoImage] = None
+        self._closing = False
+        self._motion_active = False
+        self._manual_jog_active = False
+        self._follow_stop_requested = False
+        # Direction latch for line/edge following. A detected line has no arrow,
+        # so the fitted tangent can flip 180 degrees from one frame to the next.
+        # Once a follow direction is established, keep subsequent steps moving
+        # along the same machine-space heading unless the user changes settings.
+        self._follow_heading_unit: Optional[tuple[float, float]] = None
+        self.trace_capture_callback = trace_capture_callback
+        self.active_calibration: Optional[dict[str, Any]] = self._validate_calibration(existing_calibration)
+
+        if int(rotate_degrees) not in ROTATE_VALUES:
+            rotate_degrees = 0
+
+        self.camera_index_var = tk.IntVar(value=max(0, int(camera_index)))
+        self.camera_width_var = tk.IntVar(value=max(0, int(camera_width)))
+        self.camera_height_var = tk.IntVar(value=max(0, int(camera_height)))
+        self.camera_preset_var = tk.StringVar(value=size_to_preset_label(camera_width, camera_height))
+        self.rotate_var = tk.StringVar(value=str(int(rotate_degrees)))
+        self.flip_x_var = tk.BooleanVar(value=bool(flip_x))
+        self.flip_y_var = tk.BooleanVar(value=bool(flip_y))
+        self.fine_rotation_var = tk.DoubleVar(value=self._clamp_fine_rotation(fine_rotation_degrees))
+        self.threshold_var = tk.IntVar(value=max(0, min(255, int(threshold))))
+        self.show_mask_var = tk.BooleanVar(value=bool(show_mask))
+        self.move_distance_var = tk.DoubleVar(value=max(0.001, float(move_distance)))
+        self.feed_var = tk.DoubleVar(value=max(0.1, float(feed_per_minute)))
+        self.jog_step_var = tk.DoubleVar(value=max(0.001, float(jog_step)))
+        self.center_max_move_var = tk.DoubleVar(value=max(0.001, float(center_max_move)))
+        self.line_mode_var = tk.StringVar(value=self._normalize_line_mode(line_mode))
+        self.line_search_px_var = tk.IntVar(value=self._clamp_line_search_px(line_search_px))
+        self.show_line_preview_var = tk.BooleanVar(value=bool(show_line_preview))
+        self.follow_step_var = tk.DoubleVar(value=max(0.001, float(follow_step)))
+        self.follow_feed_var = tk.DoubleVar(value=max(0.1, float(follow_feed_units_per_min)))
+        self.follow_max_correct_var = tk.DoubleVar(value=max(0.0, float(follow_max_correct)))
+        self.follow_min_confidence_var = tk.DoubleVar(value=max(0.0, min(100.0, float(follow_min_confidence))))
+        self.follow_direction_var = tk.StringVar(value=self._normalize_follow_direction(follow_direction))
+        self.follow_capture_point_var = tk.BooleanVar(value=bool(follow_capture_point))
+        self.follow_enabled_var = tk.BooleanVar(value=bool(follow_enabled))
+        self.follow_repeat_count_var = tk.IntVar(value=max(1, min(50, int(follow_repeat_count))))
+        self.dot_status_var = tk.StringVar(value="Dot: —")
+        self.line_status_var = tk.StringVar(value="Line/edge: —")
+        self.cal_status_var = tk.StringVar(value="Open camera, center the calibration dot, then click Find Dot.")
+        self.transform_status_var = tk.StringVar(value="Calibration: not run")
+
+        self._build_ui()
+        if self.active_calibration:
+            self._show_calibration_summary(self.active_calibration, loaded=True)
+        self._register_traces()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda _event: self.close())
+        self.after(100, self.open_camera)
+
+    def _build_ui(self) -> None:
+        """Build a compact calibration/following layout.
+
+        v0.5.6 proved the single-step following logic, but the calibration
+        window used too much vertical space above the live preview. This layout
+        keeps the camera/setup controls short, moves the live status beside the
+        video, and puts the jog/follow controls next to the preview where they
+        are easier to use while watching the camera.
+        """
+
+        footer = ttk.Label(
+            self,
+            text=(
+                "Calibration, dot-centering, single-step follow, and screen jogs use guarded X/Y incremental jogs through LinuxCNC MANUAL mode. "
+                "Torch/plasma should stay disabled. The camera steers; LinuxCNC remains the ruler."
+            ),
+            anchor=tk.W,
+            padding=(8, 0, 8, 8),
+        )
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+
+        root = ttk.Frame(self, padding=8)
+        root.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(root)
+        top.pack(side=tk.TOP, fill=tk.X)
+
+        camera = ttk.LabelFrame(top, text="Camera / View", padding=6)
+        camera.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+
+        ttk.Label(camera, text="Index").grid(row=0, column=0, sticky=tk.W)
+        ttk.Spinbox(camera, from_=0, to=10, textvariable=self.camera_index_var, width=4).grid(
+            row=0, column=1, sticky=tk.W, padx=(4, 10)
+        )
+        ttk.Label(camera, text="W").grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(camera, textvariable=self.camera_width_var, width=6).grid(row=0, column=3, sticky=tk.W, padx=(4, 10))
+        ttk.Label(camera, text="H").grid(row=0, column=4, sticky=tk.W)
+        ttk.Entry(camera, textvariable=self.camera_height_var, width=6).grid(row=0, column=5, sticky=tk.W, padx=(4, 10))
+        ttk.Label(camera, text="Preset").grid(row=0, column=6, sticky=tk.W)
+        preset_combo = ttk.Combobox(
+            camera,
+            textvariable=self.camera_preset_var,
+            values=preset_labels(),
+            width=11,
+            state="readonly",
+        )
+        preset_combo.grid(row=0, column=7, sticky=tk.W, padx=(4, 10))
+        preset_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_resolution_preset())
+        ttk.Button(camera, text="Open / Restart", command=self.open_camera).grid(row=0, column=8, sticky=tk.W, padx=(0, 6))
+        ttk.Button(camera, text="Close", command=self.close).grid(row=0, column=9, sticky=tk.W)
+
+        ttk.Label(camera, text="Rotate").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Combobox(
+            camera,
+            textvariable=self.rotate_var,
+            values=tuple(str(value) for value in ROTATE_VALUES),
+            width=4,
+            state="readonly",
+        ).grid(row=1, column=1, sticky=tk.W, padx=(4, 10), pady=(6, 0))
+        ttk.Checkbutton(camera, text="Flip X", variable=self.flip_x_var).grid(row=1, column=2, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ttk.Checkbutton(camera, text="Flip Y", variable=self.flip_y_var).grid(row=1, column=4, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ttk.Label(camera, text="Fine").grid(row=1, column=6, sticky=tk.E, pady=(6, 0))
+        ttk.Scale(
+            camera,
+            from_=-10.0,
+            to=10.0,
+            variable=self.fine_rotation_var,
+            command=lambda _value: self._show_current_frame(),
+        ).grid(row=1, column=7, columnspan=2, sticky="ew", padx=(4, 8), pady=(6, 0))
+        self.fine_rotation_label = ttk.Label(camera, width=7)
+        self.fine_rotation_label.grid(row=1, column=9, sticky=tk.W, pady=(6, 0))
+        camera.columnconfigure(7, weight=1)
+        self._update_fine_rotation_label()
+
+        vision = ttk.LabelFrame(top, text="Dot / Mask", padding=6)
+        vision.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        ttk.Label(vision, text="Threshold").grid(row=0, column=0, sticky=tk.W)
+        ttk.Scale(
+            vision,
+            from_=0,
+            to=255,
+            variable=self.threshold_var,
+            command=lambda _value: self._show_current_frame(),
+            length=110,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 6))
+        self.threshold_label = ttk.Label(vision, width=4)
+        self.threshold_label.grid(row=0, column=2, sticky=tk.W)
+        ttk.Checkbutton(vision, text="Mask", variable=self.show_mask_var, command=self._show_current_frame).grid(
+            row=1, column=0, sticky=tk.W, pady=(4, 0)
+        )
+        ttk.Button(vision, text="Find Dot", command=self.find_dot_once).grid(row=1, column=1, columnspan=2, sticky="ew", pady=(4, 0))
+        vision.columnconfigure(1, weight=1)
+
+        motion = ttk.LabelFrame(top, text="Calibration", padding=6)
+        motion.pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(motion, text="Move").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(motion, textvariable=self.move_distance_var, width=7).grid(row=0, column=1, sticky=tk.W, padx=(4, 8))
+        ttk.Label(motion, text="Feed").grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(motion, textvariable=self.feed_var, width=6).grid(row=0, column=3, sticky=tk.W, padx=(4, 0))
+        ttk.Button(motion, text="Run Calibration", command=self.run_calibration).grid(
+            row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0), padx=(0, 4)
+        )
+        ttk.Button(motion, text="STOP", command=self.stop_motion).grid(row=1, column=3, sticky="ew", pady=(6, 0))
+
+        main = ttk.Frame(root)
+        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        left_panel = ttk.Frame(main, width=285)
+        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        left_panel.pack_propagate(False)
+
+        status_frame = ttk.LabelFrame(left_panel, text="Status", padding=6, height=210)
+        status_frame.pack(side=tk.TOP, fill=tk.X)
+        # Keep this box tall enough for the longest live Line center status.
+        # Without a fixed height, the wrapping line status can make the whole
+        # calibration layout grow/shrink while the camera preview is live.
+        status_frame.pack_propagate(False)
+        wrap = 260
+        ttk.Label(status_frame, textvariable=self.dot_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(status_frame, textvariable=self.cal_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Label(status_frame, textvariable=self.transform_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Label(status_frame, textvariable=self.line_status_var, anchor=tk.W, justify=tk.LEFT, wraplength=wrap).pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+
+        line_tools = ttk.LabelFrame(left_panel, text="Line / Edge Preview", padding=6)
+        line_tools.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        ttk.Label(line_tools, text="Mode").grid(row=0, column=0, sticky=tk.W)
+        ttk.Combobox(
+            line_tools,
+            textvariable=self.line_mode_var,
+            values=("Line center", "Edge near center"),
+            width=17,
+            state="readonly",
+        ).grid(row=0, column=1, columnspan=2, sticky="ew", padx=(4, 0))
+        ttk.Label(line_tools, text="Search px").grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(line_tools, textvariable=self.line_search_px_var, width=7).grid(row=1, column=1, sticky=tk.W, padx=(4, 0), pady=(5, 0))
+        ttk.Checkbutton(
+            line_tools,
+            text="Overlay",
+            variable=self.show_line_preview_var,
+            command=self._show_current_frame,
+        ).grid(row=1, column=2, sticky=tk.W, pady=(5, 0))
+        ttk.Button(line_tools, text="Find Line / Edge", command=self.find_line_once).grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0)
+        )
+        line_tools.columnconfigure(1, weight=1)
+
+        preview_frame = ttk.LabelFrame(main, text="Live Preview", padding=4)
+        preview_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.preview_box = ttk.Frame(
+            preview_frame,
+            width=self.preview_display_width,
+            height=self.preview_display_height,
+        )
+        self.preview_box.pack(side=tk.TOP, expand=True)
+        self.preview_box.pack_propagate(False)
+        self.preview_label = ttk.Label(self.preview_box, anchor=tk.CENTER)
+        self.preview_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        right_panel = ttk.Frame(main, width=285)
+        right_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 0))
+        right_panel.pack_propagate(False)
+
+        jog = ttk.LabelFrame(right_panel, text="Dot Center Jog", padding=6)
+        jog.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(jog, text="Step").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(jog, textvariable=self.jog_step_var, width=8).grid(row=0, column=1, columnspan=3, sticky="ew", padx=(4, 0))
+
+        step_row = ttk.Frame(jog)
+        step_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(4, 6))
+        for label, value in ((".001", 0.001), (".005", 0.005), (".010", 0.010), (".050", 0.050), (".100", 0.100)):
+            ttk.Button(step_row, text=label, width=5, command=lambda v=value: self.jog_step_var.set(v)).pack(
+                side=tk.LEFT, padx=(0, 2)
+            )
+
+        ttk.Button(jog, text="Y+", command=lambda: self.manual_jog("Y", +1)).grid(row=2, column=1, columnspan=2, sticky="ew", pady=(0, 2))
+        ttk.Button(jog, text="X-", command=lambda: self.manual_jog("X", -1)).grid(row=3, column=0, sticky="ew", padx=(0, 2))
+        ttk.Button(jog, text="Find", command=self.find_dot_once).grid(row=3, column=1, columnspan=2, sticky="ew", padx=(0, 2))
+        ttk.Button(jog, text="X+", command=lambda: self.manual_jog("X", +1)).grid(row=3, column=3, sticky="ew")
+        ttk.Button(jog, text="Y-", command=lambda: self.manual_jog("Y", -1)).grid(row=4, column=1, columnspan=2, sticky="ew", pady=(2, 0))
+
+        ttk.Separator(jog, orient=tk.HORIZONTAL).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 6))
+        ttk.Label(jog, text="Max center").grid(row=6, column=0, columnspan=2, sticky=tk.W)
+        ttk.Entry(jog, textvariable=self.center_max_move_var, width=8).grid(row=6, column=2, columnspan=2, sticky="ew")
+        ttk.Button(jog, text="Center Dot", command=self.center_dot_using_calibration).grid(
+            row=7, column=0, columnspan=4, sticky="ew", pady=(6, 0)
+        )
+        for col in range(4):
+            jog.columnconfigure(col, weight=1)
+
+        follow_tools = ttk.LabelFrame(right_panel, text="Single-Step Follow", padding=6)
+        follow_tools.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        ttk.Checkbutton(follow_tools, text="Enable follow", variable=self.follow_enabled_var).grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(follow_tools, text="Step").grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_step_var, width=8).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Feed").grid(row=2, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_feed_var, width=8).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Max correct").grid(row=3, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_max_correct_var, width=8).grid(row=3, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Min conf").grid(row=4, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_min_confidence_var, width=8).grid(row=4, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Count").grid(row=5, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_repeat_count_var, width=8).grid(row=5, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Label(follow_tools, text="Direction").grid(row=6, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Combobox(
+            follow_tools,
+            textvariable=self.follow_direction_var,
+            values=("Forward", "Reverse"),
+            width=9,
+            state="readonly",
+        ).grid(row=6, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+        ttk.Checkbutton(
+            follow_tools,
+            text="Capture after move",
+            variable=self.follow_capture_point_var,
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ttk.Button(follow_tools, text="Follow Step", command=self.follow_line_single_step).grid(
+            row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+        )
+        ttk.Button(follow_tools, text="Follow N", command=self.follow_line_multiple_steps).grid(
+            row=9, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+        )
+        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=10, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        follow_tools.columnconfigure(1, weight=1)
+
+    def _register_traces(self) -> None:
+        watched_vars: tuple[tk.Variable, ...] = (
+            self.rotate_var,
+            self.flip_x_var,
+            self.flip_y_var,
+            self.fine_rotation_var,
+            self.threshold_var,
+            self.show_mask_var,
+            self.line_mode_var,
+            self.line_search_px_var,
+            self.show_line_preview_var,
+        )
+        for variable in watched_vars:
+            variable.trace_add("write", lambda *_args: self._on_preview_setting_changed())
+        self.follow_direction_var.trace_add("write", lambda *_args: self._clear_follow_heading())
+
+    def _clear_follow_heading(self) -> None:
+        self._follow_heading_unit = None
+
+    def _on_preview_setting_changed(self) -> None:
+        # Any camera/threshold/search change can alter the fitted tangent. Start
+        # a fresh follow latch after the user deliberately changes detection setup.
+        self._clear_follow_heading()
+        self._normalize_fine_rotation_var()
+        self._update_fine_rotation_label()
+        self._update_threshold_label()
+        self._show_current_frame()
+
+    def _clamp_fine_rotation(self, value: float) -> float:
+        try:
+            angle = float(value)
+        except (TypeError, ValueError):
+            angle = 0.0
+        return max(-10.0, min(10.0, angle))
+
+    def _normalize_fine_rotation_var(self) -> None:
+        try:
+            current = float(self.fine_rotation_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            current = 0.0
+        clamped = self._clamp_fine_rotation(current)
+        if abs(clamped - current) > 1e-9:
+            self.fine_rotation_var.set(clamped)
+
+    def _update_fine_rotation_label(self) -> None:
+        self.fine_rotation_label.configure(text=f"{self._get_fine_rotation_degrees():+.1f}°")
+
+    def _update_threshold_label(self) -> None:
+        self.threshold_label.configure(text=str(self._get_threshold()))
+
+    def _get_requested_size(self) -> tuple[int, int]:
+        try:
+            width = int(self.camera_width_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            width = 0
+        try:
+            height = int(self.camera_height_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            height = 0
+        return max(0, width), max(0, height)
+
+    def apply_resolution_preset(self) -> None:
+        preset = parse_preset_label(self.camera_preset_var.get())
+        if preset is None:
+            return
+        width, height = preset
+        self.camera_width_var.set(width)
+        self.camera_height_var.set(height)
+        self.cal_status_var.set(f"Preset selected: {width} x {height}. Click Open / Restart to apply.")
+
+    def _get_camera_index(self) -> int:
+        try:
+            return max(0, int(self.camera_index_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            return 0
+
+    def _get_rotate_degrees(self) -> int:
+        try:
+            rotate_degrees = int(self.rotate_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            rotate_degrees = 0
+        if rotate_degrees not in ROTATE_VALUES:
+            rotate_degrees = 0
+        return rotate_degrees
+
+    def _get_fine_rotation_degrees(self) -> float:
+        try:
+            return self._clamp_fine_rotation(float(self.fine_rotation_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            return 0.0
+
+    def _get_threshold(self) -> int:
+        try:
+            return max(0, min(255, int(round(float(self.threshold_var.get())))))
+        except (tk.TclError, TypeError, ValueError):
+            return 90
+
+    def _get_move_distance(self) -> float:
+        try:
+            move = abs(float(self.move_distance_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            move = 0.100
+        return max(0.001, min(1.000, move))
+
+    def _get_feed(self) -> float:
+        try:
+            feed = abs(float(self.feed_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            feed = 5.0
+        return max(0.1, min(120.0, feed))
+
+    def _get_jog_step(self) -> float:
+        try:
+            step = abs(float(self.jog_step_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            step = 0.010
+        return max(0.001, min(1.000, step))
+
+    def _get_center_max_move(self) -> float:
+        try:
+            move = abs(float(self.center_max_move_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            move = 0.100
+        return max(0.001, min(1.000, move))
+
+    def _get_follow_step(self) -> float:
+        try:
+            step = abs(float(self.follow_step_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            step = 0.050
+        return max(0.001, min(1.000, step))
+
+    def _get_follow_feed(self) -> float:
+        try:
+            feed = abs(float(self.follow_feed_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            feed = 5.0
+        feed = max(0.1, min(120.0, feed))
+        self.follow_feed_var.set(feed)
+        return feed
+
+    def _get_follow_max_correct(self) -> float:
+        try:
+            move = abs(float(self.follow_max_correct_var.get()))
+        except (tk.TclError, TypeError, ValueError):
+            move = 0.050
+        return max(0.0, min(1.000, move))
+
+    def _get_follow_min_confidence(self) -> float:
+        try:
+            confidence = float(self.follow_min_confidence_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            confidence = 45.0
+        return max(0.0, min(100.0, confidence))
+
+    def _get_follow_repeat_count(self) -> int:
+        try:
+            count = int(self.follow_repeat_count_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            count = 5
+        count = max(1, min(50, count))
+        self.follow_repeat_count_var.set(count)
+        return count
+
+    def _normalize_follow_direction(self, value: object) -> str:
+        text = str(value or "Forward").strip()
+        if text in {"Forward", "Reverse"}:
+            return text
+        return "Forward"
+
+    def _get_follow_direction_sign(self) -> int:
+        return -1 if self._normalize_follow_direction(self.follow_direction_var.get()) == "Reverse" else 1
+
+    def _normalize_line_mode(self, value: object) -> str:
+        text = str(value or "Line center").strip()
+        if text in {"Line center", "Edge near center"}:
+            return text
+        return "Line center"
+
+    def _get_line_mode(self) -> str:
+        return self._normalize_line_mode(self.line_mode_var.get())
+
+    def _clamp_line_search_px(self, value: object) -> int:
+        try:
+            pixels = int(round(float(value)))
+        except (tk.TclError, TypeError, ValueError):
+            pixels = 220
+        return max(40, min(1000, pixels))
+
+    def _get_line_search_px(self) -> int:
+        return self._clamp_line_search_px(self.line_search_px_var.get())
+
+    def open_camera(self) -> None:
+        self.release_camera()
+        self.current_frame_bgr = None
+        self.current_dot = DotDetection(False)
+        self.current_line = LineDetection(False)
+        self._update_threshold_label()
+
+        index = self._get_camera_index()
+        width, height = self._get_requested_size()
+        self.camera_preset_var.set(size_to_preset_label(width, height))
+
+        cap, info, error = open_camera_capture(index, width, height)
+        if cap is None:
+            self.cap = None
+            self.cal_status_var.set(f"Camera {index} did not open. {error}")
+            return
+
+        stream = CameraStream(cap, info)
+        stream.start()
+        self.cap = stream
+
+        status = (
+            f"Camera {index} open via {info.backend_name}. Requested {info.requested_size_text}; "
+            f"actual {info.actual_size_text}; format {info.fourcc}."
+        )
+        if info.warning:
+            status += f" Warning: {info.warning}"
+        self.cal_status_var.set(status)
+        self._schedule_next_frame()
+
+    def release_camera(self) -> None:
+        if self.after_job is not None:
+            try:
+                self.after_cancel(self.after_job)
+            except tk.TclError:
+                pass
+            self.after_job = None
+        if self.cap is not None:
+            self.cap.close()
+            self.cap = None
+
+    def _schedule_next_frame(self) -> None:
+        if self._closing:
+            return
+        self.after_job = self.after(50, self._update_preview)
+
+    def _update_preview(self) -> None:
+        self.after_job = None
+        self._pump_camera_frame()
+        if self.cap is not None and not self._closing:
+            self._schedule_next_frame()
+
+    def _pump_camera_frame(self) -> bool:
+        if self._closing or self.cap is None:
+            return False
+        frame = self.cap.get_latest_frame()
+        if frame is not None:
+            self.current_frame_bgr = frame
+            self._show_frame(frame)
+            return True
+        message = self.cap.status_message()
+        if message:
+            self.cal_status_var.set(message)
+        return False
+
+    def _show_current_frame(self) -> None:
+        if self.current_frame_bgr is not None:
+            self._show_frame(self.current_frame_bgr)
+
+    def get_transformed_frame_bgr(self, frame_bgr: np.ndarray) -> np.ndarray:
+        frame = frame_bgr
+        rotate_degrees = self._get_rotate_degrees()
+        if rotate_degrees == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif rotate_degrees == 180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif rotate_degrees == 270:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        if bool(self.flip_x_var.get()):
+            frame = cv2.flip(frame, 1)
+        if bool(self.flip_y_var.get()):
+            frame = cv2.flip(frame, 0)
+
+        fine_degrees = self._get_fine_rotation_degrees()
+        if abs(fine_degrees) > 0.0001:
+            h, w = frame.shape[:2]
+            center = (w / 2.0, h / 2.0)
+            matrix = cv2.getRotationMatrix2D(center, fine_degrees, 1.0)
+            frame = cv2.warpAffine(
+                frame,
+                matrix,
+                (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        return frame
+
+    def _make_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        # Black dot/ring on white paper. Dark pixels become white in the mask.
+        _, mask = cv2.threshold(gray, self._get_threshold(), 255, cv2.THRESH_BINARY_INV)
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return mask
+
+    def detect_dot(self) -> DotDetection:
+        if self.current_frame_bgr is None:
+            return DotDetection(False, message="No camera frame yet")
+        frame = self.get_transformed_frame_bgr(self.current_frame_bgr)
+        return self.detect_dot_in_frame(frame)
+
+    def detect_dot_in_frame(self, frame_bgr: np.ndarray) -> DotDetection:
+        mask = self._make_mask(frame_bgr)
+        contours, _hierarchy = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        h, w = mask.shape[:2]
+        center_x = w / 2.0
+        center_y = h / 2.0
+        diagonal = max(1.0, math.hypot(w, h))
+
+        best: Optional[DotDetection] = None
+        best_score = -1.0
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < 10.0 or area > float(w * h) * 0.35:
+                continue
+            moments = cv2.moments(contour)
+            if abs(moments.get("m00", 0.0)) < 1e-9:
+                continue
+            x = float(moments["m10"] / moments["m00"])
+            y = float(moments["m01"] / moments["m00"])
+            perimeter = float(cv2.arcLength(contour, True))
+            circularity = 0.0
+            if perimeter > 1e-9:
+                circularity = max(0.0, min(1.0, 4.0 * math.pi * area / (perimeter * perimeter)))
+            distance_score = max(0.0, 1.0 - (math.hypot(x - center_x, y - center_y) / (diagonal * 0.50)))
+            area_score = min(1.0, math.sqrt(area) / 120.0)
+            score = (0.55 * distance_score) + (0.25 * circularity) + (0.20 * area_score)
+            if score > best_score:
+                best_score = score
+                best = DotDetection(
+                    found=True,
+                    x=x,
+                    y=y,
+                    area=area,
+                    confidence=max(0.0, min(100.0, score * 100.0)),
+                    message="Dot found",
+                )
+
+        if best is None:
+            return DotDetection(False, message="No dark calibration target found. Adjust threshold/light or recenter dot.")
+        return best
+
+    def _show_frame(self, frame_bgr: np.ndarray) -> None:
+        transformed = self.get_transformed_frame_bgr(frame_bgr)
+        self.current_dot = self.detect_dot_in_frame(transformed)
+        if bool(self.show_line_preview_var.get()):
+            self.current_line = self.detect_line_in_frame(transformed)
+        else:
+            self.current_line = LineDetection(False, message="Line preview disabled")
+
+        if bool(self.show_mask_var.get()):
+            mask = self._make_mask(transformed)
+            preview_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)
+        else:
+            preview_rgb = cv2.cvtColor(transformed, cv2.COLOR_BGR2RGB)
+
+        pil_image = Image.fromarray(preview_rgb)
+        original_w, original_h = pil_image.size
+        # Scale against a fixed preview box instead of the label's current
+        # requested size. This prevents the live image from changing the dialog
+        # geometry frame-to-frame.
+        max_w = max(1, int(self.preview_display_width))
+        max_h = max(1, int(self.preview_display_height))
+        scale = min(max_w / original_w, max_h / original_h, 1.0)
+        new_w = max(1, int(original_w * scale))
+        new_h = max(1, int(original_h * scale))
+        if (new_w, new_h) != pil_image.size:
+            pil_image = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        self._draw_overlay(pil_image, scale, original_w, original_h)
+        if self._closing:
+            return
+        self._tk_preview = ImageTk.PhotoImage(pil_image, master=self)
+        try:
+            self.preview_label.configure(image=self._tk_preview)
+        except tk.TclError:
+            return
+        self._update_dot_status(original_w, original_h)
+        self._update_line_status(original_w, original_h)
+
+    def _draw_overlay(self, pil_image: Image.Image, scale: float, source_w: int, source_h: int) -> None:
+        draw = ImageDraw.Draw(pil_image)
+        w, h = pil_image.size
+        cx = w // 2
+        cy = h // 2
+        outline = (0, 0, 0)
+        cross = (255, 230, 0)
+        found = (0, 255, 0)
+        missing = (255, 80, 80)
+
+        draw.line((cx, 0, cx, h), fill=outline, width=5)
+        draw.line((0, cy, w, cy), fill=outline, width=5)
+        draw.line((cx, 0, cx, h), fill=cross, width=2)
+        draw.line((0, cy, w, cy), fill=cross, width=2)
+
+        r = 7
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=outline, width=4)
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=cross, width=2)
+
+        if self.current_dot.found:
+            dx = int(round(self.current_dot.x * scale))
+            dy = int(round(self.current_dot.y * scale))
+            rr = 12
+            draw.ellipse((dx - rr, dy - rr, dx + rr, dy + rr), outline=outline, width=5)
+            draw.ellipse((dx - rr, dy - rr, dx + rr, dy + rr), outline=found, width=3)
+            draw.line((dx - 18, dy, dx + 18, dy), fill=found, width=2)
+            draw.line((dx, dy - 18, dx, dy + 18), fill=found, width=2)
+        else:
+            draw.text((10, 10), "DOT NOT FOUND", fill=missing)
+
+        if bool(self.show_line_preview_var.get()):
+            self._draw_line_overlay(draw, scale, source_w, source_h)
+
+        draw.text((10, h - 24), f"Source {source_w}x{source_h}  Threshold {self._get_threshold()}", fill=(255, 255, 255))
+
+    def _update_dot_status(self, frame_w: int, frame_h: int) -> None:
+        if self.current_dot.found:
+            err_x = self.current_dot.x - (frame_w / 2.0)
+            err_y = self.current_dot.y - (frame_h / 2.0)
+            self.dot_status_var.set(
+                f"Dot: X {self.current_dot.x:.1f} Y {self.current_dot.y:.1f} | "
+                f"offset from center X {err_x:+.1f}px Y {err_y:+.1f}px | "
+                f"area {self.current_dot.area:.0f} | confidence {self.current_dot.confidence:.0f}%"
+            )
+        else:
+            self.dot_status_var.set(f"Dot: not found - {self.current_dot.message}")
+
+    def _search_box_bounds(self, frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
+        size = self._get_line_search_px()
+        half = max(20, size // 2)
+        cx = frame_w // 2
+        cy = frame_h // 2
+        x1 = max(0, cx - half)
+        y1 = max(0, cy - half)
+        x2 = min(frame_w, cx + half)
+        y2 = min(frame_h, cy + half)
+        return x1, y1, x2, y2
+
+    def detect_line(self) -> LineDetection:
+        if self.current_frame_bgr is None:
+            return LineDetection(False, mode=self._get_line_mode(), message="No camera frame yet")
+        frame = self.get_transformed_frame_bgr(self.current_frame_bgr)
+        return self.detect_line_in_frame(frame)
+
+    def detect_line_in_frame(self, frame_bgr: np.ndarray) -> LineDetection:
+        mode = self._get_line_mode()
+        mask = self._make_mask(frame_bgr)
+        h, w = mask.shape[:2]
+        x1, y1, x2, y2 = self._search_box_bounds(w, h)
+        roi = mask[y1:y2, x1:x2]
+        if roi.size <= 0:
+            return LineDetection(False, mode=mode, message="Line search box is empty")
+
+        points: Optional[np.ndarray] = None
+        score_hint = 0.0
+        if mode == "Edge near center":
+            edges = cv2.Canny(roi, 50, 150)
+            contours, _hierarchy = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            local_cx = (x2 - x1) / 2.0
+            local_cy = (y2 - y1) / 2.0
+            best_contour: Optional[np.ndarray] = None
+            best_score = -1.0
+            for contour in contours:
+                if len(contour) < 8:
+                    continue
+                pts = contour.reshape(-1, 2).astype(np.float32)
+                min_dist = float(np.min(np.hypot(pts[:, 0] - local_cx, pts[:, 1] - local_cy)))
+                span_x = float(np.max(pts[:, 0]) - np.min(pts[:, 0])) if len(pts) else 0.0
+                span_y = float(np.max(pts[:, 1]) - np.min(pts[:, 1])) if len(pts) else 0.0
+                span = math.hypot(span_x, span_y)
+                score = span - (0.45 * min_dist)
+                if score > best_score:
+                    best_score = score
+                    best_contour = contour
+            if best_contour is not None:
+                points = best_contour.reshape(-1, 2).astype(np.float32)
+                score_hint = max(0.0, best_score)
+        else:
+            contours, _hierarchy = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            roi_area = float(max(1, roi.shape[0] * roi.shape[1]))
+            local_cx = (x2 - x1) / 2.0
+            local_cy = (y2 - y1) / 2.0
+            best_contour = None
+            best_score = -1.0
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area < 8.0 or area > roi_area * 0.90:
+                    continue
+                pts = contour.reshape(-1, 2).astype(np.float32)
+                if len(pts) < 5:
+                    continue
+                mean_x = float(np.mean(pts[:, 0]))
+                mean_y = float(np.mean(pts[:, 1]))
+                distance_score = max(0.0, self._get_line_search_px() * 0.75 - math.hypot(mean_x - local_cx, mean_y - local_cy))
+                score = area + (2.0 * distance_score)
+                if score > best_score:
+                    best_score = score
+                    best_contour = contour
+            if best_contour is not None:
+                points = best_contour.reshape(-1, 2).astype(np.float32)
+                score_hint = max(0.0, best_score)
+
+        if points is None or len(points) < 5:
+            return LineDetection(False, mode=mode, message="No usable line/edge found in search box")
+
+        points_global = points.copy()
+        points_global[:, 0] += float(x1)
+        points_global[:, 1] += float(y1)
+        fit = cv2.fitLine(points_global.reshape(-1, 1, 2), cv2.DIST_L2, 0, 0.01, 0.01)
+        vx = float(fit[0][0])
+        vy = float(fit[1][0])
+        x0 = float(fit[2][0])
+        y0 = float(fit[3][0])
+        length = math.hypot(vx, vy)
+        if length < 1e-9:
+            return LineDetection(False, mode=mode, message="Line fit failed")
+        vx /= length
+        vy /= length
+        # cv2.fitLine direction is mathematically sign-ambiguous. Force a
+        # stable screen direction so repeated Follow Step clicks do not randomly
+        # alternate between forward and reverse.
+        if vx < 0.0 or (abs(vx) < 1e-9 and vy < 0.0):
+            vx = -vx
+            vy = -vy
+
+        center_x = w / 2.0
+        center_y = h / 2.0
+        t = ((center_x - x0) * vx) + ((center_y - y0) * vy)
+        closest_x = x0 + (t * vx)
+        closest_y = y0 + (t * vy)
+        err_x = closest_x - center_x
+        err_y = closest_y - center_y
+
+        projections = ((points_global[:, 0] - x0) * vx) + ((points_global[:, 1] - y0) * vy)
+        span = float(np.max(projections) - np.min(projections)) if len(projections) else 0.0
+        perpendicular = np.abs((points_global[:, 0] - x0) * (-vy) + (points_global[:, 1] - y0) * vx)
+        width_est = float(np.percentile(perpendicular, 90)) if len(perpendicular) else 0.0
+        aspect_score = 0.0
+        if width_est > 1e-6:
+            aspect_score = min(1.0, span / (width_est * 8.0))
+        span_score = min(1.0, span / max(1.0, self._get_line_search_px() * 0.55))
+        center_score = max(0.0, 1.0 - (math.hypot(err_x, err_y) / max(1.0, self._get_line_search_px() * 0.50)))
+        point_score = min(1.0, math.sqrt(len(points_global)) / 35.0)
+        raw_conf = (0.35 * span_score) + (0.25 * aspect_score) + (0.25 * point_score) + (0.15 * center_score)
+        if score_hint <= 0.0:
+            raw_conf *= 0.85
+        confidence = max(0.0, min(100.0, raw_conf * 100.0))
+        angle = math.degrees(math.atan2(vy, vx))
+        return LineDetection(
+            found=True,
+            mode=mode,
+            x=closest_x,
+            y=closest_y,
+            vx=vx,
+            vy=vy,
+            pixel_error_x=err_x,
+            pixel_error_y=err_y,
+            angle_degrees=angle,
+            confidence=confidence,
+            message="Line/edge found",
+        )
+
+    def _draw_line_overlay(self, draw: ImageDraw.ImageDraw, scale: float, source_w: int, source_h: int) -> None:
+        x1, y1, x2, y2 = self._search_box_bounds(source_w, source_h)
+        sx1 = int(round(x1 * scale))
+        sy1 = int(round(y1 * scale))
+        sx2 = int(round(x2 * scale))
+        sy2 = int(round(y2 * scale))
+        outline = (0, 0, 0)
+        box_color = (0, 190, 255)
+        line_color = (255, 80, 255)
+        point_color = (0, 255, 255)
+        draw.rectangle((sx1, sy1, sx2, sy2), outline=outline, width=4)
+        draw.rectangle((sx1, sy1, sx2, sy2), outline=box_color, width=2)
+
+        if not self.current_line.found:
+            return
+
+        cx = int(round((source_w / 2.0) * scale))
+        cy = int(round((source_h / 2.0) * scale))
+        px = int(round(self.current_line.x * scale))
+        py = int(round(self.current_line.y * scale))
+        span = max(source_w, source_h)
+        lx1 = int(round((self.current_line.x - self.current_line.vx * span) * scale))
+        ly1 = int(round((self.current_line.y - self.current_line.vy * span) * scale))
+        lx2 = int(round((self.current_line.x + self.current_line.vx * span) * scale))
+        ly2 = int(round((self.current_line.y + self.current_line.vy * span) * scale))
+        draw.line((lx1, ly1, lx2, ly2), fill=outline, width=6)
+        draw.line((lx1, ly1, lx2, ly2), fill=line_color, width=3)
+        draw.line((cx, cy, px, py), fill=outline, width=5)
+        draw.line((cx, cy, px, py), fill=point_color, width=2)
+        rr = 8
+        draw.ellipse((px - rr, py - rr, px + rr, py + rr), outline=outline, width=4)
+        draw.ellipse((px - rr, py - rr, px + rr, py + rr), outline=point_color, width=2)
+
+    def _update_line_status(self, frame_w: int, frame_h: int) -> None:
+        if not bool(self.show_line_preview_var.get()):
+            self.line_status_var.set("Line/edge: preview disabled")
+            return
+        line = self.current_line
+        if not line.found:
+            self.line_status_var.set(f"Line/edge: not found - {line.message}")
+            return
+
+        correction = self._machine_correction_from_pixel_error(line.pixel_error_x, line.pixel_error_y)
+        if correction is None:
+            correction_text = "calibration not available"
+        else:
+            move_x, move_y = correction
+            correction_text = f"suggested correction X{move_x:+.4f} Y{move_y:+.4f}"
+        self.line_status_var.set(
+            f"{line.mode}: offset X{line.pixel_error_x:+.1f}px Y{line.pixel_error_y:+.1f}px | "
+            f"angle {line.angle_degrees:+.1f}° | confidence {line.confidence:.0f}% | {correction_text}"
+        )
+
+    def _machine_correction_from_pixel_error(self, err_x: float, err_y: float) -> Optional[tuple[float, float]]:
+        calibration = self._validate_calibration(self.active_calibration)
+        if calibration is None:
+            return None
+        try:
+            inv = calibration["matrix_pixel_to_machine"]
+            move_x = float(inv[0][0]) * (-err_x) + float(inv[0][1]) * (-err_y)
+            move_y = float(inv[1][0]) * (-err_x) + float(inv[1][1]) * (-err_y)
+        except Exception:  # noqa: BLE001
+            return None
+        if not math.isfinite(move_x) or not math.isfinite(move_y):
+            return None
+        return move_x, move_y
+
+    def _machine_vector_from_pixel_vector(self, px_x: float, px_y: float) -> Optional[tuple[float, float]]:
+        calibration = self._validate_calibration(self.active_calibration)
+        if calibration is None:
+            return None
+        try:
+            inv = calibration["matrix_pixel_to_machine"]
+            move_x = float(inv[0][0]) * float(px_x) + float(inv[0][1]) * float(px_y)
+            move_y = float(inv[1][0]) * float(px_x) + float(inv[1][1]) * float(px_y)
+        except Exception:  # noqa: BLE001
+            return None
+        if not math.isfinite(move_x) or not math.isfinite(move_y):
+            return None
+        return move_x, move_y
+
+    def _limit_move_vector(self, move_x: float, move_y: float, max_len: float) -> tuple[float, float, bool]:
+        length = math.hypot(move_x, move_y)
+        if max_len <= 0.0:
+            return 0.0, 0.0, length > 0.0
+        if length > max_len:
+            scale = max_len / length
+            return move_x * scale, move_y * scale, True
+        return move_x, move_y, False
+
+    def find_line_once(self) -> None:
+        # Treat Find Line/Edge as the user's explicit setup step for a new follow
+        # direction. The next Follow Step will establish a fresh heading from the
+        # Forward/Reverse selector, then later steps will latch to it.
+        self._clear_follow_heading()
+        if self.current_frame_bgr is None:
+            messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
+            return
+        line = self.detect_line()
+        self.current_line = line
+        if line.found:
+            self.cal_status_var.set(
+                f"{line.mode} found. Pixel offset X{line.pixel_error_x:+.1f} Y{line.pixel_error_y:+.1f}; "
+                f"confidence {line.confidence:.0f}%."
+            )
+        else:
+            self.cal_status_var.set(line.message)
+        self._show_current_frame()
+
+    def find_dot_once(self) -> None:
+        if self.current_frame_bgr is None:
+            messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
+            return
+        dot = self.detect_dot()
+        self.current_dot = dot
+        if dot.found:
+            self.cal_status_var.set(
+                f"Dot found at X {dot.x:.1f} Y {dot.y:.1f}. Center it reasonably, then Run Calibration."
+            )
+        else:
+            self.cal_status_var.set(dot.message)
+        self._show_current_frame()
+
+    def _validate_calibration(self, calibration: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not isinstance(calibration, dict):
+            return None
+        if not calibration.get("valid"):
+            return None
+        matrix = calibration.get("matrix_pixel_to_machine")
+        try:
+            if len(matrix) != 2 or len(matrix[0]) != 2 or len(matrix[1]) != 2:
+                return None
+            values = [float(matrix[0][0]), float(matrix[0][1]), float(matrix[1][0]), float(matrix[1][1])]
+            if not all(math.isfinite(value) for value in values):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        return calibration
+
+    def manual_jog(self, axis: str, direction: int) -> None:
+        if self._motion_active:
+            messagebox.showinfo("Calibration active", "Wait for calibration to finish or press STOP Move.", parent=self)
+            return
+        if self._manual_jog_active:
+            return
+
+        axis = axis.upper().strip()
+        if axis not in {"X", "Y"}:
+            return
+        direction = 1 if direction >= 0 else -1
+        step = self._get_jog_step()
+        feed = self._get_feed()
+        coordinate_mode = self.coordinate_mode_label
+
+        status = self.linuxcnc_reader.read_status()
+        if not self._status_ok_for_calibration(status):
+            messagebox.showerror("LinuxCNC not ready", status.error or self._status_not_ready_message(status), parent=self)
+            return
+        start_x, start_y, _z = self._active_position(status)
+        target_x = start_x + (step * direction if axis == "X" else 0.0)
+        target_y = start_y + (step * direction if axis == "Y" else 0.0)
+
+        self._manual_jog_active = True
+        try:
+            jog = self.linuxcnc_reader.incremental_jog(axis, direction, step, feed)
+            if not jog.success:
+                messagebox.showerror("Jog failed", jog.message, parent=self)
+                self.cal_status_var.set(jog.message)
+                return
+
+            label = f"{axis}{'+' if direction > 0 else '-'}"
+            self.cal_status_var.set(f"Manual calibration jog: {label} {step:.4f} at {feed:.1f} units/min.")
+            self._wait_for_position_near(target_x, target_y, coordinate_mode, step)
+            self._wait_and_pump_camera(0.12)
+            self._show_current_frame()
+        finally:
+            self._manual_jog_active = False
+
+    def run_calibration(self) -> None:
+        if self._motion_active:
+            messagebox.showinfo("Motion already active", "FabScan is already running a calibration move.", parent=self)
+            return
+        if self.current_frame_bgr is None:
+            messagebox.showinfo("No camera frame", "Open the camera and find the dot first.", parent=self)
+            return
+
+        move_distance = self._get_move_distance()
+        feed = self._get_feed()
+        coordinate_mode = self.coordinate_mode_label
+
+        start_dot = self.detect_dot()
+        if not start_dot.found:
+            messagebox.showinfo("Dot not found", start_dot.message, parent=self)
+            return
+
+        status = self.linuxcnc_reader.read_status()
+        if not self._status_ok_for_calibration(status):
+            messagebox.showerror("LinuxCNC not ready", status.error or self._status_not_ready_message(status), parent=self)
+            return
+        start_x, start_y, _z = self._active_position(status)
+
+        self.cal_status_var.set(
+            f"Calibration starting: {coordinate_mode}, move {move_distance:.4f}, feed {feed:.1f} units/min."
+        )
+
+        self._motion_active = True
+        try:
+            self.cal_status_var.set("Calibration: jogging X+ and looking for the same dot...")
+            x_dot = self._move_find_dot_return(
+                target_x=start_x + move_distance,
+                target_y=start_y,
+                return_x=start_x,
+                return_y=start_y,
+                feed=feed,
+                coordinate_mode=coordinate_mode,
+                label="X+",
+            )
+            if x_dot is None:
+                return
+
+            self.cal_status_var.set("Calibration: jogging Y+ and looking for the same dot...")
+            y_dot = self._move_find_dot_return(
+                target_x=start_x,
+                target_y=start_y + move_distance,
+                return_x=start_x,
+                return_y=start_y,
+                feed=feed,
+                coordinate_mode=coordinate_mode,
+                label="Y+",
+            )
+            if y_dot is None:
+                return
+
+            try:
+                calibration = self._build_calibration_result(
+                    start_dot=start_dot,
+                    x_dot=x_dot,
+                    y_dot=y_dot,
+                    move_distance=move_distance,
+                    feed=feed,
+                    coordinate_mode=coordinate_mode,
+                    start_x=start_x,
+                    start_y=start_y,
+                )
+            except RuntimeError as exc:
+                self.cal_status_var.set(f"Calibration failed: {exc}")
+                messagebox.showerror("Calibration failed", str(exc), parent=self)
+                return
+            self.active_calibration = calibration
+            self.result = self._make_result(calibration=calibration)
+            self._show_calibration_summary(calibration)
+        finally:
+            self._motion_active = False
+        self._manual_jog_active = False
+
+    def _move_find_dot_return(
+        self,
+        *,
+        target_x: float,
+        target_y: float,
+        return_x: float,
+        return_y: float,
+        feed: float,
+        coordinate_mode: str,
+        label: str,
+    ) -> Optional[DotDetection]:
+        """Jog one calibration axis, find the dot, then jog back.
+
+        v0.5.0 used repeated MDI G1 moves here. That worked for some moves but
+        could race QtPlasmaC/LinuxCNC mode changes and trigger "Must be in MDI
+        mode to issue MDI command." Calibration is a relative motion test, so
+        the already-proven MANUAL-mode incremental jog path is a better fit.
+        """
+
+        axis, direction, distance = self._axis_direction_distance(
+            target_x=target_x,
+            target_y=target_y,
+            return_x=return_x,
+            return_y=return_y,
+        )
+        if axis is None:
+            self.cal_status_var.set("Calibration failed: no X/Y calibration move was requested.")
+            return None
+
+        jog = self.linuxcnc_reader.incremental_jog(axis, direction, distance, feed)
+        if not jog.success:
+            messagebox.showerror("Calibration jog failed", jog.message, parent=self)
+            self.cal_status_var.set(jog.message)
+            return None
+
+        self.cal_status_var.set(f"Calibration: {label} jog sent. Waiting for position to settle...")
+        if not self._wait_for_position_near(target_x, target_y, coordinate_mode, distance):
+            self.cal_status_var.set(f"Calibration failed: LinuxCNC did not reach/settle after {label} jog.")
+            self._return_to_start(axis, -direction, distance, feed, return_x, return_y, coordinate_mode)
+            return None
+
+        self._wait_and_pump_camera(0.35)
+        dot = self.detect_dot()
+        if not dot.found:
+            self.cal_status_var.set(f"Calibration failed: dot left frame or was not found after {label} jog.")
+            messagebox.showerror(
+                "Dot lost",
+                (
+                    f"Dot was not found after the {label} calibration jog.\n\n"
+                    "Use a smaller calibration move, better lighting, or re-center the dot. "
+                    "FabScan will try to jog back to the start point."
+                ),
+                parent=self,
+            )
+            self._return_to_start(axis, -direction, distance, feed, return_x, return_y, coordinate_mode)
+            return None
+
+        self.cal_status_var.set(f"Calibration: dot found after {label}. Jogging back to start...")
+        if not self._return_to_start(axis, -direction, distance, feed, return_x, return_y, coordinate_mode):
+            return None
+        return dot
+
+    def _axis_direction_distance(
+        self,
+        *,
+        target_x: float,
+        target_y: float,
+        return_x: float,
+        return_y: float,
+    ) -> tuple[Optional[str], int, float]:
+        dx = float(target_x) - float(return_x)
+        dy = float(target_y) - float(return_y)
+        if abs(dx) >= abs(dy) and abs(dx) > 1e-9:
+            return "X", (1 if dx >= 0.0 else -1), abs(dx)
+        if abs(dy) > 1e-9:
+            return "Y", (1 if dy >= 0.0 else -1), abs(dy)
+        return None, 1, 0.0
+
+    def _return_to_start(
+        self,
+        axis: str,
+        direction: int,
+        distance: float,
+        feed: float,
+        start_x: float,
+        start_y: float,
+        coordinate_mode: str,
+    ) -> bool:
+        jog = self.linuxcnc_reader.incremental_jog(axis, direction, distance, feed)
+        if not jog.success:
+            messagebox.showerror("Return jog failed", jog.message, parent=self)
+            self.cal_status_var.set(jog.message)
+            return False
+        if not self._wait_for_position_near(start_x, start_y, coordinate_mode, distance):
+            self.cal_status_var.set("Return jog was sent, but FabScan did not see the expected start position settle.")
+            return False
+        return True
+
+    def _wait_for_position_near(
+        self,
+        target_x: float,
+        target_y: float,
+        coordinate_mode: str,
+        move_distance: float,
+    ) -> bool:
+        timeout_seconds = max(6.0, (abs(move_distance) / max(0.001, self._get_feed())) * 60.0 * 4.0 + 2.0)
+        tolerance = max(0.001, abs(move_distance) * 0.03)
+        end_time = time.monotonic() + timeout_seconds
+        stable_count = 0
+        last_message = ""
+        while time.monotonic() < end_time:
+            self.update()
+            self._pump_camera_frame()
+            status = self.linuxcnc_reader.read_status()
+            if status.connected:
+                x, y, _z = self._active_position(status)
+                error = math.hypot(float(x) - float(target_x), float(y) - float(target_y))
+                last_message = (
+                    f"pos X{x:.4f} Y{y:.4f}, target X{target_x:.4f} Y{target_y:.4f}, "
+                    f"error {error:.5f}, mode {status.task_mode}"
+                )
+                if error <= tolerance:
+                    stable_count += 1
+                    if stable_count >= 4:
+                        return True
+                else:
+                    stable_count = 0
+            else:
+                last_message = status.error or "LinuxCNC not connected"
+                stable_count = 0
+            time.sleep(0.05)
+        self.cal_status_var.set(f"Timed out waiting for calibration jog to settle ({last_message}).")
+        return False
+
+    def _wait_for_idle(self, timeout_seconds: float) -> bool:
+        end_time = time.monotonic() + timeout_seconds
+        last_message = ""
+        while time.monotonic() < end_time:
+            self.update()
+            status = self.linuxcnc_reader.read_status()
+            if status.connected:
+                last_message = f"state {status.task_state}, mode {status.task_mode}, interp {status.interp_state}"
+                if status.interp_state == "IDLE":
+                    return True
+            else:
+                last_message = status.error or "LinuxCNC not connected"
+            time.sleep(0.05)
+        self.cal_status_var.set(f"Timed out waiting for LinuxCNC IDLE ({last_message}).")
+        return False
+
+    def _wait_and_pump_camera(self, seconds: float) -> None:
+        end_time = time.monotonic() + seconds
+        while time.monotonic() < end_time:
+            self.update()
+            self._pump_camera_frame()
+            time.sleep(0.03)
+
+    def _status_ok_for_calibration(self, status: LinuxCNCPositionStatus) -> bool:
+        if not status.available or not status.connected:
+            return False
+        if status.task_state != "ON":
+            return False
+        if status.interp_state != "IDLE":
+            return False
+        if status.task_mode != "MANUAL":
+            return False
+        if not status.all_xyz_homed:
+            return False
+        return True
+
+    def _status_not_ready_message(self, status: LinuxCNCPositionStatus) -> str:
+        if not status.available or not status.connected:
+            return status.error or "FabScan is not connected to LinuxCNC."
+        if status.task_state != "ON":
+            return f"LinuxCNC task state must be ON. Current state: {status.task_state}."
+        if status.interp_state != "IDLE":
+            return f"LinuxCNC interpreter must be IDLE. Current state: {status.interp_state}."
+        if status.task_mode != "MANUAL":
+            return (
+                "Camera calibration now uses MANUAL-mode incremental jogs, not MDI moves. "
+                f"Current mode: {status.task_mode}. Switch QtPlasmaC/LinuxCNC to manual/jog mode."
+            )
+        if not status.all_xyz_homed:
+            return f"X/Y/Z must be homed. Current homed state: {status.homed_text}."
+        return "LinuxCNC is not ready for calibration."
+
+    def _active_position(self, status: LinuxCNCPositionStatus) -> tuple[float, float, float]:
+        if self.coordinate_mode_label == "Machine coordinates":
+            return status.machine_position
+        return status.work_position
+
+    def _build_calibration_result(
+        self,
+        *,
+        start_dot: DotDetection,
+        x_dot: DotDetection,
+        y_dot: DotDetection,
+        move_distance: float,
+        feed: float,
+        coordinate_mode: str,
+        start_x: float,
+        start_y: float,
+    ) -> dict[str, Any]:
+        x_response = (x_dot.x - start_dot.x, x_dot.y - start_dot.y)
+        y_response = (y_dot.x - start_dot.x, y_dot.y - start_dot.y)
+
+        # Matrix maps machine move [dx, dy] to pixel move [du, dv].
+        a = x_response[0] / move_distance
+        b = y_response[0] / move_distance
+        c = x_response[1] / move_distance
+        d = y_response[1] / move_distance
+        det = (a * d) - (b * c)
+        if abs(det) < 1e-9:
+            raise RuntimeError("Calibration matrix is singular. Increase calibration move or improve dot detection.")
+
+        inv = [[d / det, -b / det], [-c / det, a / det]]
+        px_per_unit_x = math.hypot(*x_response) / move_distance
+        px_per_unit_y = math.hypot(*y_response) / move_distance
+        x_angle = math.degrees(math.atan2(x_response[1], x_response[0]))
+        y_angle = math.degrees(math.atan2(y_response[1], y_response[0]))
+
+        return {
+            "valid": True,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "camera_index": self._get_camera_index(),
+            "camera_width": self._get_requested_size()[0],
+            "camera_height": self._get_requested_size()[1],
+            "rotate_degrees": self._get_rotate_degrees(),
+            "flip_x": bool(self.flip_x_var.get()),
+            "flip_y": bool(self.flip_y_var.get()),
+            "fine_rotation_degrees": self._get_fine_rotation_degrees(),
+            "threshold": self._get_threshold(),
+            "coordinate_mode_label": coordinate_mode,
+            "move_distance": move_distance,
+            "feed_units_per_min": feed,
+            "start_position": [start_x, start_y],
+            "start_dot_px": [start_dot.x, start_dot.y],
+            "x_plus_dot_px": [x_dot.x, x_dot.y],
+            "y_plus_dot_px": [y_dot.x, y_dot.y],
+            "x_plus_pixel_response": [x_response[0], x_response[1]],
+            "y_plus_pixel_response": [y_response[0], y_response[1]],
+            "matrix_machine_to_pixel": [[a, b], [c, d]],
+            "matrix_pixel_to_machine": inv,
+            "pixels_per_unit_x": px_per_unit_x,
+            "pixels_per_unit_y": px_per_unit_y,
+            "x_response_angle_degrees": x_angle,
+            "y_response_angle_degrees": y_angle,
+            "determinant": det,
+        }
+
+    def _show_calibration_summary(self, calibration: dict[str, Any], *, loaded: bool = False) -> None:
+        prefix = "Calibration loaded" if loaded else "Calibration valid"
+        self.transform_status_var.set(
+            f"{prefix}: "
+            f"X {calibration['pixels_per_unit_x']:.1f} px/unit, "
+            f"Y {calibration['pixels_per_unit_y']:.1f} px/unit, "
+            f"X angle {calibration['x_response_angle_degrees']:+.1f}°, "
+            f"Y angle {calibration['y_response_angle_degrees']:+.1f}°."
+        )
+        if loaded:
+            self.cal_status_var.set("Saved calibration loaded. Use Center Dot to test the camera/machine transform.")
+        else:
+            self.cal_status_var.set("Calibration complete. Use Center Dot to test it, or close this window to return to FabScan.")
+
+    def _choose_latched_follow_heading(
+        self,
+        raw_tangent_x: float,
+        raw_tangent_y: float,
+        direction_sign: int,
+    ) -> tuple[Optional[tuple[float, float]], str]:
+        """Resolve the 180-degree ambiguity of a detected line tangent.
+
+        cv2.fitLine returns a line axis, not an arrow. On a nearly vertical or
+        horizontal target the sign can flip between frames, which makes the
+        machine step forward/back/forward/back. Convert the detected tangent to
+        a unit machine-space vector, then choose the sign that stays closest to
+        the previously successful follow heading.
+        """
+
+        length = math.hypot(raw_tangent_x, raw_tangent_y)
+        if length < 1e-9:
+            return None, "no tangent"
+
+        unit_x = raw_tangent_x / length
+        unit_y = raw_tangent_y / length
+
+        previous = self._follow_heading_unit
+        if previous is not None:
+            prev_len = math.hypot(previous[0], previous[1])
+            if prev_len > 1e-9:
+                prev_x = previous[0] / prev_len
+                prev_y = previous[1] / prev_len
+                dot = (unit_x * prev_x) + (unit_y * prev_y)
+                if dot < 0.0:
+                    unit_x = -unit_x
+                    unit_y = -unit_y
+                return (unit_x, unit_y), "latched"
+
+        # First step after Find Line/Edge or a setting change: honor the user's
+        # Forward/Reverse selector and establish the heading latch.
+        sign = -1.0 if int(direction_sign) < 0 else 1.0
+        return (unit_x * sign, unit_y * sign), "new heading"
+
+    def follow_line_single_step(self) -> None:
+        """Move one bounded step along the detected line/edge."""
+
+        self._follow_stop_requested = False
+        self._follow_line_step_impl(step_label="Follow Step", show_dialogs=True)
+
+    def follow_line_multiple_steps(self) -> None:
+        """Run a bounded number of single follow steps, stopping on trouble.
+
+        This is still not continuous/free-running following. The user chooses a
+        small count, and FabScan performs that many already-bounded single-step
+        moves. Each step re-detects the line/edge and stops if confidence drops,
+        the target is lost, LinuxCNC is not ready, or STOP Move is pressed.
+        """
+
+        if self._motion_active:
+            messagebox.showinfo("Motion active", "Wait for the current motion to finish or press STOP Move.", parent=self)
+            return
+        if self._manual_jog_active:
+            return
+        if not bool(self.follow_enabled_var.get()):
+            messagebox.showinfo("Follow disabled", "Check Enable follow before using Follow N.", parent=self)
+            return
+
+        count = self._get_follow_repeat_count()
+        if count <= 1:
+            self.follow_line_single_step()
+            return
+
+        self._follow_stop_requested = False
+        completed = 0
+        self.cal_status_var.set(f"Follow N starting: {count} requested steps.")
+        self.update()
+
+        for index in range(1, count + 1):
+            if self._follow_stop_requested:
+                break
+            ok = self._follow_line_step_impl(step_label=f"Follow {index}/{count}", show_dialogs=False)
+            if not ok:
+                break
+            completed += 1
+            self._wait_and_pump_camera(0.08)
+
+        last = self.cal_status_var.get()
+        if self._follow_stop_requested:
+            self.cal_status_var.set(f"Follow N stopped by user after {completed}/{count} completed steps.")
+        elif completed >= count:
+            self.cal_status_var.set(f"Follow N complete: {completed}/{count} steps completed.")
+        else:
+            self.cal_status_var.set(f"Follow N stopped after {completed}/{count} completed steps. {last}")
+        self._show_current_frame()
+
+    def _follow_line_step_impl(self, *, step_label: str, show_dialogs: bool) -> bool:
+        """Shared implementation for one camera-derived line/edge follow step."""
+
+        if self._motion_active:
+            if show_dialogs:
+                messagebox.showinfo("Motion active", "Wait for the current motion to finish or press STOP Move.", parent=self)
+            return False
+        if self._manual_jog_active:
+            return False
+        if not bool(self.follow_enabled_var.get()):
+            if show_dialogs:
+                messagebox.showinfo("Follow disabled", "Check Enable follow before using Follow Step.", parent=self)
+            return False
+
+        calibration = self._validate_calibration(self.active_calibration)
+        if calibration is None:
+            if show_dialogs:
+                messagebox.showinfo("No calibration", "Run calibration first, then use Follow Step.", parent=self)
+            self.cal_status_var.set("Follow refused: no valid camera calibration.")
+            return False
+        if self.current_frame_bgr is None:
+            if show_dialogs:
+                messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
+            self.cal_status_var.set("Follow refused: no camera frame is available.")
+            return False
+
+        status = self.linuxcnc_reader.read_status()
+        if not self._status_ok_for_calibration(status):
+            message = status.error or self._status_not_ready_message(status)
+            if show_dialogs:
+                messagebox.showerror("LinuxCNC not ready", message, parent=self)
+            self.cal_status_var.set(message)
+            return False
+
+        line = self.detect_line()
+        self.current_line = line
+        if not line.found:
+            self.cal_status_var.set(line.message)
+            if show_dialogs:
+                messagebox.showinfo("Line/edge not found", line.message, parent=self)
+            self._show_current_frame()
+            return False
+
+        min_confidence = self._get_follow_min_confidence()
+        if line.confidence < min_confidence:
+            self.cal_status_var.set(
+                f"{step_label} refused: confidence {line.confidence:.0f}% is below minimum {min_confidence:.0f}%."
+            )
+            self._show_current_frame()
+            return False
+
+        tangent = self._machine_vector_from_pixel_vector(line.vx, line.vy)
+        correction = self._machine_correction_from_pixel_error(line.pixel_error_x, line.pixel_error_y)
+        if tangent is None or correction is None:
+            if show_dialogs:
+                messagebox.showerror("Bad calibration", "Saved calibration could not be used for line following.", parent=self)
+            self.cal_status_var.set("Follow failed: saved calibration could not be used for line following.")
+            return False
+
+        tangent_len = math.hypot(tangent[0], tangent[1])
+        if tangent_len < 1e-9:
+            self.cal_status_var.set(f"{step_label} failed: detected line direction could not be converted to machine movement.")
+            self._show_current_frame()
+            return False
+
+        follow_step = self._get_follow_step()
+        direction_sign = self._get_follow_direction_sign()
+        heading, heading_state = self._choose_latched_follow_heading(tangent[0], tangent[1], direction_sign)
+        if heading is None:
+            self.cal_status_var.set(f"{step_label} failed: detected line direction could not be latched.")
+            self._show_current_frame()
+            return False
+        tangent_x = follow_step * heading[0]
+        tangent_y = follow_step * heading[1]
+
+        max_correct = self._get_follow_max_correct()
+        correct_x, correct_y, correction_limited = self._limit_move_vector(correction[0], correction[1], max_correct)
+        move_x = tangent_x + correct_x
+        move_y = tangent_y + correct_y
+        move_len = math.hypot(move_x, move_y)
+        if move_len < 0.0005:
+            self.cal_status_var.set(f"{step_label}: calculated move is tiny. No move sent.")
+            self._show_current_frame()
+            return False
+
+        max_total = max(0.001, follow_step + max_correct)
+        move_x, move_y, total_limited = self._limit_move_vector(move_x, move_y, max_total)
+
+        start_x, start_y, _z = self._active_position(status)
+        target_x = start_x + move_x
+        target_y = start_y + move_y
+        feed = self._get_follow_feed()
+        coordinate_mode = self.coordinate_mode_label
+
+        self._manual_jog_active = True
+        try:
+            limit_bits = []
+            if correction_limited:
+                limit_bits.append("side correction limited")
+            if total_limited:
+                limit_bits.append("total move limited")
+            limit_text = f" ({', '.join(limit_bits)})" if limit_bits else ""
+            self.cal_status_var.set(
+                f"{step_label}{limit_text}: F{feed:.1f}, {heading_state}, "
+                f"tangent X{tangent_x:+.4f} Y{tangent_y:+.4f}, "
+                f"correct X{correct_x:+.4f} Y{correct_y:+.4f}, "
+                f"total X{move_x:+.4f} Y{move_y:+.4f}."
+            )
+            self.update()
+            if not self._send_correction_jogs(move_x, move_y, target_x, target_y, feed, coordinate_mode):
+                return False
+
+            # Motion succeeded. Latch the machine-space heading used for this
+            # step so the next detection cannot flip 180 degrees.
+            self._follow_heading_unit = heading
+            self._wait_and_pump_camera(0.20)
+            new_line = self.detect_line()
+            self.current_line = new_line
+            capture_text = ""
+            if bool(self.follow_capture_point_var.get()) and self.trace_capture_callback is not None:
+                self.trace_capture_callback()
+                capture_text = " Captured current position to the active trace."
+            if new_line.found:
+                self.cal_status_var.set(
+                    f"{step_label} complete. New offset X{new_line.pixel_error_x:+.1f}px "
+                    f"Y{new_line.pixel_error_y:+.1f}px, confidence {new_line.confidence:.0f}%." + capture_text
+                )
+            else:
+                self.cal_status_var.set(f"{step_label} complete, but the line/edge was not found afterward." + capture_text)
+            self._show_current_frame()
+            return True
+        finally:
+            self._manual_jog_active = False
+
+    def center_dot_using_calibration(self) -> None:
+        if self._motion_active:
+            messagebox.showinfo("Calibration active", "Wait for calibration to finish or press STOP Move.", parent=self)
+            return
+        if self._manual_jog_active:
+            return
+
+        calibration = self._validate_calibration(self.active_calibration)
+        if calibration is None:
+            messagebox.showinfo("No calibration", "Run calibration first, then use Center Dot.", parent=self)
+            return
+        if self.current_frame_bgr is None:
+            messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
+            return
+
+        status = self.linuxcnc_reader.read_status()
+        if not self._status_ok_for_calibration(status):
+            messagebox.showerror("LinuxCNC not ready", status.error or self._status_not_ready_message(status), parent=self)
+            return
+
+        transformed = self.get_transformed_frame_bgr(self.current_frame_bgr)
+        frame_h, frame_w = transformed.shape[:2]
+        dot = self.detect_dot_in_frame(transformed)
+        self.current_dot = dot
+        if not dot.found:
+            self.cal_status_var.set(dot.message)
+            messagebox.showinfo("Dot not found", dot.message, parent=self)
+            self._show_current_frame()
+            return
+
+        err_x = dot.x - (frame_w / 2.0)
+        err_y = dot.y - (frame_h / 2.0)
+        pixel_error = math.hypot(err_x, err_y)
+        if pixel_error <= 2.0:
+            self.cal_status_var.set(f"Center Dot: already centered within {pixel_error:.1f} px.")
+            self._show_current_frame()
+            return
+
+        try:
+            inv = calibration["matrix_pixel_to_machine"]
+            # Desired pixel shift is opposite the current dot-to-crosshair error.
+            move_x = float(inv[0][0]) * (-err_x) + float(inv[0][1]) * (-err_y)
+            move_y = float(inv[1][0]) * (-err_x) + float(inv[1][1]) * (-err_y)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Bad calibration", f"Saved calibration could not be used: {exc}", parent=self)
+            return
+
+        if not math.isfinite(move_x) or not math.isfinite(move_y):
+            messagebox.showerror("Bad correction", "Calculated dot-centering move was not finite.", parent=self)
+            return
+
+        max_move = self._get_center_max_move()
+        vector_len = math.hypot(move_x, move_y)
+        limited = False
+        if vector_len > max_move:
+            scale = max_move / vector_len
+            move_x *= scale
+            move_y *= scale
+            vector_len = max_move
+            limited = True
+
+        if vector_len < 0.0005:
+            self.cal_status_var.set(f"Center Dot: correction is tiny ({vector_len:.5f} units). No move sent.")
+            self._show_current_frame()
+            return
+
+        start_x, start_y, _z = self._active_position(status)
+        target_x = start_x + move_x
+        target_y = start_y + move_y
+        feed = self._get_feed()
+        coordinate_mode = self.coordinate_mode_label
+
+        self._manual_jog_active = True
+        try:
+            limit_text = " limited" if limited else ""
+            self.cal_status_var.set(
+                f"Center Dot:{limit_text} correction X{move_x:+.4f} Y{move_y:+.4f} "
+                f"from pixel error X{err_x:+.1f} Y{err_y:+.1f}."
+            )
+            if not self._send_correction_jogs(move_x, move_y, target_x, target_y, feed, coordinate_mode):
+                return
+            self._wait_and_pump_camera(0.20)
+            new_dot = self.detect_dot()
+            self.current_dot = new_dot
+            if new_dot.found:
+                new_err_x = new_dot.x - (frame_w / 2.0)
+                new_err_y = new_dot.y - (frame_h / 2.0)
+                self.cal_status_var.set(
+                    f"Center Dot complete. New offset X{new_err_x:+.1f}px Y{new_err_y:+.1f}px. "
+                    "Click again if you want to sneak up on center."
+                )
+            else:
+                self.cal_status_var.set("Center Dot move complete, but the dot was not found afterward.")
+            self._show_current_frame()
+        finally:
+            self._manual_jog_active = False
+
+    def _send_correction_jogs(
+        self,
+        move_x: float,
+        move_y: float,
+        target_x: float,
+        target_y: float,
+        feed: float,
+        coordinate_mode: str,
+    ) -> bool:
+        start_status = self.linuxcnc_reader.read_status()
+        start_x, start_y, _z = self._active_position(start_status)
+
+        if abs(move_x) >= 0.0005:
+            direction = 1 if move_x >= 0.0 else -1
+            distance = abs(move_x)
+            jog = self.linuxcnc_reader.incremental_jog("X", direction, distance, feed)
+            if not jog.success:
+                messagebox.showerror("Center Dot jog failed", jog.message, parent=self)
+                self.cal_status_var.set(jog.message)
+                return False
+            if not self._wait_for_position_near(start_x + move_x, start_y, coordinate_mode, distance):
+                self.cal_status_var.set("Center Dot X correction did not settle as expected.")
+                return False
+
+        if abs(move_y) >= 0.0005:
+            direction = 1 if move_y >= 0.0 else -1
+            distance = abs(move_y)
+            jog = self.linuxcnc_reader.incremental_jog("Y", direction, distance, feed)
+            if not jog.success:
+                messagebox.showerror("Center Dot jog failed", jog.message, parent=self)
+                self.cal_status_var.set(jog.message)
+                return False
+            if not self._wait_for_position_near(target_x, target_y, coordinate_mode, distance):
+                self.cal_status_var.set("Center Dot Y correction did not settle as expected.")
+                return False
+
+        return True
+
+    def _make_result(self, calibration: Optional[dict[str, Any]]) -> CameraCalibrationDialogResult:
+        width, height = self._get_requested_size()
+        return CameraCalibrationDialogResult(
+            camera_index=self._get_camera_index(),
+            requested_width=width,
+            requested_height=height,
+            rotate_degrees=self._get_rotate_degrees(),
+            flip_x=bool(self.flip_x_var.get()),
+            flip_y=bool(self.flip_y_var.get()),
+            fine_rotation_degrees=self._get_fine_rotation_degrees(),
+            threshold=self._get_threshold(),
+            show_mask=bool(self.show_mask_var.get()),
+            move_distance=self._get_move_distance(),
+            feed_units_per_min=self._get_feed(),
+            jog_step=self._get_jog_step(),
+            center_max_move=self._get_center_max_move(),
+            line_mode=self._get_line_mode(),
+            line_search_px=self._get_line_search_px(),
+            show_line_preview=bool(self.show_line_preview_var.get()),
+            follow_step=self._get_follow_step(),
+            follow_feed_units_per_min=self._get_follow_feed(),
+            follow_max_correct=self._get_follow_max_correct(),
+            follow_min_confidence=self._get_follow_min_confidence(),
+            follow_direction=self._normalize_follow_direction(self.follow_direction_var.get()),
+            follow_capture_point=bool(self.follow_capture_point_var.get()),
+            follow_enabled=bool(self.follow_enabled_var.get()),
+            follow_repeat_count=self._get_follow_repeat_count(),
+            calibration=calibration or self.active_calibration,
+        )
+
+    def stop_motion(self) -> None:
+        self._follow_stop_requested = True
+        self._clear_follow_heading()
+        result = self.linuxcnc_reader.abort_motion()
+        self.cal_status_var.set(result.message)
+
+    def close(self) -> None:
+        self._closing = True
+        if self.result is None:
+            self.result = self._make_result(calibration=None)
+        self.release_camera()
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass

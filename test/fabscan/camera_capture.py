@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
-import time
 
 import cv2
 import numpy as np
@@ -13,8 +12,6 @@ from tkinter import messagebox, ttk
 from fabscan.camera_device import (
     CAMERA_RESOLUTION_PRESETS,
     DEFAULT_CAMERA_HEIGHT,
-    DEFAULT_CAMERA_PREVIEW_MAX_FPS,
-    DEFAULT_CAMERA_STREAM_MAX_FPS,
     DEFAULT_CAMERA_WIDTH,
     CameraStream,
     open_camera_capture,
@@ -35,10 +32,6 @@ class CameraCaptureResult:
     camera_index: int
     requested_width: int
     requested_height: int
-    camera_stream_max_fps: float = DEFAULT_CAMERA_STREAM_MAX_FPS
-    camera_preview_max_fps: float = DEFAULT_CAMERA_PREVIEW_MAX_FPS
-    linuxcnc_safe_preview: bool = False
-    profile_preview: bool = False
     rotate_degrees: int = 0
     flip_x: bool = False
     flip_y: bool = False
@@ -67,10 +60,6 @@ class CameraCaptureDialog(tk.Toplevel):
         camera_index: int = 0,
         camera_width: int = DEFAULT_CAMERA_WIDTH,
         camera_height: int = DEFAULT_CAMERA_HEIGHT,
-        camera_stream_max_fps: float = DEFAULT_CAMERA_STREAM_MAX_FPS,
-        camera_preview_max_fps: float = DEFAULT_CAMERA_PREVIEW_MAX_FPS,
-        linuxcnc_safe_preview: bool = False,
-        profile_preview: bool = False,
         rotate_degrees: int = 0,
         flip_x: bool = False,
         flip_y: bool = False,
@@ -90,9 +79,6 @@ class CameraCaptureDialog(tk.Toplevel):
         self.after_job: Optional[str] = None
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
         self._closing = False
-        self._last_preview_sequence = 0
-        self._next_preview_due = 0.0
-        self._preview_count = 0
 
         if int(rotate_degrees) not in ROTATE_VALUES:
             rotate_degrees = 0
@@ -101,10 +87,6 @@ class CameraCaptureDialog(tk.Toplevel):
         self.camera_width_var = tk.IntVar(value=max(0, int(camera_width)))
         self.camera_height_var = tk.IntVar(value=max(0, int(camera_height)))
         self.camera_preset_var = tk.StringVar(value=size_to_preset_label(camera_width, camera_height))
-        self.camera_stream_max_fps_var = tk.DoubleVar(value=self._clamp_camera_stream_max_fps(camera_stream_max_fps))
-        self.camera_preview_max_fps_var = tk.DoubleVar(value=self._clamp_camera_preview_max_fps(camera_preview_max_fps))
-        self.linuxcnc_safe_preview_var = tk.BooleanVar(value=bool(linuxcnc_safe_preview))
-        self.profile_preview_var = tk.BooleanVar(value=bool(profile_preview))
         self.rotate_var = tk.StringVar(value=str(int(rotate_degrees)))
         self.flip_x_var = tk.BooleanVar(value=bool(flip_x))
         self.flip_y_var = tk.BooleanVar(value=bool(flip_y))
@@ -158,13 +140,6 @@ class CameraCaptureDialog(tk.Toplevel):
         )
         preset_combo.pack(side=tk.LEFT, padx=(4, 8))
         preset_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_resolution_preset())
-
-        ttk.Label(connection, text="Capture FPS").pack(side=tk.LEFT)
-        ttk.Entry(connection, textvariable=self.camera_stream_max_fps_var, width=5).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Label(connection, text="Preview FPS").pack(side=tk.LEFT)
-        ttk.Entry(connection, textvariable=self.camera_preview_max_fps_var, width=5).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Checkbutton(connection, text="LinuxCNC Safe", variable=self.linuxcnc_safe_preview_var, command=self.apply_linuxcnc_safe_preview).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(connection, text="Profile", variable=self.profile_preview_var).pack(side=tk.LEFT, padx=(0, 8))
 
         ttk.Button(connection, text="Open / Restart Camera", command=self.open_camera).pack(
             side=tk.LEFT, padx=(0, 8)
@@ -304,52 +279,6 @@ class CameraCaptureDialog(tk.Toplevel):
         except (tk.TclError, TypeError, ValueError):
             return 0
 
-    def _clamp_camera_stream_max_fps(self, value: object) -> float:
-        try:
-            fps = float(value)
-        except (tk.TclError, TypeError, ValueError):
-            fps = DEFAULT_CAMERA_STREAM_MAX_FPS
-        return max(1.0, min(60.0, fps))
-
-    def _get_camera_stream_max_fps(self) -> float:
-        fps = self._clamp_camera_stream_max_fps(self.camera_stream_max_fps_var.get())
-        try:
-            if abs(float(self.camera_stream_max_fps_var.get()) - fps) > 1e-9:
-                self.camera_stream_max_fps_var.set(fps)
-        except (tk.TclError, TypeError, ValueError):
-            self.camera_stream_max_fps_var.set(fps)
-        return fps
-
-    def _clamp_camera_preview_max_fps(self, value: object) -> float:
-        try:
-            fps = float(value)
-        except (tk.TclError, TypeError, ValueError):
-            fps = DEFAULT_CAMERA_PREVIEW_MAX_FPS
-        return max(0.2, min(60.0, fps))
-
-    def _get_camera_preview_max_fps(self) -> float:
-        fps = self._clamp_camera_preview_max_fps(self.camera_preview_max_fps_var.get())
-        try:
-            if abs(float(self.camera_preview_max_fps_var.get()) - fps) > 1e-9:
-                self.camera_preview_max_fps_var.set(fps)
-        except (tk.TclError, TypeError, ValueError):
-            self.camera_preview_max_fps_var.set(fps)
-        return fps
-
-    def apply_linuxcnc_safe_preview(self) -> None:
-        if not bool(self.linuxcnc_safe_preview_var.get()):
-            return
-        self.camera_stream_max_fps_var.set(5.0)
-        self.camera_preview_max_fps_var.set(2.0)
-        self.show_grid_var.set(False)
-        self.status_var.set("LinuxCNC Safe preview: capture 5 fps, display 2 fps, low-priority preview work.")
-
-    def _profile_enabled(self) -> bool:
-        try:
-            return bool(self.profile_preview_var.get())
-        except tk.TclError:
-            return False
-
     def _get_rotate_degrees(self) -> int:
         try:
             rotate_degrees = int(self.rotate_var.get())
@@ -381,24 +310,13 @@ class CameraCaptureDialog(tk.Toplevel):
             self.status_var.set(f"Camera {index} did not open. {error}")
             return
 
-        if bool(self.linuxcnc_safe_preview_var.get()):
-            try:
-                cv2.setNumThreads(1)
-            except Exception:
-                pass
-        fps_cap = self._get_camera_stream_max_fps()
-        preview_fps = self._get_camera_preview_max_fps()
-        self._last_preview_sequence = 0
-        self._next_preview_due = 0.0
-        self._preview_count = 0
-        stream = CameraStream(cap, info, max_fps=fps_cap)
+        stream = CameraStream(cap, info)
         stream.start()
         self.cap = stream
 
         status = (
             f"Camera {index} open via {info.backend_name}. Requested {info.requested_size_text}; "
-            f"actual {info.actual_size_text}; format {info.fourcc}; read cap {fps_cap:g} fps; "
-            f"preview cap {preview_fps:g} fps. "
+            f"actual {info.actual_size_text}; format {info.fourcc}. "
             "X+ is right and Y+ is up in the transformed preview."
         )
         if info.warning:
@@ -421,44 +339,17 @@ class CameraCaptureDialog(tk.Toplevel):
     def _schedule_next_frame(self) -> None:
         if self._closing:
             return
-        delay_ms = 50
-        if self._next_preview_due > 0.0:
-            delay_ms = max(20, int(max(0.0, self._next_preview_due - time.monotonic()) * 1000.0))
-        self.after_job = self.after(delay_ms, self._update_preview)
+        self.after_job = self.after(50, self._update_preview)
 
     def _update_preview(self) -> None:
         self.after_job = None
         if self._closing or self.cap is None:
             return
 
-        now = time.monotonic()
-        if self._next_preview_due > 0.0 and now < self._next_preview_due:
-            self._schedule_next_frame()
-            return
-
-        preview_interval = 1.0 / self._get_camera_preview_max_fps()
-        self._next_preview_due = now + preview_interval
-
-        t0 = time.perf_counter()
-        result = self.cap.get_latest_frame_with_id()
-        t_get = time.perf_counter()
-        if result is not None:
-            frame, sequence, _timestamp = result
-            if sequence != self._last_preview_sequence:
-                self._last_preview_sequence = sequence
-                self.current_frame_bgr = frame
-                self._show_frame(frame)
-                self._preview_count += 1
-                if self._profile_enabled():
-                    stats = self.cap.stats()
-                    print(
-                        "FabScan camera capture-preview "
-                        f"seq={sequence} get_ms={(t_get - t0) * 1000.0:.1f} "
-                        f"total_ms={(time.perf_counter() - t0) * 1000.0:.1f} "
-                        f"cap_fps={stats.get('read_fps', 0.0):.2f} preview_count={self._preview_count} "
-                        f"dropped={stats.get('dropped_count', 0.0):.0f}",
-                        flush=True,
-                    )
+        frame = self.cap.get_latest_frame()
+        if frame is not None:
+            self.current_frame_bgr = frame
+            self._show_frame(frame)
         else:
             message = self.cap.status_message()
             if message:
@@ -578,10 +469,6 @@ class CameraCaptureDialog(tk.Toplevel):
             camera_index=self._get_camera_index(),
             requested_width=width,
             requested_height=height,
-            camera_stream_max_fps=self._get_camera_stream_max_fps(),
-            camera_preview_max_fps=self._get_camera_preview_max_fps(),
-            linuxcnc_safe_preview=bool(self.linuxcnc_safe_preview_var.get()),
-            profile_preview=bool(self.profile_preview_var.get()),
             rotate_degrees=self._get_rotate_degrees(),
             flip_x=bool(self.flip_x_var.get()),
             flip_y=bool(self.flip_y_var.get()),

@@ -1,6 +1,164 @@
-# FabScan v0.5.14 - Follow Settle / Line Quality
+## v0.5.26 - Safe Preview / Frame Dropping
 
-v0.5.14 is a camera-follow tuning build. It adds a user-settable settle delay after follow moves and adds live line-quality feedback so camera height, focus, lighting, and search-box size are easier to judge while testing.
+- About/title updated to `FabScan v0.5.26 - Safe Preview / Frame Dropping`.
+- Added separate camera `Capture FPS` and `Preview FPS` controls. Capture can keep reading at a low rate while the Tk/PIL/ImageTk display work runs even slower.
+- Added a `LinuxCNC Safe` preview preset. In Camera Calibration it sets capture to 5 fps, preview display to 1 fps, disables line preview, dot marker preview, mask preview, Corner pause, and Corner assist. In Camera Capture it sets capture to 5 fps and preview display to 2 fps.
+- Camera preview loops now use queue-size-one/latest-frame behavior with sequence numbers. They drop stale/repeated frames and do not resize/convert/draw/ImageTk-update unless a new preview frame is actually due.
+- Camera wait/pump loops can still keep `current_frame_bgr` fresh for follow/calibration, but they no longer have to redraw the GUI every 50 ms.
+- When LinuxCNC Safe preview is enabled, FabScan attempts `cv2.setNumThreads(1)` to keep OpenCV/native processing from spreading across cores.
+- Added a `Profile` checkbox for preview timing logs. Camera Calibration profiling reports transform, dot detection, line detection, mask/RGB conversion, resize, overlay, ImageTk, total frame time, achieved capture FPS, preview count, and replaced/dropped frame count.
+- No intentional changes to follow motion math, progress lock, corner assist, or DXF export. This release is about reducing and instrumenting preview/display CPU load after LinuxCNC isolation testing showed FabScan preview was the trigger, not raw UVC streaming.
+
+## v0.5.25 - RT-Friendly Camera / Saved Knobs
+
+- About/title updated to `FabScan v0.5.25 - RT-Friendly Camera / Saved Knobs`.
+- Camera preview reader now caps background reads at a saved `FPS cap` value, default 20 fps, instead of reading as fast as OpenCV/camera buffering allows.
+- Camera reader uses `stop_event.wait()` for capped sleeps and failed-read backoff so camera shutdown stays responsive.
+- Camera Capture and Camera Calibration expose/save the shared camera `FPS cap` setting.
+- Corner/Hough/intersection detection is skipped unless `Corner pause` is enabled, so straight-line/curve testing with corner handling off avoids unnecessary per-frame CPU work.
+- Camera calibration/follow settings are saved immediately when the calibration dialog closes, including the growing follow-control knob set, so the next FabScan session starts with the previous test settings.
+- No intended change to line-follow motion math, progress lock, corner assist, or DXF export.
+
+## v0.5.24 - Progress Lock / Latch Fix
+
+- Fixed a follow-latch reset bug: reading the Start dir control no longer writes the same value back to the Tk variable every step, which could fire the variable trace and clear the heading/progress latch during Follow N. This likely prevented the v0.5.23 reverse guard from seeing the prior move.
+- Progress continuity now uses the last successful commanded move before the older heading latch when both are available.
+- Replaced the silent tangent-only reverse fallback with a hard, visible Progress Lock: if the final commanded move would reverse relative to recent travel, the move is refused before LinuxCNC motion is sent. Status reports the progress dot value, e.g. `progress +0.93` or `dot -0.98` when refused.
+- No corner/intersection-assist behavior was intentionally expanded in this release. This is focused on stopping the E/F back-and-forth sticking behavior from reaching the DXF.
+- About/title updated to `FabScan v0.5.24 - Progress Lock / Latch Fix`.
+
+## v0.5.23 - Tangent Direction Continuity
+
+This build targets the back-and-forth "stuck" behavior seen on the standard test sheet, especially the radius/tangent transition and circle tests.
+
+- Added stronger signed tangent continuity for follow stabilization.
+  - `cv2.fitLine` gives a line axis, not a travel arrow. FabScan now orients the fitted pixel tangent against the current latched machine-space travel heading before applying the EMA angle filter.
+  - This reduces the chance that a valid-looking line fit silently becomes a 180-degree reversed motion command.
+- Added a commanded-move reverse guard.
+  - After tangent and side correction are combined, FabScan checks whether the resulting move would reverse against the previous successful travel direction.
+  - If the combined move tries to reverse, FabScan strips side correction once and sends the tangent-only move when that is safe.
+  - If the tangent itself would still reverse, the step is refused and the user is asked to use `Find Line / Edge` if the reversal is intentional.
+- The last successful move direction is now remembered separately from the line-fit latch so full curves/circles have an extra continuity reference.
+- Corner Assist remains unchanged; this release is focused on normal straight/curve follow stability.
+- About/title updated to `FabScan v0.5.23 - Tangent Direction Continuity`.
+
+## v0.5.22 - Follow Stabilization
+
+This build pauses corner expansion work and strengthens the normal follow detector underneath it.
+
+- Added `Stabilize` controls under Single-Step Follow.
+  - Default: enabled.
+  - `Err α` default: `0.35` for EMA filtering of raw pixel offset.
+  - `Ang α` default: `0.25` for EMA filtering of detected tangent direction.
+  - `Sanity°` default: `30`; after a heading is latched, a non-corner frame whose heading jumps beyond this is rejected instead of becoming motion. Set to `0` to disable this sanity reject.
+- Added contour continuity scoring.
+  - Once a line/edge has been accepted, contour selection now penalizes candidates that jump far from the previous filtered offset or disagree with the latched/filtered heading.
+  - This is meant to reduce silent jumps to the other edge of a line or another nearby feature.
+- Follow motion now uses the filtered offset/angle before applying Deadband/Gain/Max correct.
+- `Find Line / Edge`, Start dir changes, preview/search setting changes, and STOP reset the follow filter/latch cleanly.
+- Corner Assist from v0.5.21 remains present, but this version is deliberately staged before Lucas-Kanade optical flow, Kalman filtering, or PID/P+D control.
+- About/title updated to `FabScan v0.5.22 - Follow Stabilization`.
+
+## v0.5.21 - Corner Intersection Assist
+
+This build adds the first practical corner-following assist for Camera Calibration / Single-Step Follow.
+
+- Added `Corner assist` under Single-Step Follow.
+  - When `Corner pause` and `Corner assist` are enabled, FabScan tries to use the two Hough-detected line directions to compute the actual corner/intersection point.
+  - If the computed intersection is safe and close enough, FabScan drives the camera/crosshair to that intersection instead of stopping and forcing manual Find/Step driving through the corner.
+  - After the corner move succeeds, FabScan latches the selected outgoing `Start dir` (`X+`, `X-`, `Y+`, `Y-`) so the next follow step continues down the new leg.
+- Added `Lookahead` steps for Corner Assist.
+  - Default: `5`.
+  - The maximum corner-intersection move is `Lookahead × Step`, clamped to 1–10 lookahead steps.
+  - If the calculated corner is farther away than the lookahead window, FabScan refuses the assist and falls back to the safe pause behavior.
+- The live overlay/status now reports and marks the fitted corner intersection when available.
+- `Follow N` count is no longer capped at 50.
+  - It now accepts up to `9999` steps for longer full-shape tests.
+  - Each individual move is still bounded by the normal step/correction/corner-assist safety checks, and `STOP Move` remains available.
+- About/title updated to `FabScan v0.5.21 - Corner Intersection Assist`.
+
+## v0.5.20 - Live Entry Fix
+
+Small Camera Calibration usability fix:
+
+- Search px now tolerates partial typing/backspacing while Overlay is enabled.
+- This prevents Tkinter callback errors when the Search px box is temporarily empty during live preview.
+- No motion, corner, or detection behavior was intentionally changed from v0.5.19.
+
+# FabScan v0.5.19 - Corner Resume / Entry Fix
+
+v0.5.19 is a small fix build for Camera Calibration corner-follow testing. It fixes the Corner° field so it can be edited normally while Overlay is enabled, and it makes the corner-pause continuation workflow usable after clicking Find Line/Edge at a corner.
+
+## What changed in v0.5.19
+
+- Fixed the `Corner°` entry typing bug.
+  - It no longer clamps/replaces the value while the user is actively typing.
+  - This fixes the behavior where backspace could force the field to `10`, then later typing could force it to `135`, especially while the live line overlay was enabled.
+- Improved corner-pause resume behavior.
+  - When corner pause stops at a possible corner/intersection, choose the next `Start dir`, then click `Find Line / Edge`.
+  - If the frame still contains a corner candidate, FabScan arms a one-shot resume: the next follow move bypasses corner pause once so it can step out of the ambiguous L-shaped search area.
+  - During that one resume step, FabScan can choose between the Hough primary/secondary corner directions instead of only the averaged line fit.
+  - Side correction is skipped for that single corner-resume step, because the normal line-center correction may be based on an averaged/diagonal corner fit.
+- No changes to jog, calibration motion, or DXF export.
+- About/title updated to `FabScan v0.5.19 - Corner Resume / Entry Fix`.
+
+## What changed in v0.5.18
+
+
+
+- Camera Calibration right-side control panel now has its own vertical scrollbar.
+- Dot Center Jog and Single-Step Follow controls remain in the same right column, but the column can scroll on shorter displays.
+- Mouse wheel scrolling works when the pointer is over the right-side control panel.
+- No follow/detection/motion logic changed from v0.5.17.
+- About/title updated to `FabScan v0.5.18 - Calibration Right Panel Scroll`.
+
+## What changed in v0.5.17
+
+- Camera Calibration `Single-Step Follow` now has a saved `Corner pause` option.
+  - Default: enabled.
+  - When FabScan sees two strong line directions in the search box, it pauses/refuses the next follow move instead of blindly fitting one diagonal/averaged line through the corner.
+- Added saved `Corner°` setting.
+  - Default: `55°`.
+  - This is the minimum angle between detected line directions before the corner/intersection pause can trigger.
+- The line/edge status now reports secondary-direction/corner information when available, for example `corner 89°/0.42`.
+- The old `Forward` / `Reverse` follow direction selector is replaced with `Start dir`: `X+`, `X-`, `Y+`, or `Y-`.
+  - First follow step chooses the fitted-line direction whose machine-space projection matches the selected axis/sign.
+  - Later steps still latch to the previous successful machine-space heading.
+  - This makes testing more repeatable; for example, a mostly Y move can always start as Y+ or Y- instead of depending on an arbitrary fit-line sign.
+- About/title updated to `FabScan v0.5.17 - Corner Pause / Axis Latch`.
+
+This is intended to address the sharp-corner tests where a square search box sees both legs of an L-shaped corner and rounds/blends through it. The first implementation is deliberately conservative: pause at the corner, then let the user reposition/select the next start direction and continue.
+
+v0.5.16 is a camera-follow tuning/UI build. It adds side-correction deadband/gain so Line center follow stops chasing tiny frame-to-frame offsets, and it makes the Camera Calibration status box readable while live updates are still coming in.
+
+## What changed in v0.5.16
+
+- Camera Calibration `Single-Step Follow` now has saved `Deadband` and `Gain` fields.
+  - `Deadband` default: `0.003` machine units.
+  - `Gain` default: `0.50`.
+  - `Max correct` remains the hard side-correction limit.
+- Side correction now behaves like this:
+  - if the raw correction is inside the deadband, no side correction is applied;
+  - if it is outside the deadband, the deadband is subtracted and the remaining correction is multiplied by Gain;
+  - the result is still limited by `Max correct`.
+- Follow status now reports raw correction vs applied correction, plus the active deadband/gain values.
+- The Camera Calibration status panel no longer snaps back to the bottom while the user has scrolled up to read older/top lines. It still auto-scrolls when already at the bottom.
+- About/title updated to `FabScan v0.5.16 - Follow Deadband / Status Scroll`.
+
+This is intended to reduce the edge-to-edge hunting seen in Line center mode, especially on thin printed lines where small detection jitter can otherwise cause side correction on every step.
+
+## What changed in v0.5.15
+
+- Camera Calibration `Single-Step Follow` now has a saved `Max turn°` field.
+  - Default: `70°`
+  - Allowed range: `0°` to `180°`
+  - `0°` disables the heading-change stop.
+- After the first follow heading is latched, each next detected heading is compared to the previous successful machine-space heading.
+- If the detected heading change is greater than `Max turn°`, FabScan refuses the move and stops Follow N.
+- The stop message tells the user to click `Find Line / Edge` to reset the latch when the stop is an intentional corner.
+- About/title updated to `FabScan v0.5.15 - Heading Change Stop`.
+
+This is intended to catch the sharp-corner case where a large search box sees both legs of a corner and starts averaging/rounding through it.
 
 ## What changed in v0.5.14
 
@@ -72,7 +230,7 @@ Resolution: 800 x 600
 
 Avoid `1280 x 720` unless the status line confirms the camera actually returns that size reliably.
 
-## Suggested line-follow settings from v0.5.14 testing
+## Suggested line-follow settings from v0.5.17/v0.5.18 testing
 
 For thin printed-line tests with the camera close to the paper:
 
@@ -81,9 +239,15 @@ Mode: Line center
 Step: 0.030
 Feed: 100 units/min
 Settle ms: 150 to 300
-Max correct: 0.010 to 0.012
+Max turn°: 50 to 75
+Corner pause: enabled
+Corner°: 55
+Start dir: X+/X-/Y+/Y- based on intended first machine direction
+Max correct: 0.005 to 0.012
+Deadband: 0.002 to 0.005
+Gain: 0.35 to 0.75
 Min conf: 45 to 55
-Search px: 175 to 200
+Search px: 175 to 250
 Count: 10 to 50
 ```
 
@@ -94,12 +258,18 @@ Mode: Line center
 Step: 0.025 to 0.050
 Feed: 5.0 units/min to start, then increase as confidence improves
 Settle ms: 150
+Max turn°: 70
+Corner pause: enabled
+Corner°: 55
+Start dir: choose X+/X-/Y+/Y- for the intended first move
 Max correct: 0.010 or 0.015
+Deadband: 0.003
+Gain: 0.50
 Min conf: 55 or 60
 Count: 10 to 50
 ```
 
-If the first follow step goes the wrong way, change Direction and click `Find Line / Edge` again before running Follow N.
+If the first follow step goes the wrong way, change `Start dir` and click `Find Line / Edge` again before running Follow N.
 
 ## Safety boundary
 

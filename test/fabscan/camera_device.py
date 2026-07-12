@@ -12,9 +12,6 @@ import numpy as np
 
 DEFAULT_CAMERA_WIDTH = 800
 DEFAULT_CAMERA_HEIGHT = 600
-DEFAULT_CAMERA_STREAM_MAX_FPS = 20.0
-DEFAULT_CAMERA_PREVIEW_MAX_FPS = 10.0
-
 
 # Put the known-good microscope-camera size first. Keep 1280x720 last because
 # many UVC microscope cameras do not expose that mode even though it is common
@@ -157,10 +154,9 @@ class CameraStream:
     status instead of looking frozen.
     """
 
-    def __init__(self, cap: cv2.VideoCapture, info: CameraOpenInfo, *, max_fps: float = DEFAULT_CAMERA_STREAM_MAX_FPS) -> None:
+    def __init__(self, cap: cv2.VideoCapture, info: CameraOpenInfo) -> None:
         self.cap = cap
         self.info = info
-        self.max_fps = self._clamp_max_fps(max_fps)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -169,23 +165,6 @@ class CameraStream:
         self._read_count = 0
         self._fail_count = 0
         self._last_error = "Waiting for first camera frame..."
-        # Queue-size-one semantics: keep only the newest frame and tag it with
-        # a monotonically increasing sequence so GUI preview loops can skip
-        # stale/repeated frames instead of converting/drawing the same image
-        # over and over.
-        self._latest_sequence = 0
-        self._dropped_count = 0
-        self._started_time = time.monotonic()
-
-    @staticmethod
-    def _clamp_max_fps(value: float) -> float:
-        try:
-            fps = float(value)
-        except (TypeError, ValueError):
-            fps = DEFAULT_CAMERA_STREAM_MAX_FPS
-        # 0/negative would create a tight loop or divide-by-zero; 60 is more
-        # than enough for FabScan previews and keeps accidental entries sane.
-        return max(1.0, min(60.0, fps))
 
     def start(self) -> None:
         if self._thread is not None:
@@ -194,9 +173,7 @@ class CameraStream:
         self._thread.start()
 
     def _reader_loop(self) -> None:
-        target_interval = 1.0 / self.max_fps
         while not self._stop_event.is_set():
-            loop_start = time.monotonic()
             try:
                 ok, frame = self.cap.read()
             except Exception as exc:
@@ -209,12 +186,9 @@ class CameraStream:
             now = time.monotonic()
             with self._lock:
                 if ok and frame is not None:
-                    if self._latest_frame is not None:
-                        self._dropped_count += 1
                     self._latest_frame = frame
                     self._latest_time = now
                     self._read_count += 1
-                    self._latest_sequence += 1
                     self._fail_count = 0
                     self._last_error = ""
                 else:
@@ -222,48 +196,16 @@ class CameraStream:
                     self._last_error = error
 
             if not ok:
-                self._stop_event.wait(0.05)
-            else:
-                elapsed = time.monotonic() - loop_start
-                remaining = target_interval - elapsed
-                if remaining > 0.0:
-                    self._stop_event.wait(remaining)
+                time.sleep(0.05)
 
     def get_latest_frame(self, *, copy: bool = True) -> Optional[np.ndarray]:
-        result = self.get_latest_frame_with_id(copy=copy)
-        if result is None:
-            return None
-        frame, _sequence, _timestamp = result
-        return frame
-
-    def get_latest_frame_with_id(self, *, copy: bool = True) -> Optional[tuple[np.ndarray, int, float]]:
-        """Return the newest frame plus its sequence number and timestamp.
-
-        Preview code should compare the sequence number with the last displayed
-        frame. If it is unchanged, there is no new work to do.
-        """
-
         with self._lock:
             frame = self._latest_frame
             if frame is None:
                 return None
-            sequence = self._latest_sequence
-            timestamp = self._latest_time
             if copy:
-                frame = frame.copy()
-            return frame, sequence, timestamp
-
-    def stats(self) -> dict[str, float]:
-        with self._lock:
-            elapsed = max(1e-9, time.monotonic() - self._started_time)
-            return {
-                "read_count": float(self._read_count),
-                "fail_count": float(self._fail_count),
-                "dropped_count": float(self._dropped_count),
-                "read_fps": float(self._read_count) / elapsed,
-                "latest_sequence": float(self._latest_sequence),
-                "latest_age": (time.monotonic() - self._latest_time) if self._latest_time > 0.0 else 0.0,
-            }
+                return frame.copy()
+            return frame
 
     def status_message(self) -> str:
         with self._lock:
