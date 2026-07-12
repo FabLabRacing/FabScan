@@ -1,3 +1,13 @@
+## v0.5.3.1 - Position Delay Experiment
+
+- Adds an experimental Stage 2B/2C position-history path in Camera Calibration. FabScan keeps a short rolling LinuxCNC position history during follow moves, jog waits, and post-move checks.
+- Adds `Use delayed pos` and `Delay ms` controls to Single-Step Follow. The old behavior remains the default with delayed position OFF.
+- When delayed position is enabled, FabScan matches the current camera frame timestamp to a delayed/interpolated LinuxCNC position sample, plans the camera-derived move from that historical position, then converts it back into a safe incremental command from the current position. The command is still bounded by the existing Follow Step + Max correct limit and progress lock.
+- Timeline CSV rows now include run/session IDs, run step numbers, delayed-position fields, target-base position, original frame move, and command adjustment values.
+- Follow N now starts a fresh run ID and resets the follow/progress latch at the start of each new Follow N, avoiding stale-latch behavior between separate tests.
+- No velocity-jog loop, virtual machine target, Z motion, torch/plasma control, corner-assist behavior, or DXF export changes were intentionally added.
+- About/title updated to `FabScan v0.5.3.1 - Position Delay Experiment`.
+
 ## v0.5.3.0 - Stage 2 Timeline Logging
 
 - Starts Stage 2 as instrumentation only. No follow math, jog behavior, corner logic, or DXF export behavior is intentionally changed.

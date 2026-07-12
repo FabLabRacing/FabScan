@@ -112,6 +112,15 @@ class CornerAssistMove:
 
 
 @dataclass
+class PositionHistorySample:
+    timestamp_s: float
+    x: float
+    y: float
+    z: float
+    source: str = ""
+
+
+@dataclass
 class CameraCalibrationDialogResult:
     camera_index: int
     requested_width: int
@@ -155,6 +164,8 @@ class CameraCalibrationDialogResult:
     follow_enabled: bool
     follow_repeat_count: int
     follow_timeline_log_enabled: bool
+    follow_use_delayed_position: bool
+    follow_position_delay_ms: int
     calibration: Optional[dict[str, Any]] = None
 
 
@@ -214,11 +225,13 @@ class CameraCalibrationDialog(tk.Toplevel):
         follow_enabled: bool = False,
         follow_repeat_count: int = 5,
         follow_timeline_log_enabled: bool = False,
+        follow_use_delayed_position: bool = False,
+        follow_position_delay_ms: int = 120,
         existing_calibration: Optional[dict[str, Any]] = None,
         trace_capture_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.3.0")
+        self.title("FabScan Camera Calibration Lite - v0.5.3.1")
         self.minsize(1080, 650)
         # Give the dialog an explicit starting size so Tk does not keep
         # recomputing the top-level size as live preview/status content changes.
@@ -274,6 +287,11 @@ class CameraCalibrationDialog(tk.Toplevel):
         self._timeline_log_file: Optional[Any] = None
         self._timeline_csv: Optional[csv.DictWriter] = None
         self._timeline_step_counter = 0
+        self._follow_run_counter = 0
+        self._active_follow_run_id = 0
+        self._active_follow_run_step = 0
+        self._position_history: list[PositionHistorySample] = []
+        self._position_history_window_s = 8.0
         self.trace_capture_callback = trace_capture_callback
         self.active_calibration: Optional[dict[str, Any]] = self._validate_calibration(existing_calibration)
 
@@ -324,6 +342,8 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.follow_enabled_var = tk.BooleanVar(value=bool(follow_enabled))
         self.follow_repeat_count_var = tk.IntVar(value=max(1, min(9999, int(follow_repeat_count))))
         self.follow_timeline_log_var = tk.BooleanVar(value=bool(follow_timeline_log_enabled))
+        self.follow_use_delayed_position_var = tk.BooleanVar(value=bool(follow_use_delayed_position))
+        self.follow_position_delay_ms_var = tk.IntVar(value=self._clamp_follow_position_delay_ms(follow_position_delay_ms))
         self.dot_status_var = tk.StringVar(value="Dot: —")
         self.line_status_var = tk.StringVar(value="Line/edge: —")
         self.cal_status_var = tk.StringVar(value="Open camera, center the calibration dot, then click Find Dot.")
@@ -671,13 +691,22 @@ class CameraCalibrationDialog(tk.Toplevel):
             variable=self.follow_timeline_log_var,
             command=self._on_timeline_log_toggle,
         ).grid(row=20, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ttk.Checkbutton(
+            follow_tools,
+            text="Use delayed pos",
+            variable=self.follow_use_delayed_position_var,
+        ).grid(row=21, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ttk.Label(follow_tools, text="Delay ms").grid(row=22, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_position_delay_ms_var, width=8).grid(
+            row=22, column=1, sticky="ew", padx=(4, 0), pady=(5, 0)
+        )
         ttk.Button(follow_tools, text="Follow Step", command=self.follow_line_single_step).grid(
-            row=21, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+            row=23, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
         ttk.Button(follow_tools, text="Follow N", command=self.follow_line_multiple_steps).grid(
-            row=22, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+            row=24, column=0, columnspan=2, sticky="ew", pady=(4, 0)
         )
-        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=23, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=25, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         follow_tools.columnconfigure(1, weight=1)
 
     def _on_timeline_log_toggle(self) -> None:
@@ -709,11 +738,28 @@ class CameraCalibrationDialog(tk.Toplevel):
             "step_label",
             "result",
             "reason",
+            "run_id",
+            "run_step",
             "frame_sequence",
             "frame_timestamp_s",
             "frame_age_ms",
             "capture_fps",
             "preview_fps",
+            "use_delayed_position",
+            "position_delay_ms",
+            "frame_target_time_s",
+            "delayed_position_found",
+            "delayed_position_source",
+            "delayed_position_age_ms",
+            "delayed_position_error_ms",
+            "delayed_x",
+            "delayed_y",
+            "target_base_x",
+            "target_base_y",
+            "frame_move_x",
+            "frame_move_y",
+            "command_adjust_x",
+            "command_adjust_y",
             "linuxcnc_read_ms",
             "status_ok",
             "task_state",
@@ -771,6 +817,8 @@ class CameraCalibrationDialog(tk.Toplevel):
                 result="ok",
                 capture_fps=self._get_camera_stream_max_fps(),
                 preview_fps=self._get_camera_preview_max_fps(),
+                use_delayed_position=bool(self.follow_use_delayed_position_var.get()),
+                position_delay_ms=self._get_follow_position_delay_ms(),
             )
             return path
         except OSError as exc:
@@ -844,6 +892,8 @@ class CameraCalibrationDialog(tk.Toplevel):
                 "timestamp_iso": datetime.now().isoformat(timespec="milliseconds"),
                 "monotonic_s": f"{time.monotonic():.6f}",
                 "event": event,
+                "run_id": int(getattr(self, "_active_follow_run_id", 0) or 0),
+                "run_step": int(getattr(self, "_active_follow_run_step", 0) or 0),
             }
         )
         row.update(self._timeline_frame_fields())
@@ -1114,6 +1164,22 @@ class CameraCalibrationDialog(tk.Toplevel):
         except (tk.TclError, TypeError, ValueError):
             self.follow_settle_ms_var.set(settle_ms)
         return settle_ms
+
+    def _clamp_follow_position_delay_ms(self, value: object) -> int:
+        try:
+            delay_ms = int(round(float(value)))
+        except (tk.TclError, TypeError, ValueError):
+            delay_ms = 120
+        return max(0, min(1000, delay_ms))
+
+    def _get_follow_position_delay_ms(self) -> int:
+        delay_ms = self._clamp_follow_position_delay_ms(self.follow_position_delay_ms_var.get())
+        try:
+            if int(self.follow_position_delay_ms_var.get()) != delay_ms:
+                self.follow_position_delay_ms_var.set(delay_ms)
+        except (tk.TclError, TypeError, ValueError):
+            self.follow_position_delay_ms_var.set(delay_ms)
+        return delay_ms
 
     def _clamp_follow_max_heading_change(self, value: object) -> float:
         try:
@@ -2741,6 +2807,101 @@ class CameraCalibrationDialog(tk.Toplevel):
             return False
         return True
 
+    def _record_position_history(self, status: LinuxCNCPositionStatus, *, source: str, timestamp_s: Optional[float] = None) -> Optional[PositionHistorySample]:
+        if not getattr(status, "connected", False):
+            return None
+        try:
+            x, y, z = self._active_position(status)
+        except Exception:
+            return None
+        now = time.monotonic() if timestamp_s is None else float(timestamp_s)
+        sample = PositionHistorySample(now, float(x), float(y), float(z), source)
+        self._position_history.append(sample)
+        cutoff = now - self._position_history_window_s
+        while self._position_history and self._position_history[0].timestamp_s < cutoff:
+            self._position_history.pop(0)
+        return sample
+
+    def _lookup_position_history(self, target_time_s: float) -> Optional[PositionHistorySample]:
+        samples = self._position_history
+        if not samples:
+            return None
+        if target_time_s <= samples[0].timestamp_s:
+            return samples[0]
+        if target_time_s >= samples[-1].timestamp_s:
+            return samples[-1]
+
+        prev = samples[0]
+        for nxt in samples[1:]:
+            if nxt.timestamp_s >= target_time_s:
+                span = nxt.timestamp_s - prev.timestamp_s
+                if span <= 1e-9:
+                    return prev
+                ratio = (target_time_s - prev.timestamp_s) / span
+                return PositionHistorySample(
+                    target_time_s,
+                    prev.x + ((nxt.x - prev.x) * ratio),
+                    prev.y + ((nxt.y - prev.y) * ratio),
+                    prev.z + ((nxt.z - prev.z) * ratio),
+                    f"interp:{prev.source}->{nxt.source}",
+                )
+            prev = nxt
+        return samples[-1]
+
+    def _delayed_position_plan_fields(
+        self,
+        *,
+        current_x: float,
+        current_y: float,
+        frame_move_x: float,
+        frame_move_y: float,
+    ) -> tuple[float, float, dict[str, Any]]:
+        delay_ms = self._get_follow_position_delay_ms()
+        use_delayed = bool(self.follow_use_delayed_position_var.get())
+        fields: dict[str, Any] = {
+            "use_delayed_position": use_delayed,
+            "position_delay_ms": delay_ms,
+            "frame_move_x": f"{frame_move_x:.6f}",
+            "frame_move_y": f"{frame_move_y:.6f}",
+            "target_base_x": f"{current_x:.6f}",
+            "target_base_y": f"{current_y:.6f}",
+            "command_adjust_x": "0.000000",
+            "command_adjust_y": "0.000000",
+        }
+        if not use_delayed:
+            return current_x, current_y, fields
+
+        frame_ts = float(getattr(self, "current_frame_timestamp", 0.0) or 0.0)
+        if frame_ts <= 0.0:
+            fields["delayed_position_found"] = False
+            fields["delayed_position_source"] = "no frame timestamp"
+            return current_x, current_y, fields
+
+        target_time = frame_ts - (delay_ms / 1000.0)
+        fields["frame_target_time_s"] = f"{target_time:.6f}"
+        sample = self._lookup_position_history(target_time)
+        if sample is None:
+            fields["delayed_position_found"] = False
+            fields["delayed_position_source"] = "no position history"
+            return current_x, current_y, fields
+
+        now = time.monotonic()
+        fields.update(
+            {
+                "delayed_position_found": True,
+                "delayed_position_source": sample.source,
+                "delayed_position_age_ms": f"{(now - sample.timestamp_s) * 1000.0:.3f}",
+                "delayed_position_error_ms": f"{(sample.timestamp_s - target_time) * 1000.0:.3f}",
+                "delayed_x": f"{sample.x:.6f}",
+                "delayed_y": f"{sample.y:.6f}",
+                "target_base_x": f"{sample.x:.6f}",
+                "target_base_y": f"{sample.y:.6f}",
+                "command_adjust_x": f"{sample.x - current_x:.6f}",
+                "command_adjust_y": f"{sample.y - current_y:.6f}",
+            }
+        )
+        return sample.x, sample.y, fields
+
     def _wait_for_position_near(
         self,
         target_x: float,
@@ -2757,6 +2918,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.update()
             self._pump_camera_frame()
             status = self.linuxcnc_reader.read_status()
+            self._record_position_history(status, source="wait_position")
             if status.connected:
                 x, y, _z = self._active_position(status)
                 error = math.hypot(float(x) - float(target_x), float(y) - float(target_y))
@@ -2783,6 +2945,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         while time.monotonic() < end_time:
             self.update()
             status = self.linuxcnc_reader.read_status()
+            self._record_position_history(status, source="wait_idle")
             if status.connected:
                 last_message = f"state {status.task_state}, mode {status.task_mode}, interp {status.interp_state}"
                 if status.interp_state == "IDLE":
@@ -3092,9 +3255,29 @@ class CameraCalibrationDialog(tk.Toplevel):
         head_unit = (heading[0] / head_len, heading[1] / head_len)
         return self._angle_between_unit_vectors(prev_unit, head_unit)
 
+    def _begin_follow_run(self, label: str, *, requested_steps: int, reset_latch: bool) -> None:
+        self._follow_run_counter += 1
+        self._active_follow_run_id = self._follow_run_counter
+        self._active_follow_run_step = 0
+        if reset_latch:
+            self._clear_follow_heading()
+        self._timeline_log(
+            "RUN_START",
+            result="begin",
+            reason=label,
+            use_delayed_position=bool(self.follow_use_delayed_position_var.get()),
+            position_delay_ms=self._get_follow_position_delay_ms(),
+            capture_fps=f"{self._get_camera_stream_max_fps():.3f}",
+            preview_fps=f"{self._get_camera_preview_max_fps():.3f}",
+            move_len=f"{self._get_follow_step():.6f}",
+            min_confidence=f"{self._get_follow_min_confidence():.3f}",
+            applied_correct_len=f"{self._get_follow_max_correct():.6f}",
+        )
+
     def follow_line_single_step(self) -> None:
         """Move one bounded step along the detected line/edge."""
 
+        self._begin_follow_run("Follow Step", requested_steps=1, reset_latch=False)
         self._follow_stop_requested = False
         self._follow_line_step_impl(step_label="Follow Step", show_dialogs=True)
 
@@ -3121,6 +3304,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.follow_line_single_step()
             return
 
+        self._begin_follow_run("Follow N", requested_steps=count, reset_latch=True)
         self._follow_stop_requested = False
         completed = 0
         self.cal_status_var.set(f"Follow N starting: {count} requested steps.")
@@ -3141,6 +3325,11 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.cal_status_var.set(f"Follow N complete: {completed}/{count} steps completed.")
         else:
             self.cal_status_var.set(f"Follow N stopped after {completed}/{count} completed steps. {last}")
+        self._timeline_log(
+            "RUN_END",
+            result="stopped" if self._follow_stop_requested else ("complete" if completed >= count else "incomplete"),
+            reason=self.cal_status_var.get(),
+        )
         self._show_current_frame()
 
     def _follow_line_step_impl(self, *, step_label: str, show_dialogs: bool) -> bool:
@@ -3149,6 +3338,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         step_start_time = time.monotonic()
         self._timeline_step_counter += 1
         step_id = self._timeline_step_counter
+        self._active_follow_run_step += 1
         self._timeline_log(
             "STEP_START",
             step_id=step_id,
@@ -3156,6 +3346,8 @@ class CameraCalibrationDialog(tk.Toplevel):
             result="begin",
             capture_fps=f"{self._get_camera_stream_max_fps():.3f}",
             preview_fps=f"{self._get_camera_preview_max_fps():.3f}",
+            use_delayed_position=bool(self.follow_use_delayed_position_var.get()),
+            position_delay_ms=self._get_follow_position_delay_ms(),
         )
 
         if self._motion_active:
@@ -3192,6 +3384,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         status_read_start = time.monotonic()
         status = self.linuxcnc_reader.read_status()
         status_read_ms = (time.monotonic() - status_read_start) * 1000.0
+        self._record_position_history(status, source="step_status")
         status_ok = self._status_ok_for_calibration(status)
         start_status_x = ""
         start_status_y = ""
@@ -3414,6 +3607,29 @@ class CameraCalibrationDialog(tk.Toplevel):
             move_x, move_y, total_limited = self._limit_move_vector(move_x, move_y, max_total)
             move_len = math.hypot(move_x, move_y)
 
+        start_x, start_y, _z = self._active_position(status)
+        frame_move_x = move_x
+        frame_move_y = move_y
+        target_base_x, target_base_y, delay_fields = self._delayed_position_plan_fields(
+            current_x=start_x,
+            current_y=start_y,
+            frame_move_x=frame_move_x,
+            frame_move_y=frame_move_y,
+        )
+        target_x = target_base_x + frame_move_x
+        target_y = target_base_y + frame_move_y
+        move_x = target_x - start_x
+        move_y = target_y - start_y
+        delay_limited = False
+        max_total_for_delay = max(0.001, follow_step + max_correct)
+        move_x, move_y, delay_limited = self._limit_move_vector(move_x, move_y, max_total_for_delay)
+        if delay_limited:
+            target_x = start_x + move_x
+            target_y = start_y + move_y
+            prior_state = correction_state
+            correction_state = f"{prior_state}; delay command limited" if prior_state else "delay command limited"
+        move_len = math.hypot(move_x, move_y)
+
         progress_dot: Optional[float] = None
         progress_lock_refused = False
         previous_move = self._follow_last_move_unit or self._follow_heading_unit
@@ -3444,6 +3660,7 @@ class CameraCalibrationDialog(tk.Toplevel):
                 move_x=f"{move_x:.6f}",
                 move_y=f"{move_y:.6f}",
                 move_len=f"{move_len:.6f}",
+                **delay_fields,
                 **self._timeline_line_fields(line),
             )
             self.cal_status_var.set(
@@ -3470,9 +3687,6 @@ class CameraCalibrationDialog(tk.Toplevel):
             return False
 
         max_heading_change = self._get_follow_max_heading_change()
-        start_x, start_y, _z = self._active_position(status)
-        target_x = start_x + move_x
-        target_y = start_y + move_y
         feed = self._get_follow_feed()
         settle_ms = self._get_follow_settle_ms()
         coordinate_mode = self.coordinate_mode_label
@@ -3501,6 +3715,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             heading_change_degrees=f"{heading_change:.3f}" if heading_change is not None else "",
             progress_dot=f"{progress_dot:.6f}" if progress_dot is not None else "",
             correction_state=correction_state,
+            **delay_fields,
             **self._timeline_line_fields(line),
         )
 
@@ -3603,6 +3818,7 @@ class CameraCalibrationDialog(tk.Toplevel):
                 new_line = self._stabilize_follow_line(new_line, frame_w=frame_w, frame_h=frame_h)
             self.current_line = new_line
             post_status = self.linuxcnc_reader.read_status()
+            self._record_position_history(post_status, source="post_detection")
             post_x = ""
             post_y = ""
             if post_status.connected:
@@ -3787,6 +4003,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         timeline_step_label: str = "",
     ) -> bool:
         start_status = self.linuxcnc_reader.read_status()
+        self._record_position_history(start_status, source="jog_start")
         start_x, start_y, _z = self._active_position(start_status)
 
         if abs(move_x) >= 0.0005:
@@ -3928,6 +4145,8 @@ class CameraCalibrationDialog(tk.Toplevel):
             follow_enabled=bool(self.follow_enabled_var.get()),
             follow_repeat_count=self._get_follow_repeat_count(),
             follow_timeline_log_enabled=bool(self.follow_timeline_log_var.get()),
+            follow_use_delayed_position=bool(self.follow_use_delayed_position_var.get()),
+            follow_position_delay_ms=self._get_follow_position_delay_ms(),
             calibration=calibration or self.active_calibration,
         )
 

@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.3.0"
-APP_TITLE = f"FabScan v{APP_VERSION} - Stage 2 Timeline Logging"
+APP_VERSION = "0.5.3.1"
+APP_TITLE = f"FabScan v{APP_VERSION} - Position Delay Experiment"
 
 
 class FabScanApp(tk.Tk):
@@ -2114,6 +2114,8 @@ class FabScanApp(tk.Tk):
             "camera_follow_enabled": bool(self.settings.get("camera_follow_enabled", False)),
             "camera_follow_repeat_count": int(self.settings.get("camera_follow_repeat_count", 5)),
             "camera_follow_timeline_log_enabled": bool(self.settings.get("camera_follow_timeline_log_enabled", False)),
+            "camera_follow_use_delayed_position": bool(self.settings.get("camera_follow_use_delayed_position", False)),
+            "camera_follow_position_delay_ms": int(self.settings.get("camera_follow_position_delay_ms", 120)),
             "camera_calibration": self.settings.get("camera_calibration", None),
         }
 
@@ -2196,6 +2198,7 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
+            "v0.5.3.1 adds an experimental position-delay mode for Stage 2 testing: FabScan can keep a short LinuxCNC position history and, when enabled, plan a follow move from the machine position that best matches the camera frame timestamp. The old current-position behavior remains the default.\n\n"
             "v0.5.22 adds Follow Stabilization: contour continuity scoring, EMA filtering for offset/angle, and a heading sanity reject so one bad frame is less likely to become motion.\n\n"
             "Corner Assist remains available from v0.5.21, and Follow N still allows large tests up to 9999 steps.\n\n"
             f"Settings file:\n{get_settings_path()}",
@@ -2447,6 +2450,8 @@ class FabScanApp(tk.Tk):
         follow_enabled = self.safe_bool_from_settings("camera_follow_enabled", False)
         follow_repeat_count = self.safe_int_from_settings("camera_follow_repeat_count", 5)
         follow_timeline_log_enabled = self.safe_bool_from_settings("camera_follow_timeline_log_enabled", False)
+        follow_use_delayed_position = self.safe_bool_from_settings("camera_follow_use_delayed_position", False)
+        follow_position_delay_ms = self.safe_int_from_settings("camera_follow_position_delay_ms", 120)
         existing_calibration = self.settings.get("camera_calibration", None)
 
         dialog = CameraCalibrationDialog(
@@ -2495,6 +2500,8 @@ class FabScanApp(tk.Tk):
             follow_enabled=follow_enabled,
             follow_repeat_count=follow_repeat_count,
             follow_timeline_log_enabled=follow_timeline_log_enabled,
+            follow_use_delayed_position=follow_use_delayed_position,
+            follow_position_delay_ms=follow_position_delay_ms,
             existing_calibration=existing_calibration,
             trace_capture_callback=self.capture_trace_point,
         )
@@ -2545,6 +2552,8 @@ class FabScanApp(tk.Tk):
         self.settings["camera_follow_enabled"] = dialog.result.follow_enabled
         self.settings["camera_follow_repeat_count"] = dialog.result.follow_repeat_count
         self.settings["camera_follow_timeline_log_enabled"] = dialog.result.follow_timeline_log_enabled
+        self.settings["camera_follow_use_delayed_position"] = dialog.result.follow_use_delayed_position
+        self.settings["camera_follow_position_delay_ms"] = dialog.result.follow_position_delay_ms
 
         if dialog.result.calibration:
             self.settings["camera_calibration"] = dialog.result.calibration
