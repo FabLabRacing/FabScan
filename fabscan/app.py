@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.26"
-APP_TITLE = f"FabScan v{APP_VERSION} - Safe Preview / Frame Dropping"
+APP_VERSION = "0.5.3.0"
+APP_TITLE = f"FabScan v{APP_VERSION} - Stage 2 Timeline Logging"
 
 
 class FabScanApp(tk.Tk):
@@ -2113,6 +2113,7 @@ class FabScanApp(tk.Tk):
             "camera_follow_capture_point": bool(self.settings.get("camera_follow_capture_point", False)),
             "camera_follow_enabled": bool(self.settings.get("camera_follow_enabled", False)),
             "camera_follow_repeat_count": int(self.settings.get("camera_follow_repeat_count", 5)),
+            "camera_follow_timeline_log_enabled": bool(self.settings.get("camera_follow_timeline_log_enabled", False)),
             "camera_calibration": self.settings.get("camera_calibration", None),
         }
 
@@ -2445,6 +2446,7 @@ class FabScanApp(tk.Tk):
         follow_capture_point = self.safe_bool_from_settings("camera_follow_capture_point", False)
         follow_enabled = self.safe_bool_from_settings("camera_follow_enabled", False)
         follow_repeat_count = self.safe_int_from_settings("camera_follow_repeat_count", 5)
+        follow_timeline_log_enabled = self.safe_bool_from_settings("camera_follow_timeline_log_enabled", False)
         existing_calibration = self.settings.get("camera_calibration", None)
 
         dialog = CameraCalibrationDialog(
@@ -2492,6 +2494,7 @@ class FabScanApp(tk.Tk):
             follow_capture_point=follow_capture_point,
             follow_enabled=follow_enabled,
             follow_repeat_count=follow_repeat_count,
+            follow_timeline_log_enabled=follow_timeline_log_enabled,
             existing_calibration=existing_calibration,
             trace_capture_callback=self.capture_trace_point,
         )
@@ -2541,6 +2544,7 @@ class FabScanApp(tk.Tk):
         self.settings["camera_follow_capture_point"] = dialog.result.follow_capture_point
         self.settings["camera_follow_enabled"] = dialog.result.follow_enabled
         self.settings["camera_follow_repeat_count"] = dialog.result.follow_repeat_count
+        self.settings["camera_follow_timeline_log_enabled"] = dialog.result.follow_timeline_log_enabled
 
         if dialog.result.calibration:
             self.settings["camera_calibration"] = dialog.result.calibration

@@ -1,3 +1,11 @@
+## v0.5.3.0 - Stage 2 Timeline Logging
+
+- Starts Stage 2 as instrumentation only. No follow math, jog behavior, corner logic, or DXF export behavior is intentionally changed.
+- Camera Calibration now has a `Timeline log` checkbox in the Single-Step Follow panel. When enabled, FabScan writes a CSV under `~/FabScan Logs/`.
+- The timeline CSV records Follow Step / Follow N events including frame sequence, frame age, LinuxCNC status-read timing, pre-move position, detection confidence/offset/angle, move plan, jog timing, settle timing, post-move position, and post-move detection.
+- This is meant to help measure the camera/machine-position delay problem before attempting virtual-target or velocity-follow control.
+- About/title updated to `FabScan v0.5.3.0 - Stage 2 Timeline Logging`.
+
 ## v0.5.26 - Safe Preview / Frame Dropping
 
 - About/title updated to `FabScan v0.5.26 - Safe Preview / Frame Dropping`.

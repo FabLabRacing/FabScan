@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+import csv
 import math
+from pathlib import Path
 import time
 from typing import Any, Callable, Optional
 
@@ -152,6 +154,7 @@ class CameraCalibrationDialogResult:
     follow_capture_point: bool
     follow_enabled: bool
     follow_repeat_count: int
+    follow_timeline_log_enabled: bool
     calibration: Optional[dict[str, Any]] = None
 
 
@@ -210,11 +213,12 @@ class CameraCalibrationDialog(tk.Toplevel):
         follow_capture_point: bool = False,
         follow_enabled: bool = False,
         follow_repeat_count: int = 5,
+        follow_timeline_log_enabled: bool = False,
         existing_calibration: Optional[dict[str, Any]] = None,
         trace_capture_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.25")
+        self.title("FabScan Camera Calibration Lite - v0.5.3.0")
         self.minsize(1080, 650)
         # Give the dialog an explicit starting size so Tk does not keep
         # recomputing the top-level size as live preview/status content changes.
@@ -226,6 +230,8 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.result: Optional[CameraCalibrationDialogResult] = None
         self.cap: Optional[CameraStream] = None
         self.current_frame_bgr: Optional[np.ndarray] = None
+        self.current_frame_sequence: int = 0
+        self.current_frame_timestamp: float = 0.0
         self.current_dot: DotDetection = DotDetection(False)
         self.current_line: LineDetection = LineDetection(False)
         # Fixed live-preview box. Without this, the PhotoImage size can change
@@ -264,6 +270,10 @@ class CameraCalibrationDialog(tk.Toplevel):
         self._last_preview_sequence = 0
         self._next_preview_due = 0.0
         self._preview_count = 0
+        self._timeline_log_path: Optional[Path] = None
+        self._timeline_log_file: Optional[Any] = None
+        self._timeline_csv: Optional[csv.DictWriter] = None
+        self._timeline_step_counter = 0
         self.trace_capture_callback = trace_capture_callback
         self.active_calibration: Optional[dict[str, Any]] = self._validate_calibration(existing_calibration)
 
@@ -313,6 +323,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.follow_capture_point_var = tk.BooleanVar(value=bool(follow_capture_point))
         self.follow_enabled_var = tk.BooleanVar(value=bool(follow_enabled))
         self.follow_repeat_count_var = tk.IntVar(value=max(1, min(9999, int(follow_repeat_count))))
+        self.follow_timeline_log_var = tk.BooleanVar(value=bool(follow_timeline_log_enabled))
         self.dot_status_var = tk.StringVar(value="Dot: —")
         self.line_status_var = tk.StringVar(value="Line/edge: —")
         self.cal_status_var = tk.StringVar(value="Open camera, center the calibration dot, then click Find Dot.")
@@ -654,14 +665,201 @@ class CameraCalibrationDialog(tk.Toplevel):
             text="Capture after move",
             variable=self.follow_capture_point_var,
         ).grid(row=19, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ttk.Checkbutton(
+            follow_tools,
+            text="Timeline log",
+            variable=self.follow_timeline_log_var,
+            command=self._on_timeline_log_toggle,
+        ).grid(row=20, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
         ttk.Button(follow_tools, text="Follow Step", command=self.follow_line_single_step).grid(
-            row=20, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+            row=21, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
         ttk.Button(follow_tools, text="Follow N", command=self.follow_line_multiple_steps).grid(
-            row=21, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+            row=22, column=0, columnspan=2, sticky="ew", pady=(4, 0)
         )
-        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=22, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=23, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         follow_tools.columnconfigure(1, weight=1)
+
+    def _on_timeline_log_toggle(self) -> None:
+        """Open or close the Stage 2 timeline logger from the Follow panel."""
+
+        if self._timeline_log_enabled():
+            path = self._open_timeline_log()
+            if path is not None:
+                self.cal_status_var.set(f"Timeline log enabled: {path}")
+        else:
+            path = self._timeline_log_path
+            self._close_timeline_log()
+            if path is not None:
+                self.cal_status_var.set(f"Timeline log closed: {path}")
+
+    def _timeline_log_enabled(self) -> bool:
+        try:
+            return bool(self.follow_timeline_log_var.get())
+        except tk.TclError:
+            return False
+
+    @staticmethod
+    def _timeline_fields() -> tuple[str, ...]:
+        return (
+            "timestamp_iso",
+            "monotonic_s",
+            "event",
+            "step_id",
+            "step_label",
+            "result",
+            "reason",
+            "frame_sequence",
+            "frame_timestamp_s",
+            "frame_age_ms",
+            "capture_fps",
+            "preview_fps",
+            "linuxcnc_read_ms",
+            "status_ok",
+            "task_state",
+            "task_mode",
+            "interp_state",
+            "start_x",
+            "start_y",
+            "post_x",
+            "post_y",
+            "target_x",
+            "target_y",
+            "move_x",
+            "move_y",
+            "move_len",
+            "tangent_x",
+            "tangent_y",
+            "correct_x",
+            "correct_y",
+            "raw_correct_len",
+            "applied_correct_len",
+            "confidence",
+            "min_confidence",
+            "pixel_error_x",
+            "pixel_error_y",
+            "angle_degrees",
+            "span_px",
+            "width_px",
+            "point_count",
+            "search_px",
+            "heading_state",
+            "heading_change_degrees",
+            "progress_dot",
+            "correction_state",
+            "corner_candidate",
+            "corner_angle_degrees",
+            "corner_strength",
+            "duration_ms",
+        )
+
+    def _open_timeline_log(self) -> Optional[Path]:
+        if self._timeline_csv is not None and self._timeline_log_path is not None:
+            return self._timeline_log_path
+        try:
+            log_dir = Path.home() / "FabScan Logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / f"fabscan_timeline_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.csv"
+            file = path.open("w", newline="", encoding="utf-8")
+            writer = csv.DictWriter(file, fieldnames=self._timeline_fields(), extrasaction="ignore")
+            writer.writeheader()
+            self._timeline_log_file = file
+            self._timeline_csv = writer
+            self._timeline_log_path = path
+            self._timeline_log(
+                "SESSION_START",
+                result="ok",
+                capture_fps=self._get_camera_stream_max_fps(),
+                preview_fps=self._get_camera_preview_max_fps(),
+            )
+            return path
+        except OSError as exc:
+            self._timeline_log_file = None
+            self._timeline_csv = None
+            self._timeline_log_path = None
+            try:
+                self.follow_timeline_log_var.set(False)
+            except tk.TclError:
+                pass
+            self.cal_status_var.set(f"Timeline log could not open: {exc}")
+            return None
+
+    def _close_timeline_log(self) -> None:
+        file = self._timeline_log_file
+        self._timeline_csv = None
+        self._timeline_log_file = None
+        if file is not None:
+            try:
+                file.close()
+            except OSError:
+                pass
+
+    def _timeline_frame_fields(self) -> dict[str, Any]:
+        now = time.monotonic()
+        frame_ts = float(getattr(self, "current_frame_timestamp", 0.0) or 0.0)
+        return {
+            "frame_sequence": int(getattr(self, "current_frame_sequence", 0) or 0),
+            "frame_timestamp_s": f"{frame_ts:.6f}" if frame_ts > 0.0 else "",
+            "frame_age_ms": f"{(now - frame_ts) * 1000.0:.3f}" if frame_ts > 0.0 else "",
+        }
+
+    @staticmethod
+    def _timeline_line_fields(line: Optional[LineDetection]) -> dict[str, Any]:
+        if line is None:
+            return {}
+        return {
+            "confidence": f"{float(line.confidence):.3f}",
+            "pixel_error_x": f"{float(line.pixel_error_x):.3f}",
+            "pixel_error_y": f"{float(line.pixel_error_y):.3f}",
+            "angle_degrees": f"{float(line.angle_degrees):.3f}",
+            "span_px": f"{float(line.span_px):.3f}",
+            "width_px": f"{float(line.width_px):.3f}",
+            "point_count": int(line.point_count),
+            "search_px": int(line.search_px),
+            "corner_candidate": bool(line.corner_candidate),
+            "corner_angle_degrees": f"{float(line.corner_angle_degrees):.3f}",
+            "corner_strength": f"{float(line.corner_strength):.3f}",
+        }
+
+    def _timeline_log(self, event: str, **kwargs: Any) -> None:
+        """Write one Stage 2 timeline event.
+
+        This is intentionally low-rate: it logs Follow Step / Follow N decisions
+        and jog timing, not every preview frame. That keeps the RT-safe preview
+        gains from v0.5.26 intact while giving us a time-aligned flight recorder.
+        """
+
+        if not self._timeline_log_enabled():
+            return
+        if self._timeline_csv is None:
+            if self._open_timeline_log() is None:
+                return
+        writer = self._timeline_csv
+        file = self._timeline_log_file
+        if writer is None or file is None:
+            return
+        row: dict[str, Any] = {field: "" for field in self._timeline_fields()}
+        row.update(
+            {
+                "timestamp_iso": datetime.now().isoformat(timespec="milliseconds"),
+                "monotonic_s": f"{time.monotonic():.6f}",
+                "event": event,
+            }
+        )
+        row.update(self._timeline_frame_fields())
+        for key, value in kwargs.items():
+            if key in row:
+                row[key] = value
+        try:
+            writer.writerow(row)
+            file.flush()
+        except OSError as exc:
+            try:
+                self.follow_timeline_log_var.set(False)
+            except tk.TclError:
+                pass
+            self.cal_status_var.set(f"Timeline log disabled after write error: {exc}")
+            self._close_timeline_log()
 
     def _register_traces(self) -> None:
         watched_vars: tuple[tk.Variable, ...] = (
@@ -1191,6 +1389,8 @@ class CameraCalibrationDialog(tk.Toplevel):
     def open_camera(self) -> None:
         self.release_camera()
         self.current_frame_bgr = None
+        self.current_frame_sequence = 0
+        self.current_frame_timestamp = 0.0
         self.current_dot = DotDetection(False)
         self.current_line = LineDetection(False)
         self._update_threshold_label()
@@ -1269,11 +1469,13 @@ class CameraCalibrationDialog(tk.Toplevel):
         result = self.cap.get_latest_frame_with_id()
         t_get = time.perf_counter()
         if result is not None:
-            frame, sequence, _timestamp = result
+            frame, sequence, timestamp = result
             if sequence == self._last_camera_sequence and not display:
                 return False
             self._last_camera_sequence = sequence
             self.current_frame_bgr = frame
+            self.current_frame_sequence = int(sequence)
+            self.current_frame_timestamp = float(timestamp)
             if display and sequence != self._last_preview_sequence:
                 self._last_preview_sequence = sequence
                 self._show_frame(frame)
@@ -2944,24 +3146,41 @@ class CameraCalibrationDialog(tk.Toplevel):
     def _follow_line_step_impl(self, *, step_label: str, show_dialogs: bool) -> bool:
         """Shared implementation for one camera-derived line/edge follow step."""
 
+        step_start_time = time.monotonic()
+        self._timeline_step_counter += 1
+        step_id = self._timeline_step_counter
+        self._timeline_log(
+            "STEP_START",
+            step_id=step_id,
+            step_label=step_label,
+            result="begin",
+            capture_fps=f"{self._get_camera_stream_max_fps():.3f}",
+            preview_fps=f"{self._get_camera_preview_max_fps():.3f}",
+        )
+
         if self._motion_active:
+            self._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="refused", reason="motion active")
             if show_dialogs:
                 messagebox.showinfo("Motion active", "Wait for the current motion to finish or press STOP Move.", parent=self)
             return False
         if self._manual_jog_active:
+            self._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="refused", reason="manual jog active")
             return False
         if not bool(self.follow_enabled_var.get()):
+            self._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="refused", reason="follow disabled")
             if show_dialogs:
                 messagebox.showinfo("Follow disabled", "Check Enable follow before using Follow Step.", parent=self)
             return False
 
         calibration = self._validate_calibration(self.active_calibration)
         if calibration is None:
+            self._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="refused", reason="no valid calibration")
             if show_dialogs:
                 messagebox.showinfo("No calibration", "Run calibration first, then use Follow Step.", parent=self)
             self.cal_status_var.set("Follow refused: no valid camera calibration.")
             return False
         if self.current_frame_bgr is None:
+            self._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="refused", reason="no camera frame")
             if show_dialogs:
                 messagebox.showinfo("No camera frame", "No camera frame is available yet.", parent=self)
             self.cal_status_var.set("Follow refused: no camera frame is available.")
@@ -2970,17 +3189,64 @@ class CameraCalibrationDialog(tk.Toplevel):
         transformed_for_size = self.get_transformed_frame_bgr(self.current_frame_bgr)
         frame_h, frame_w = transformed_for_size.shape[:2]
 
+        status_read_start = time.monotonic()
         status = self.linuxcnc_reader.read_status()
-        if not self._status_ok_for_calibration(status):
+        status_read_ms = (time.monotonic() - status_read_start) * 1000.0
+        status_ok = self._status_ok_for_calibration(status)
+        start_status_x = ""
+        start_status_y = ""
+        if status.connected:
+            try:
+                start_status_x, start_status_y, _status_z = self._active_position(status)
+            except Exception:
+                start_status_x = ""
+                start_status_y = ""
+        self._timeline_log(
+            "STATUS_READ",
+            step_id=step_id,
+            step_label=step_label,
+            linuxcnc_read_ms=f"{status_read_ms:.3f}",
+            status_ok=bool(status_ok),
+            task_state=status.task_state,
+            task_mode=status.task_mode,
+            interp_state=status.interp_state,
+            start_x=f"{float(start_status_x):.6f}" if start_status_x != "" else "",
+            start_y=f"{float(start_status_y):.6f}" if start_status_y != "" else "",
+        )
+        if not status_ok:
             message = status.error or self._status_not_ready_message(status)
+            self._timeline_log(
+                "STEP_REFUSED",
+                step_id=step_id,
+                step_label=step_label,
+                result="refused",
+                reason=message,
+                linuxcnc_read_ms=f"{status_read_ms:.3f}",
+                status_ok=False,
+                task_state=status.task_state,
+                task_mode=status.task_mode,
+                interp_state=status.interp_state,
+            )
             if show_dialogs:
                 messagebox.showerror("LinuxCNC not ready", message, parent=self)
             self.cal_status_var.set(message)
             return False
 
+        detection_start = time.monotonic()
         line = self.detect_line()
+        detection_ms = (time.monotonic() - detection_start) * 1000.0
+        self._timeline_log(
+            "DETECTION",
+            step_id=step_id,
+            step_label=step_label,
+            result="found" if line.found else "not_found",
+            reason=line.message,
+            duration_ms=f"{detection_ms:.3f}",
+            **self._timeline_line_fields(line),
+        )
         if not line.found:
             self.current_line = line
+            self._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="refused", reason=line.message)
             self.cal_status_var.set(line.message)
             if show_dialogs:
                 messagebox.showinfo("Line/edge not found", line.message, parent=self)
@@ -2989,6 +3255,14 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         if not self._follow_detection_sanity_ok(line, step_label=step_label):
             self.current_line = line
+            self._timeline_log(
+                "STEP_REFUSED",
+                step_id=step_id,
+                step_label=step_label,
+                result="refused",
+                reason=self.cal_status_var.get(),
+                **self._timeline_line_fields(line),
+            )
             self._show_current_frame()
             return False
 
@@ -2997,9 +3271,17 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         min_confidence = self._get_follow_min_confidence()
         if line.confidence < min_confidence:
-            self.cal_status_var.set(
-                f"{step_label} refused: confidence {line.confidence:.0f}% is below minimum {min_confidence:.0f}%."
+            reason = f"confidence {line.confidence:.0f}% is below minimum {min_confidence:.0f}%"
+            self._timeline_log(
+                "STEP_REFUSED",
+                step_id=step_id,
+                step_label=step_label,
+                result="refused",
+                reason=reason,
+                min_confidence=f"{min_confidence:.3f}",
+                **self._timeline_line_fields(line),
             )
+            self.cal_status_var.set(f"{step_label} refused: {reason}.")
             self._show_current_frame()
             return False
 
@@ -3008,6 +3290,7 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         correction = self._machine_correction_from_pixel_error(line.pixel_error_x, line.pixel_error_y)
         if correction is None:
+            self._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="refused", reason="saved calibration could not be used for line following")
             if show_dialogs:
                 messagebox.showerror("Bad calibration", "Saved calibration could not be used for line following.", parent=self)
             self.cal_status_var.set("Follow failed: saved calibration could not be used for line following.")
@@ -3150,6 +3433,19 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         if progress_lock_refused:
             dot_text = f"{progress_dot:+.2f}" if progress_dot is not None else "unknown"
+            reason = f"progress lock blocked reverse move (dot {dot_text})"
+            self._timeline_log(
+                "STEP_REFUSED",
+                step_id=step_id,
+                step_label=step_label,
+                result="refused",
+                reason=reason,
+                progress_dot=f"{progress_dot:.6f}" if progress_dot is not None else "",
+                move_x=f"{move_x:.6f}",
+                move_y=f"{move_y:.6f}",
+                move_len=f"{move_len:.6f}",
+                **self._timeline_line_fields(line),
+            )
             self.cal_status_var.set(
                 f"{step_label} refused: progress lock blocked a reverse move "
                 f"(dot {dot_text}). Use Find Line/Edge to reset the latch if this reversal is intentional."
@@ -3158,6 +3454,17 @@ class CameraCalibrationDialog(tk.Toplevel):
             return False
 
         if move_len < 0.0005:
+            self._timeline_log(
+                "STEP_REFUSED",
+                step_id=step_id,
+                step_label=step_label,
+                result="refused",
+                reason="calculated move is tiny",
+                move_x=f"{move_x:.6f}",
+                move_y=f"{move_y:.6f}",
+                move_len=f"{move_len:.6f}",
+                **self._timeline_line_fields(line),
+            )
             self.cal_status_var.set(f"{step_label}: calculated move is tiny. No move sent.")
             self._show_current_frame()
             return False
@@ -3169,6 +3476,33 @@ class CameraCalibrationDialog(tk.Toplevel):
         feed = self._get_follow_feed()
         settle_ms = self._get_follow_settle_ms()
         coordinate_mode = self.coordinate_mode_label
+
+        self._timeline_log(
+            "MOVE_PLAN",
+            step_id=step_id,
+            step_label=step_label,
+            result="planned",
+            status_ok=True,
+            start_x=f"{start_x:.6f}",
+            start_y=f"{start_y:.6f}",
+            target_x=f"{target_x:.6f}",
+            target_y=f"{target_y:.6f}",
+            move_x=f"{move_x:.6f}",
+            move_y=f"{move_y:.6f}",
+            move_len=f"{move_len:.6f}",
+            tangent_x=f"{tangent_x:.6f}",
+            tangent_y=f"{tangent_y:.6f}",
+            correct_x=f"{correct_x:.6f}",
+            correct_y=f"{correct_y:.6f}",
+            raw_correct_len=f"{raw_correct_len:.6f}",
+            applied_correct_len=f"{applied_correct_len:.6f}",
+            min_confidence=f"{min_confidence:.3f}",
+            heading_state=heading_state,
+            heading_change_degrees=f"{heading_change:.3f}" if heading_change is not None else "",
+            progress_dot=f"{progress_dot:.6f}" if progress_dot is not None else "",
+            correction_state=correction_state,
+            **self._timeline_line_fields(line),
+        )
 
         self._manual_jog_active = True
         try:
@@ -3208,8 +3542,39 @@ class CameraCalibrationDialog(tk.Toplevel):
                 f"{turn_text}{move_detail}"
             )
             self.update()
-            if not self._send_correction_jogs(move_x, move_y, target_x, target_y, feed, coordinate_mode):
+            send_start = time.monotonic()
+            if not self._send_correction_jogs(
+                move_x,
+                move_y,
+                target_x,
+                target_y,
+                feed,
+                coordinate_mode,
+                timeline_step_id=step_id,
+                timeline_step_label=step_label,
+            ):
+                self._timeline_log(
+                    "MOVE_FAILED",
+                    step_id=step_id,
+                    step_label=step_label,
+                    result="failed",
+                    reason=self.cal_status_var.get(),
+                    duration_ms=f"{(time.monotonic() - send_start) * 1000.0:.3f}",
+                    move_x=f"{move_x:.6f}",
+                    move_y=f"{move_y:.6f}",
+                    move_len=f"{move_len:.6f}",
+                )
                 return False
+            self._timeline_log(
+                "MOVE_SENT",
+                step_id=step_id,
+                step_label=step_label,
+                result="ok",
+                duration_ms=f"{(time.monotonic() - send_start) * 1000.0:.3f}",
+                move_x=f"{move_x:.6f}",
+                move_y=f"{move_y:.6f}",
+                move_len=f"{move_len:.6f}",
+            )
 
             # Motion succeeded. Latch the machine-space heading used for this
             # step so the next detection cannot flip 180 degrees. For Corner
@@ -3218,8 +3583,18 @@ class CameraCalibrationDialog(tk.Toplevel):
             move_unit = self._normalize_unit_vector(move_x, move_y)
             if move_unit is not None:
                 self._follow_last_move_unit = move_unit
+            settle_start = time.monotonic()
             self._wait_and_pump_camera(settle_ms / 1000.0)
+            self._timeline_log(
+                "SETTLE_DONE",
+                step_id=step_id,
+                step_label=step_label,
+                result="ok",
+                duration_ms=f"{(time.monotonic() - settle_start) * 1000.0:.3f}",
+            )
+            post_detection_start = time.monotonic()
             new_line = self.detect_line()
+            post_detection_ms = (time.monotonic() - post_detection_start) * 1000.0
             if correction_state == "corner assist":
                 # The old-leg filter would fight the new outgoing leg. Re-seed
                 # after the corner move if the next leg is visible.
@@ -3227,6 +3602,28 @@ class CameraCalibrationDialog(tk.Toplevel):
             if new_line.found:
                 new_line = self._stabilize_follow_line(new_line, frame_w=frame_w, frame_h=frame_h)
             self.current_line = new_line
+            post_status = self.linuxcnc_reader.read_status()
+            post_x = ""
+            post_y = ""
+            if post_status.connected:
+                try:
+                    post_x, post_y, _post_z = self._active_position(post_status)
+                except Exception:
+                    post_x = ""
+                    post_y = ""
+            self._timeline_log(
+                "POST_DETECTION",
+                step_id=step_id,
+                step_label=step_label,
+                result="found" if new_line.found else "not_found",
+                reason=new_line.message,
+                post_x=f"{float(post_x):.6f}" if post_x != "" else "",
+                post_y=f"{float(post_y):.6f}" if post_y != "" else "",
+                target_x=f"{target_x:.6f}",
+                target_y=f"{target_y:.6f}",
+                duration_ms=f"{post_detection_ms:.3f}",
+                **self._timeline_line_fields(new_line),
+            )
             capture_text = ""
             if bool(self.follow_capture_point_var.get()) and self.trace_capture_callback is not None:
                 self.trace_capture_callback()
@@ -3238,6 +3635,18 @@ class CameraCalibrationDialog(tk.Toplevel):
                 )
             else:
                 self.cal_status_var.set(f"{step_label} complete, but the line/edge was not found afterward." + capture_text)
+            self._timeline_log(
+                "STEP_COMPLETE",
+                step_id=step_id,
+                step_label=step_label,
+                result="ok",
+                duration_ms=f"{(time.monotonic() - step_start_time) * 1000.0:.3f}",
+                move_x=f"{move_x:.6f}",
+                move_y=f"{move_y:.6f}",
+                move_len=f"{move_len:.6f}",
+                target_x=f"{target_x:.6f}",
+                target_y=f"{target_y:.6f}",
+            )
             self._show_current_frame()
             return True
         finally:
@@ -3315,6 +3724,23 @@ class CameraCalibrationDialog(tk.Toplevel):
         feed = self._get_feed()
         coordinate_mode = self.coordinate_mode_label
 
+        self._timeline_log(
+            "CENTER_DOT_MOVE_PLAN",
+            step_label="Center Dot",
+            result="planned",
+            status_ok=True,
+            start_x=f"{start_x:.6f}",
+            start_y=f"{start_y:.6f}",
+            target_x=f"{target_x:.6f}",
+            target_y=f"{target_y:.6f}",
+            move_x=f"{move_x:.6f}",
+            move_y=f"{move_y:.6f}",
+            move_len=f"{vector_len:.6f}",
+            pixel_error_x=f"{err_x:.3f}",
+            pixel_error_y=f"{err_y:.3f}",
+            reason="limited" if limited else "",
+        )
+
         self._manual_jog_active = True
         try:
             limit_text = " limited" if limited else ""
@@ -3322,7 +3748,15 @@ class CameraCalibrationDialog(tk.Toplevel):
                 f"Center Dot:{limit_text} correction X{move_x:+.4f} Y{move_y:+.4f} "
                 f"from pixel error X{err_x:+.1f} Y{err_y:+.1f}."
             )
-            if not self._send_correction_jogs(move_x, move_y, target_x, target_y, feed, coordinate_mode):
+            if not self._send_correction_jogs(
+                move_x,
+                move_y,
+                target_x,
+                target_y,
+                feed,
+                coordinate_mode,
+                timeline_step_label="Center Dot",
+            ):
                 return
             self._wait_and_pump_camera(0.20)
             new_dot = self.detect_dot()
@@ -3348,6 +3782,9 @@ class CameraCalibrationDialog(tk.Toplevel):
         target_y: float,
         feed: float,
         coordinate_mode: str,
+        *,
+        timeline_step_id: int = 0,
+        timeline_step_label: str = "",
     ) -> bool:
         start_status = self.linuxcnc_reader.read_status()
         start_x, start_y, _z = self._active_position(start_status)
@@ -3355,24 +3792,92 @@ class CameraCalibrationDialog(tk.Toplevel):
         if abs(move_x) >= 0.0005:
             direction = 1 if move_x >= 0.0 else -1
             distance = abs(move_x)
+            event_start = time.monotonic()
+            self._timeline_log(
+                "JOG_X_START",
+                step_id=timeline_step_id,
+                step_label=timeline_step_label,
+                result="begin",
+                start_x=f"{start_x:.6f}",
+                start_y=f"{start_y:.6f}",
+                target_x=f"{start_x + move_x:.6f}",
+                target_y=f"{start_y:.6f}",
+                move_x=f"{move_x:.6f}",
+                move_y="0.000000",
+                move_len=f"{distance:.6f}",
+            )
             jog = self.linuxcnc_reader.incremental_jog("X", direction, distance, feed)
             if not jog.success:
+                self._timeline_log(
+                    "JOG_X_FAILED",
+                    step_id=timeline_step_id,
+                    step_label=timeline_step_label,
+                    result="failed",
+                    reason=jog.message,
+                    duration_ms=f"{(time.monotonic() - event_start) * 1000.0:.3f}",
+                )
                 messagebox.showerror("Center Dot jog failed", jog.message, parent=self)
                 self.cal_status_var.set(jog.message)
                 return False
-            if not self._wait_for_position_near(start_x + move_x, start_y, coordinate_mode, distance):
+            wait_ok = self._wait_for_position_near(start_x + move_x, start_y, coordinate_mode, distance)
+            self._timeline_log(
+                "JOG_X_DONE",
+                step_id=timeline_step_id,
+                step_label=timeline_step_label,
+                result="ok" if wait_ok else "failed",
+                duration_ms=f"{(time.monotonic() - event_start) * 1000.0:.3f}",
+                target_x=f"{start_x + move_x:.6f}",
+                target_y=f"{start_y:.6f}",
+                move_x=f"{move_x:.6f}",
+                move_y="0.000000",
+                move_len=f"{distance:.6f}",
+            )
+            if not wait_ok:
                 self.cal_status_var.set("Center Dot X correction did not settle as expected.")
                 return False
 
         if abs(move_y) >= 0.0005:
             direction = 1 if move_y >= 0.0 else -1
             distance = abs(move_y)
+            event_start = time.monotonic()
+            self._timeline_log(
+                "JOG_Y_START",
+                step_id=timeline_step_id,
+                step_label=timeline_step_label,
+                result="begin",
+                target_x=f"{target_x:.6f}",
+                target_y=f"{target_y:.6f}",
+                move_x="0.000000",
+                move_y=f"{move_y:.6f}",
+                move_len=f"{distance:.6f}",
+            )
             jog = self.linuxcnc_reader.incremental_jog("Y", direction, distance, feed)
             if not jog.success:
+                self._timeline_log(
+                    "JOG_Y_FAILED",
+                    step_id=timeline_step_id,
+                    step_label=timeline_step_label,
+                    result="failed",
+                    reason=jog.message,
+                    duration_ms=f"{(time.monotonic() - event_start) * 1000.0:.3f}",
+                )
                 messagebox.showerror("Center Dot jog failed", jog.message, parent=self)
                 self.cal_status_var.set(jog.message)
                 return False
-            if not self._wait_for_position_near(target_x, target_y, coordinate_mode, distance):
+            wait_ok = self._wait_for_position_near(target_x, target_y, coordinate_mode, distance)
+            self._timeline_log(
+                "JOG_Y_DONE",
+                step_id=timeline_step_id,
+                step_label=timeline_step_label,
+                result="ok" if wait_ok else "failed",
+                duration_ms=f"{(time.monotonic() - event_start) * 1000.0:.3f}",
+                target_x=f"{target_x:.6f}",
+                target_y=f"{target_y:.6f}",
+                move_x="0.000000",
+                move_y=f"{move_y:.6f}",
+                move_len=f"{distance:.6f}",
+            )
+            if not wait_ok:
                 self.cal_status_var.set("Center Dot Y correction did not settle as expected.")
                 return False
 
@@ -3422,13 +3927,16 @@ class CameraCalibrationDialog(tk.Toplevel):
             follow_capture_point=bool(self.follow_capture_point_var.get()),
             follow_enabled=bool(self.follow_enabled_var.get()),
             follow_repeat_count=self._get_follow_repeat_count(),
+            follow_timeline_log_enabled=bool(self.follow_timeline_log_var.get()),
             calibration=calibration or self.active_calibration,
         )
 
     def stop_motion(self) -> None:
         self._follow_stop_requested = True
+        self._timeline_log("STOP_REQUESTED", result="requested")
         self._clear_follow_heading()
         result = self.linuxcnc_reader.abort_motion()
+        self._timeline_log("STOP_DONE", result="ok" if result.success else "failed", reason=result.message)
         self.cal_status_var.set(result.message)
 
     def close(self) -> None:
@@ -3436,6 +3944,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         if self.result is None:
             self.result = self._make_result(calibration=None)
         self.release_camera()
+        self._close_timeline_log()
         try:
             self.destroy()
         except tk.TclError:

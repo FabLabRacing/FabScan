@@ -86,6 +86,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "camera_follow_capture_point": False,
     "camera_follow_enabled": False,
     "camera_follow_repeat_count": 5,
+    "camera_follow_timeline_log_enabled": False,
     "camera_calibration": None,
 }
 
