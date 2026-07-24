@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.3.1"
-APP_TITLE = f"FabScan v{APP_VERSION} - Position Delay Experiment"
+APP_VERSION = "0.5.3.3"
+APP_TITLE = f"FabScan v{APP_VERSION} - Stage 2D Virtual Target Lite"
 
 
 class FabScanApp(tk.Tk):
@@ -2116,6 +2116,8 @@ class FabScanApp(tk.Tk):
             "camera_follow_timeline_log_enabled": bool(self.settings.get("camera_follow_timeline_log_enabled", False)),
             "camera_follow_use_delayed_position": bool(self.settings.get("camera_follow_use_delayed_position", False)),
             "camera_follow_position_delay_ms": int(self.settings.get("camera_follow_position_delay_ms", 120)),
+            "camera_follow_virtual_target_enabled": bool(self.settings.get("camera_follow_virtual_target_enabled", False)),
+            "camera_follow_virtual_min_progress_pct": float(self.settings.get("camera_follow_virtual_min_progress_pct", 70.0)),
             "camera_calibration": self.settings.get("camera_calibration", None),
         }
 
@@ -2198,6 +2200,8 @@ class FabScanApp(tk.Tk):
             f"FabScan v{APP_VERSION}\n\n"
             "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
             "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
+            "v0.5.3.3 adds transient not-found recovery: Follow Step/N waits for fresh camera frames and retries a complete no-line/no-edge detection before refusing. It also marks low preview-rate overlays as sampled so the operator knows follow may be using newer frames than the displayed overlay.\n\n"
+            "v0.5.3.2 adds a Stage 2D-lite virtual-target experiment: optional command shaping keeps delay compensation from canceling most forward progress while still allowing side steering. The old behavior remains the default.\n\n"
             "v0.5.3.1 adds an experimental position-delay mode for Stage 2 testing: FabScan can keep a short LinuxCNC position history and, when enabled, plan a follow move from the machine position that best matches the camera frame timestamp. The old current-position behavior remains the default.\n\n"
             "v0.5.22 adds Follow Stabilization: contour continuity scoring, EMA filtering for offset/angle, and a heading sanity reject so one bad frame is less likely to become motion.\n\n"
             "Corner Assist remains available from v0.5.21, and Follow N still allows large tests up to 9999 steps.\n\n"
@@ -2452,6 +2456,8 @@ class FabScanApp(tk.Tk):
         follow_timeline_log_enabled = self.safe_bool_from_settings("camera_follow_timeline_log_enabled", False)
         follow_use_delayed_position = self.safe_bool_from_settings("camera_follow_use_delayed_position", False)
         follow_position_delay_ms = self.safe_int_from_settings("camera_follow_position_delay_ms", 120)
+        follow_virtual_target_enabled = self.safe_bool_from_settings("camera_follow_virtual_target_enabled", False)
+        follow_virtual_min_progress_pct = self.safe_float_from_settings("camera_follow_virtual_min_progress_pct", 70.0)
         existing_calibration = self.settings.get("camera_calibration", None)
 
         dialog = CameraCalibrationDialog(
@@ -2502,6 +2508,8 @@ class FabScanApp(tk.Tk):
             follow_timeline_log_enabled=follow_timeline_log_enabled,
             follow_use_delayed_position=follow_use_delayed_position,
             follow_position_delay_ms=follow_position_delay_ms,
+            follow_virtual_target_enabled=follow_virtual_target_enabled,
+            follow_virtual_min_progress_pct=follow_virtual_min_progress_pct,
             existing_calibration=existing_calibration,
             trace_capture_callback=self.capture_trace_point,
         )
@@ -2554,6 +2562,8 @@ class FabScanApp(tk.Tk):
         self.settings["camera_follow_timeline_log_enabled"] = dialog.result.follow_timeline_log_enabled
         self.settings["camera_follow_use_delayed_position"] = dialog.result.follow_use_delayed_position
         self.settings["camera_follow_position_delay_ms"] = dialog.result.follow_position_delay_ms
+        self.settings["camera_follow_virtual_target_enabled"] = dialog.result.follow_virtual_target_enabled
+        self.settings["camera_follow_virtual_min_progress_pct"] = dialog.result.follow_virtual_min_progress_pct
 
         if dialog.result.calibration:
             self.settings["camera_calibration"] = dialog.result.calibration

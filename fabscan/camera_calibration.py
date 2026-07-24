@@ -166,6 +166,8 @@ class CameraCalibrationDialogResult:
     follow_timeline_log_enabled: bool
     follow_use_delayed_position: bool
     follow_position_delay_ms: int
+    follow_virtual_target_enabled: bool
+    follow_virtual_min_progress_pct: float
     calibration: Optional[dict[str, Any]] = None
 
 
@@ -227,11 +229,13 @@ class CameraCalibrationDialog(tk.Toplevel):
         follow_timeline_log_enabled: bool = False,
         follow_use_delayed_position: bool = False,
         follow_position_delay_ms: int = 120,
+        follow_virtual_target_enabled: bool = False,
+        follow_virtual_min_progress_pct: float = 70.0,
         existing_calibration: Optional[dict[str, Any]] = None,
         trace_capture_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.3.1")
+        self.title("FabScan Camera Calibration Lite - v0.5.3.3")
         self.minsize(1080, 650)
         # Give the dialog an explicit starting size so Tk does not keep
         # recomputing the top-level size as live preview/status content changes.
@@ -292,6 +296,20 @@ class CameraCalibrationDialog(tk.Toplevel):
         self._active_follow_run_step = 0
         self._position_history: list[PositionHistorySample] = []
         self._position_history_window_s = 8.0
+        # Stage 2D experimental virtual-target state. This remains a bounded
+        # position-step shim, not a velocity-jog/continuous controller. The
+        # virtual target is reset at each new Follow run and kept inside the
+        # normal Follow Step + Max correct limits.
+        self._follow_virtual_target_xy: Optional[tuple[float, float]] = None
+        # v0.5.3.3 transient-not-found recovery. With Capture FPS much higher
+        # than Preview FPS, one bad/undrawn frame can otherwise stop Follow N even
+        # when the operator still sees the last good overlay on screen. Keep the
+        # retry count small and wait only for fresh frames so this stays safe and
+        # bounded.
+        self._follow_not_found_retry_count = 2
+        self._follow_not_found_retry_timeout_s = 0.20
+        self._last_follow_detection_sequence = 0
+        self._last_follow_detection_result = ""
         self.trace_capture_callback = trace_capture_callback
         self.active_calibration: Optional[dict[str, Any]] = self._validate_calibration(existing_calibration)
 
@@ -344,6 +362,8 @@ class CameraCalibrationDialog(tk.Toplevel):
         self.follow_timeline_log_var = tk.BooleanVar(value=bool(follow_timeline_log_enabled))
         self.follow_use_delayed_position_var = tk.BooleanVar(value=bool(follow_use_delayed_position))
         self.follow_position_delay_ms_var = tk.IntVar(value=self._clamp_follow_position_delay_ms(follow_position_delay_ms))
+        self.follow_virtual_target_var = tk.BooleanVar(value=bool(follow_virtual_target_enabled))
+        self.follow_virtual_min_progress_pct_var = tk.DoubleVar(value=self._clamp_follow_virtual_min_progress_pct(follow_virtual_min_progress_pct))
         self.dot_status_var = tk.StringVar(value="Dot: —")
         self.line_status_var = tk.StringVar(value="Line/edge: —")
         self.cal_status_var = tk.StringVar(value="Open camera, center the calibration dot, then click Find Dot.")
@@ -700,13 +720,22 @@ class CameraCalibrationDialog(tk.Toplevel):
         ttk.Entry(follow_tools, textvariable=self.follow_position_delay_ms_var, width=8).grid(
             row=22, column=1, sticky="ew", padx=(4, 0), pady=(5, 0)
         )
+        ttk.Checkbutton(
+            follow_tools,
+            text="Virtual target",
+            variable=self.follow_virtual_target_var,
+        ).grid(row=23, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        ttk.Label(follow_tools, text="Min prog %").grid(row=24, column=0, sticky=tk.W, pady=(5, 0))
+        ttk.Entry(follow_tools, textvariable=self.follow_virtual_min_progress_pct_var, width=8).grid(
+            row=24, column=1, sticky="ew", padx=(4, 0), pady=(5, 0)
+        )
         ttk.Button(follow_tools, text="Follow Step", command=self.follow_line_single_step).grid(
-            row=23, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+            row=25, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
         ttk.Button(follow_tools, text="Follow N", command=self.follow_line_multiple_steps).grid(
-            row=24, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+            row=26, column=0, columnspan=2, sticky="ew", pady=(4, 0)
         )
-        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=25, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(follow_tools, text="STOP Move", command=self.stop_motion).grid(row=27, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         follow_tools.columnconfigure(1, weight=1)
 
     def _on_timeline_log_toggle(self) -> None:
@@ -747,6 +776,8 @@ class CameraCalibrationDialog(tk.Toplevel):
             "preview_fps",
             "use_delayed_position",
             "position_delay_ms",
+            "use_virtual_target",
+            "virtual_min_progress_pct",
             "frame_target_time_s",
             "delayed_position_found",
             "delayed_position_source",
@@ -760,6 +791,21 @@ class CameraCalibrationDialog(tk.Toplevel):
             "frame_move_y",
             "command_adjust_x",
             "command_adjust_y",
+            "virtual_state",
+            "virtual_desired_x",
+            "virtual_desired_y",
+            "virtual_target_x",
+            "virtual_target_y",
+            "virtual_raw_parallel",
+            "virtual_raw_perp",
+            "virtual_final_parallel",
+            "virtual_final_perp",
+            "virtual_min_forward",
+            "virtual_side_limit",
+            "detection_phase",
+            "retry_attempt",
+            "retry_wait_ms",
+            "fresh_frame",
             "linuxcnc_read_ms",
             "status_ok",
             "task_state",
@@ -819,6 +865,8 @@ class CameraCalibrationDialog(tk.Toplevel):
                 preview_fps=self._get_camera_preview_max_fps(),
                 use_delayed_position=bool(self.follow_use_delayed_position_var.get()),
                 position_delay_ms=self._get_follow_position_delay_ms(),
+                use_virtual_target=bool(self.follow_virtual_target_var.get()),
+                virtual_min_progress_pct=f"{self._get_follow_virtual_min_progress_pct():.3f}",
             )
             return path
         except OSError as exc:
@@ -868,6 +916,145 @@ class CameraCalibrationDialog(tk.Toplevel):
             "corner_angle_degrees": f"{float(line.corner_angle_degrees):.3f}",
             "corner_strength": f"{float(line.corner_strength):.3f}",
         }
+
+    def _current_frame_age_s(self) -> Optional[float]:
+        frame_ts = float(getattr(self, "current_frame_timestamp", 0.0) or 0.0)
+        if frame_ts <= 0.0:
+            return None
+        return max(0.0, time.monotonic() - frame_ts)
+
+    def _max_follow_frame_age_s(self) -> float:
+        """Accept a wider age window at low capture rates, tighter at 30 fps."""
+
+        fps = max(0.1, self._get_camera_stream_max_fps())
+        return max(0.25, min(0.75, 2.5 / fps))
+
+    def _wait_for_fresh_camera_frame(
+        self,
+        *,
+        previous_sequence: int,
+        timeout_s: float,
+    ) -> tuple[bool, float]:
+        """Pump the camera until a newer frame is available or timeout expires."""
+
+        start = time.monotonic()
+        end = start + max(0.0, float(timeout_s))
+        while time.monotonic() < end and not self._closing:
+            self.update()
+            self._pump_camera_frame(display=False)
+            if int(getattr(self, "current_frame_sequence", 0) or 0) > int(previous_sequence):
+                return True, time.monotonic() - start
+            time.sleep(0.01)
+        return False, time.monotonic() - start
+
+    def _freshen_follow_frame_if_stale(self, *, step_id: int, step_label: str) -> None:
+        """Avoid starting a follow decision from a stale paused/preview frame."""
+
+        if self.current_frame_bgr is None:
+            return
+        age = self._current_frame_age_s()
+        max_age = self._max_follow_frame_age_s()
+        if age is not None and age <= max_age:
+            return
+
+        previous_sequence = int(getattr(self, "current_frame_sequence", 0) or 0)
+        refreshed, waited_s = self._wait_for_fresh_camera_frame(
+            previous_sequence=previous_sequence,
+            timeout_s=self._follow_not_found_retry_timeout_s,
+        )
+        self._timeline_log(
+            "FRAME_FRESHEN",
+            step_id=step_id,
+            step_label=step_label,
+            result="fresh" if refreshed else "stale",
+            reason=f"frame age exceeded {max_age * 1000.0:.0f} ms" if age is not None else "frame timestamp unavailable",
+            retry_wait_ms=f"{waited_s * 1000.0:.3f}",
+            fresh_frame=bool(refreshed),
+        )
+
+    def _detect_line_for_follow_with_retries(
+        self,
+        *,
+        step_id: int,
+        step_label: str,
+        phase: str,
+        base_event: str,
+    ) -> tuple[LineDetection, float]:
+        """Detect a line/edge and retry transient not-found frames safely.
+
+        v0.5.3.3 intentionally retries only complete not-found detections. It
+        does not bypass confidence, sanity, progress lock, or motion limits. The
+        retry waits for a newer camera frame first, so it can recover from a bad
+        frame without re-processing the same failed image over and over.
+        """
+
+        attempts = max(0, int(self._follow_not_found_retry_count))
+        total_detection_ms = 0.0
+        detection_start = time.monotonic()
+        line = self.detect_line()
+        detection_ms = (time.monotonic() - detection_start) * 1000.0
+        total_detection_ms += detection_ms
+        self._timeline_log(
+            base_event,
+            step_id=step_id,
+            step_label=step_label,
+            result="found" if line.found else "not_found",
+            reason=line.message,
+            detection_phase=phase,
+            retry_attempt=0,
+            duration_ms=f"{detection_ms:.3f}",
+            **self._timeline_line_fields(line),
+        )
+
+        if line.found:
+            self._last_follow_detection_sequence = int(getattr(self, "current_frame_sequence", 0) or 0)
+            self._last_follow_detection_result = "found"
+            return line, total_detection_ms
+
+        for attempt in range(1, attempts + 1):
+            previous_sequence = int(getattr(self, "current_frame_sequence", 0) or 0)
+            refreshed, waited_s = self._wait_for_fresh_camera_frame(
+                previous_sequence=previous_sequence,
+                timeout_s=self._follow_not_found_retry_timeout_s,
+            )
+            self._timeline_log(
+                f"{base_event}_RETRY_WAIT",
+                step_id=step_id,
+                step_label=step_label,
+                result="fresh" if refreshed else "timeout",
+                reason=line.message,
+                detection_phase=phase,
+                retry_attempt=attempt,
+                retry_wait_ms=f"{waited_s * 1000.0:.3f}",
+                fresh_frame=bool(refreshed),
+            )
+            if not refreshed:
+                continue
+
+            retry_start = time.monotonic()
+            retry_line = self.detect_line()
+            retry_ms = (time.monotonic() - retry_start) * 1000.0
+            total_detection_ms += retry_ms
+            self._timeline_log(
+                f"{base_event}_RETRY",
+                step_id=step_id,
+                step_label=step_label,
+                result="found" if retry_line.found else "not_found",
+                reason=retry_line.message,
+                detection_phase=phase,
+                retry_attempt=attempt,
+                duration_ms=f"{retry_ms:.3f}",
+                **self._timeline_line_fields(retry_line),
+            )
+            line = retry_line
+            if line.found:
+                self._last_follow_detection_sequence = int(getattr(self, "current_frame_sequence", 0) or 0)
+                self._last_follow_detection_result = f"found after retry {attempt}"
+                return line, total_detection_ms
+
+        self._last_follow_detection_sequence = int(getattr(self, "current_frame_sequence", 0) or 0)
+        self._last_follow_detection_result = "not_found"
+        return line, total_detection_ms
 
     def _timeline_log(self, event: str, **kwargs: Any) -> None:
         """Write one Stage 2 timeline event.
@@ -1180,6 +1367,56 @@ class CameraCalibrationDialog(tk.Toplevel):
         except (tk.TclError, TypeError, ValueError):
             self.follow_position_delay_ms_var.set(delay_ms)
         return delay_ms
+
+    def _clamp_follow_virtual_min_progress_pct(self, value: object) -> float:
+        try:
+            pct = abs(float(value))
+        except (tk.TclError, TypeError, ValueError):
+            pct = 70.0
+        return max(0.0, min(100.0, pct))
+
+    def _get_follow_virtual_min_progress_pct(self) -> float:
+        pct = self._clamp_follow_virtual_min_progress_pct(self.follow_virtual_min_progress_pct_var.get())
+        try:
+            if abs(float(self.follow_virtual_min_progress_pct_var.get()) - pct) > 1e-9:
+                self.follow_virtual_min_progress_pct_var.set(pct)
+        except (tk.TclError, TypeError, ValueError):
+            self.follow_virtual_min_progress_pct_var.set(pct)
+        return pct
+
+    def _get_follow_virtual_target_enabled(self) -> bool:
+        try:
+            return bool(self.follow_virtual_target_var.get())
+        except tk.TclError:
+            return False
+
+    def _clamp_parallel_perp_move(
+        self,
+        *,
+        move_x: float,
+        move_y: float,
+        heading: tuple[float, float],
+        min_forward: float,
+        max_forward: float,
+        max_side: float,
+    ) -> tuple[float, float, float, float, float, float]:
+        unit = self._normalize_unit_vector(heading[0], heading[1])
+        if unit is None:
+            return move_x, move_y, 0.0, 0.0, 0.0, 0.0
+        hx, hy = unit
+        nx, ny = -hy, hx
+        raw_parallel = (move_x * hx) + (move_y * hy)
+        raw_perp = (move_x * nx) + (move_y * ny)
+        final_parallel = max(min_forward, min(max_forward, raw_parallel))
+        final_perp = max(-max_side, min(max_side, raw_perp))
+        return (
+            (final_parallel * hx) + (final_perp * nx),
+            (final_parallel * hy) + (final_perp * ny),
+            raw_parallel,
+            raw_perp,
+            final_parallel,
+            final_perp,
+        )
 
     def _clamp_follow_max_heading_change(self, value: object) -> float:
         try:
@@ -1752,7 +1989,19 @@ class CameraCalibrationDialog(tk.Toplevel):
         if bool(self.show_line_preview_var.get()):
             self._draw_line_overlay(draw, scale, source_w, source_h)
 
-        draw.text((10, h - 24), f"Source {source_w}x{source_h}  Threshold {self._get_threshold()}", fill=(255, 255, 255))
+        source_text = f"Source {source_w}x{source_h}  Threshold {self._get_threshold()}"
+        frame_age = self._current_frame_age_s()
+        if frame_age is not None:
+            source_text += f"  Frame age {frame_age * 1000.0:.0f} ms"
+        draw.text((10, h - 24), source_text, fill=(255, 255, 255))
+        preview_fps = self._get_camera_preview_max_fps()
+        capture_fps = self._get_camera_stream_max_fps()
+        if preview_fps < max(1.1, capture_fps * 0.50):
+            draw.text(
+                (10, h - 44),
+                "LOW PREVIEW RATE: overlay is sampled; follow may use newer frames",
+                fill=(255, 255, 255),
+            )
 
     def _update_dot_status(self, frame_w: int, frame_h: int) -> None:
         if self.current_dot.found:
@@ -2902,6 +3151,110 @@ class CameraCalibrationDialog(tk.Toplevel):
         )
         return sample.x, sample.y, fields
 
+    def _virtual_target_default_fields(self) -> dict[str, Any]:
+        return {
+            "use_virtual_target": bool(self._get_follow_virtual_target_enabled()),
+            "virtual_min_progress_pct": f"{self._get_follow_virtual_min_progress_pct():.3f}",
+        }
+
+    def _apply_follow_virtual_target(
+        self,
+        *,
+        current_x: float,
+        current_y: float,
+        desired_target_x: float,
+        desired_target_y: float,
+        heading: tuple[float, float],
+        follow_step: float,
+        max_correct: float,
+    ) -> tuple[float, float, float, float, dict[str, Any]]:
+        """Stage 2D-lite virtual-target command shaping.
+
+        This does not send velocity jogs and does not allow an unbounded
+        controller to chase the camera. It keeps a small virtual target in the
+        same coordinate space as LinuxCNC, advances that target toward the
+        camera-derived desired target, then clamps the real command into
+        tangent/perpendicular components. The important first safety rule is
+        that delay compensation may help steering, but it may not cancel most
+        of the forward progress.
+        """
+
+        fields = self._virtual_target_default_fields()
+        if not self._get_follow_virtual_target_enabled():
+            fields["virtual_state"] = "disabled"
+            return desired_target_x, desired_target_y, desired_target_x - current_x, desired_target_y - current_y, fields
+
+        unit = self._normalize_unit_vector(heading[0], heading[1])
+        if unit is None:
+            fields["virtual_state"] = "no heading"
+            return desired_target_x, desired_target_y, desired_target_x - current_x, desired_target_y - current_y, fields
+
+        prev_target = self._follow_virtual_target_xy
+        if prev_target is None:
+            prev_target = (current_x, current_y)
+
+        desired_delta_x = desired_target_x - prev_target[0]
+        desired_delta_y = desired_target_y - prev_target[1]
+        max_target_advance = max(0.001, follow_step + max_correct)
+        target_delta_x, target_delta_y, target_limited = self._limit_move_vector(
+            desired_delta_x,
+            desired_delta_y,
+            max_target_advance,
+        )
+        virtual_x = prev_target[0] + target_delta_x
+        virtual_y = prev_target[1] + target_delta_y
+
+        raw_move_x = virtual_x - current_x
+        raw_move_y = virtual_y - current_y
+        min_forward = follow_step * (self._get_follow_virtual_min_progress_pct() / 100.0)
+        max_forward = max(0.001, follow_step + max_correct)
+        max_side = max(0.0, max_correct)
+        move_x, move_y, raw_parallel, raw_perp, final_parallel, final_perp = self._clamp_parallel_perp_move(
+            move_x=raw_move_x,
+            move_y=raw_move_y,
+            heading=unit,
+            min_forward=min_forward,
+            max_forward=max_forward,
+            max_side=max_side,
+        )
+        move_x, move_y, total_limited = self._limit_move_vector(move_x, move_y, max_forward)
+        # If total length limiting scaled the vector, report the actual final
+        # tangent/side components that will be commanded.
+        hx, hy = unit
+        nx, ny = -hy, hx
+        final_parallel = (move_x * hx) + (move_y * hy)
+        final_perp = (move_x * nx) + (move_y * ny)
+        target_x = current_x + move_x
+        target_y = current_y + move_y
+        self._follow_virtual_target_xy = (target_x, target_y)
+
+        state_bits = ["active"]
+        if target_limited:
+            state_bits.append("target limited")
+        if raw_parallel < min_forward:
+            state_bits.append("forward floor")
+        if abs(raw_perp) > max_side:
+            state_bits.append("side limited")
+        if total_limited:
+            state_bits.append("total limited")
+
+        fields.update(
+            {
+                "virtual_state": "; ".join(state_bits),
+                "virtual_desired_x": f"{desired_target_x:.6f}",
+                "virtual_desired_y": f"{desired_target_y:.6f}",
+                "virtual_target_x": f"{target_x:.6f}",
+                "virtual_target_y": f"{target_y:.6f}",
+                "virtual_raw_parallel": f"{raw_parallel:.6f}",
+                "virtual_raw_perp": f"{raw_perp:.6f}",
+                "virtual_final_parallel": f"{final_parallel:.6f}",
+                "virtual_final_perp": f"{final_perp:.6f}",
+                "virtual_min_forward": f"{min_forward:.6f}",
+                "virtual_side_limit": f"{max_side:.6f}",
+            }
+        )
+        return target_x, target_y, move_x, move_y, fields
+
     def _wait_for_position_near(
         self,
         target_x: float,
@@ -3261,12 +3614,16 @@ class CameraCalibrationDialog(tk.Toplevel):
         self._active_follow_run_step = 0
         if reset_latch:
             self._clear_follow_heading()
+        else:
+            self._follow_virtual_target_xy = None
         self._timeline_log(
             "RUN_START",
             result="begin",
             reason=label,
             use_delayed_position=bool(self.follow_use_delayed_position_var.get()),
             position_delay_ms=self._get_follow_position_delay_ms(),
+            use_virtual_target=bool(self.follow_virtual_target_var.get()),
+            virtual_min_progress_pct=f"{self._get_follow_virtual_min_progress_pct():.3f}",
             capture_fps=f"{self._get_camera_stream_max_fps():.3f}",
             preview_fps=f"{self._get_camera_preview_max_fps():.3f}",
             move_len=f"{self._get_follow_step():.6f}",
@@ -3348,6 +3705,8 @@ class CameraCalibrationDialog(tk.Toplevel):
             preview_fps=f"{self._get_camera_preview_max_fps():.3f}",
             use_delayed_position=bool(self.follow_use_delayed_position_var.get()),
             position_delay_ms=self._get_follow_position_delay_ms(),
+            use_virtual_target=bool(self.follow_virtual_target_var.get()),
+            virtual_min_progress_pct=f"{self._get_follow_virtual_min_progress_pct():.3f}",
         )
 
         if self._motion_active:
@@ -3378,6 +3737,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.cal_status_var.set("Follow refused: no camera frame is available.")
             return False
 
+        self._freshen_follow_frame_if_stale(step_id=step_id, step_label=step_label)
         transformed_for_size = self.get_transformed_frame_bgr(self.current_frame_bgr)
         frame_h, frame_w = transformed_for_size.shape[:2]
 
@@ -3425,24 +3785,19 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.cal_status_var.set(message)
             return False
 
-        detection_start = time.monotonic()
-        line = self.detect_line()
-        detection_ms = (time.monotonic() - detection_start) * 1000.0
-        self._timeline_log(
-            "DETECTION",
+        line, detection_ms = self._detect_line_for_follow_with_retries(
             step_id=step_id,
             step_label=step_label,
-            result="found" if line.found else "not_found",
-            reason=line.message,
-            duration_ms=f"{detection_ms:.3f}",
-            **self._timeline_line_fields(line),
+            phase="pre_move",
+            base_event="DETECTION",
         )
         if not line.found:
             self.current_line = line
-            self._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="refused", reason=line.message)
-            self.cal_status_var.set(line.message)
+            reason = f"{line.message} after fresh-frame retry"
+            self._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="refused", reason=reason)
+            self.cal_status_var.set(reason)
             if show_dialogs:
-                messagebox.showinfo("Line/edge not found", line.message, parent=self)
+                messagebox.showinfo("Line/edge not found", reason, parent=self)
             self._show_current_frame()
             return False
 
@@ -3628,6 +3983,20 @@ class CameraCalibrationDialog(tk.Toplevel):
             target_y = start_y + move_y
             prior_state = correction_state
             correction_state = f"{prior_state}; delay command limited" if prior_state else "delay command limited"
+
+        virtual_fields = self._virtual_target_default_fields()
+        if corner_assist is None and self._get_follow_virtual_target_enabled():
+            target_x, target_y, move_x, move_y, virtual_fields = self._apply_follow_virtual_target(
+                current_x=start_x,
+                current_y=start_y,
+                desired_target_x=target_x,
+                desired_target_y=target_y,
+                heading=heading,
+                follow_step=follow_step,
+                max_correct=max_correct,
+            )
+            prior_state = correction_state
+            correction_state = f"{prior_state}; virtual target" if prior_state else "virtual target"
         move_len = math.hypot(move_x, move_y)
 
         progress_dot: Optional[float] = None
@@ -3661,6 +4030,7 @@ class CameraCalibrationDialog(tk.Toplevel):
                 move_y=f"{move_y:.6f}",
                 move_len=f"{move_len:.6f}",
                 **delay_fields,
+                **virtual_fields,
                 **self._timeline_line_fields(line),
             )
             self.cal_status_var.set(
@@ -3680,6 +4050,8 @@ class CameraCalibrationDialog(tk.Toplevel):
                 move_x=f"{move_x:.6f}",
                 move_y=f"{move_y:.6f}",
                 move_len=f"{move_len:.6f}",
+                **delay_fields,
+                **virtual_fields,
                 **self._timeline_line_fields(line),
             )
             self.cal_status_var.set(f"{step_label}: calculated move is tiny. No move sent.")
@@ -3716,6 +4088,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             progress_dot=f"{progress_dot:.6f}" if progress_dot is not None else "",
             correction_state=correction_state,
             **delay_fields,
+            **virtual_fields,
             **self._timeline_line_fields(line),
         )
 
@@ -3735,6 +4108,9 @@ class CameraCalibrationDialog(tk.Toplevel):
                 limit_bits.append(f"corner assist: {corner_assist.distance:.4f}/{corner_assist.max_distance:.4f}, {lookahead_steps} step lookahead")
             if total_limited:
                 limit_bits.append("total move limited")
+            if self._get_follow_virtual_target_enabled() and corner_assist is None:
+                state = str(virtual_fields.get("virtual_state", "virtual target"))
+                limit_bits.append(f"virtual target: {state}")
             limit_text = f" ({', '.join(limit_bits)})" if limit_bits else ""
             turn_text = ""
             if heading_change is not None and max_heading_change > 0.0:
@@ -3807,9 +4183,12 @@ class CameraCalibrationDialog(tk.Toplevel):
                 result="ok",
                 duration_ms=f"{(time.monotonic() - settle_start) * 1000.0:.3f}",
             )
-            post_detection_start = time.monotonic()
-            new_line = self.detect_line()
-            post_detection_ms = (time.monotonic() - post_detection_start) * 1000.0
+            new_line, post_detection_ms = self._detect_line_for_follow_with_retries(
+                step_id=step_id,
+                step_label=step_label,
+                phase="post_move",
+                base_event="POST_DETECTION",
+            )
             if correction_state == "corner assist":
                 # The old-leg filter would fight the new outgoing leg. Re-seed
                 # after the corner move if the next leg is visible.
@@ -3828,7 +4207,7 @@ class CameraCalibrationDialog(tk.Toplevel):
                     post_x = ""
                     post_y = ""
             self._timeline_log(
-                "POST_DETECTION",
+                "POST_DETECTION_FINAL",
                 step_id=step_id,
                 step_label=step_label,
                 result="found" if new_line.found else "not_found",
@@ -4147,6 +4526,8 @@ class CameraCalibrationDialog(tk.Toplevel):
             follow_timeline_log_enabled=bool(self.follow_timeline_log_var.get()),
             follow_use_delayed_position=bool(self.follow_use_delayed_position_var.get()),
             follow_position_delay_ms=self._get_follow_position_delay_ms(),
+            follow_virtual_target_enabled=bool(self.follow_virtual_target_var.get()),
+            follow_virtual_min_progress_pct=self._get_follow_virtual_min_progress_pct(),
             calibration=calibration or self.active_calibration,
         )
 

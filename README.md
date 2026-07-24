@@ -1,3 +1,23 @@
+## v0.5.3.3 - Fresh Frame Retry / Sampled Overlay Warning
+
+- Added a small transient not-found recovery path for Follow Step / Follow N. If line/edge detection returns a complete `not_found`, FabScan waits for a fresh camera frame and retries before refusing the step.
+- The retry is intentionally narrow: it only retries no-line/no-edge frames. It does not bypass confidence, sanity, progress lock, correction limits, or LinuxCNC readiness checks.
+- Post-move detection uses the same fresh-frame retry so a single bad/undrawn frame does not immediately poison the next follow step.
+- The timeline CSV now records detection phase, retry attempt, retry wait time, and whether a fresh frame was received. Post-move detection now has a final summary row after retries.
+- Live preview overlay now warns when preview FPS is much lower than capture FPS, because the displayed overlay is only a sampled view and Follow may be using newer frames.
+- No virtual-target math, delayed-position math, DXF export, corner assist, Z/torch/plasma behavior, or LinuxCNC command style was intentionally changed.
+
+## v0.5.3.2 - Stage 2D Virtual Target Lite
+
+- Added an experimental `Virtual target` checkbox and `Min prog %` setting in Camera Calibration > Single-Step Follow.
+- This is a cautious Stage 2D-lite step, not a velocity-jog or continuous controller. FabScan still sends bounded X/Y position moves only.
+- When enabled, FabScan shapes the delayed/current camera-derived target through a small virtual target and decomposes the command into tangent and side components. The goal is to let delay compensation help steering without allowing it to cancel most of the forward step.
+- `Min prog %` defaults to 70%, so a normal follow step should keep at least 70% of the requested forward progress unless an existing safety/refusal stops the move.
+- Timeline logs now include virtual-target fields such as virtual state, desired target, shaped target, raw/final tangent component, raw/final side component, progress floor, and side limit.
+- Defaults remain conservative: delayed position is still off unless enabled, and virtual target is off unless enabled.
+- No velocity-jog loop, virtual-machine free-run, Z/torch/plasma control, corner-assist behavior change, or DXF export change was intentionally added.
+- About/title updated to `FabScan v0.5.3.2 - Stage 2D Virtual Target Lite`.
+
 ## v0.5.3.1 - Position Delay Experiment
 
 - Adds an experimental Stage 2B/2C position-history path in Camera Calibration. FabScan keeps a short rolling LinuxCNC position history during follow moves, jog waits, and post-move checks.
