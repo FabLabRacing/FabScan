@@ -8,3 +8,6 @@ exports/*.dxf
 .DS_Store
 Thumbs.db
 zips/
+exports/
+test/
+
