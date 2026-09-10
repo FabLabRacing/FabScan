@@ -19,3 +19,6 @@ replays/
 
 # Generated simulator output
 simulated_runs/
+
+# FabScan milestone installer backups
+.m*_backup_*/
