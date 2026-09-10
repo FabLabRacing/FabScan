@@ -14,7 +14,7 @@ Driver: uvcvideo
 Interface: V4L2 / UVC
 ```
 
-This is useful because FabScan does not depend on a proprietary camera driver. A current replacement should preferably be a standard USB Video Class (UVC) camera that Linux exposes through V4L2.
+FabScan does not depend on a proprietary camera driver. A current replacement should preferably be a standard USB Video Class (UVC) camera that Linux exposes through V4L2.
 
 ### Known-Good Development Mode
 
