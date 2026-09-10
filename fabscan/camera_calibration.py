@@ -65,6 +65,15 @@ class LineDetection:
     corner_candidate: bool = False
     corner_angle_degrees: float = 0.0
     corner_strength: float = 0.0
+    corner_hough_segment_count: int = 0
+    corner_cluster_count: int = 0
+    corner_primary_angle_degrees: float = 0.0
+    corner_secondary_angle_degrees: float = 0.0
+    corner_third_angle_degrees: float = 0.0
+    corner_primary_length_px: float = 0.0
+    corner_secondary_length_px: float = 0.0
+    corner_third_length_px: float = 0.0
+    corner_reject_reason: str = ""
     corner_message: str = ""
     corner_primary_vx: float = 0.0
     corner_primary_vy: float = 0.0
@@ -86,6 +95,15 @@ class CornerMetrics:
     angle_degrees: float = 0.0
     strength: float = 0.0
     message: str = ""
+    hough_segment_count: int = 0
+    cluster_count: int = 0
+    primary_angle_degrees: float = 0.0
+    secondary_angle_degrees: float = 0.0
+    third_angle_degrees: float = 0.0
+    primary_length_px: float = 0.0
+    secondary_length_px: float = 0.0
+    third_length_px: float = 0.0
+    reject_reason: str = ""
     primary_x: float = 0.0
     primary_y: float = 0.0
     primary_vx: float = 0.0
@@ -107,8 +125,19 @@ class CornerAssistMove:
     heading: Optional[tuple[float, float]] = None
     heading_state: str = ""
     message: str = ""
+    reason: str = ""
     distance: float = 0.0
     max_distance: float = 0.0
+    engage_distance: float = 0.0
+    intersection_x_px: float = 0.0
+    intersection_y_px: float = 0.0
+    offset_x_px: float = 0.0
+    offset_y_px: float = 0.0
+    classification: str = ""
+    classification_reason: str = ""
+    heading_sample_count: int = 0
+    heading_range_degrees: float = 0.0
+    heading_avg_step_degrees: float = 0.0
 
 
 @dataclass
@@ -235,7 +264,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         trace_capture_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
-        self.title("FabScan Camera Calibration Lite - v0.5.3.3")
+        self.title("FabScan Camera Calibration Lite - v0.5.3.10")
         self.minsize(1080, 650)
         # Give the dialog an explicit starting size so Tk does not keep
         # recomputing the top-level size as live preview/status content changes.
@@ -278,11 +307,32 @@ class CameraCalibrationDialog(tk.Toplevel):
         # this later once the basic detector is less jumpy.
         self._follow_filtered_err: Optional[tuple[float, float]] = None
         self._follow_filtered_vec_px: Optional[tuple[float, float]] = None
+        # Recent accepted turn history for curve-aware sanity. This lets the
+        # normal profile follower pass strong, high-quality detections through
+        # curved/part-like geometry without weakening garbage-frame rejection.
+        self._follow_recent_turn_degrees: list[float] = []
+        # Raw fit-angle history from accepted ordinary follow steps.  Corner
+        # Assist uses this to decide whether a candidate is a sharp vertex
+        # approached from a stable line, or just a radius/fillet where the
+        # heading has been rotating for several steps.
+        self._follow_recent_raw_angle_degrees: list[float] = []
+        self._last_follow_sanity_action = ""
+        self._last_follow_sanity_reason = ""
+        self._last_follow_sanity_change_degrees: Optional[float] = None
         # When corner pause stops at an intentional corner, the user can pick
         # the next Start dir and click Find Line/Edge. The next follow move is
         # allowed to bypass corner pause once so it can step out of the
         # ambiguous L-shaped ROI instead of immediately pausing again.
         self._follow_corner_resume_once = False
+        # v0.5.3.7: Corner Assist is a true one-shot event per detected corner zone.
+        # After a successful assist, suppress additional assists until the
+        # two-line/corner candidate actually clears for a couple of clean frames.
+        # Do not re-arm merely because several ordinary steps have elapsed while
+        # the camera still sees the same corner/radius/tab clutter.
+        self._follow_corner_assist_consumed = False
+        self._follow_corner_assist_cooldown_steps = 0
+        self._follow_corner_assist_clear_frames = 0
+        self._follow_corner_assist_clear_frame_limit = 2
         self._last_camera_sequence = 0
         self._last_preview_sequence = 0
         self._next_preview_due = 0.0
@@ -301,11 +351,12 @@ class CameraCalibrationDialog(tk.Toplevel):
         # virtual target is reset at each new Follow run and kept inside the
         # normal Follow Step + Max correct limits.
         self._follow_virtual_target_xy: Optional[tuple[float, float]] = None
-        # v0.5.3.3 transient-not-found recovery. With Capture FPS much higher
-        # than Preview FPS, one bad/undrawn frame can otherwise stop Follow N even
-        # when the operator still sees the last good overlay on screen. Keep the
-        # retry count small and wait only for fresh frames so this stays safe and
-        # bounded.
+        # v0.5.3.3 transient-not-found recovery, expanded in v0.5.3.4 to also
+        # retry obvious one-frame garbage detections. With Capture FPS much
+        # higher than Preview FPS, one bad/undrawn frame can otherwise stop
+        # Follow N even when the operator still sees the last good overlay on
+        # screen. Keep the retry count small and wait only for fresh frames so
+        # this stays safe and bounded.
         self._follow_not_found_retry_count = 2
         self._follow_not_found_retry_timeout_s = 0.20
         self._last_follow_detection_sequence = 0
@@ -838,10 +889,48 @@ class CameraCalibrationDialog(tk.Toplevel):
             "heading_state",
             "heading_change_degrees",
             "progress_dot",
+            "sanity_action",
+            "sanity_reason",
+            "sanity_limit_degrees",
+            "sanity_change_degrees",
+            "garbage_retry_reason",
             "correction_state",
             "corner_candidate",
             "corner_angle_degrees",
             "corner_strength",
+            "corner_hough_segment_count",
+            "corner_cluster_count",
+            "corner_primary_angle_degrees",
+            "corner_secondary_angle_degrees",
+            "corner_third_angle_degrees",
+            "corner_primary_length_px",
+            "corner_secondary_length_px",
+            "corner_third_length_px",
+            "corner_reject_reason",
+            "corner_action",
+            "corner_reason",
+            "corner_classification",
+            "corner_classification_reason",
+            "corner_heading_samples",
+            "corner_heading_range_degrees",
+            "corner_heading_avg_step_degrees",
+            "corner_distance",
+            "corner_lookahead_limit",
+            "corner_engage_limit",
+            "corner_intersection_valid",
+            "corner_intersection_x_px",
+            "corner_intersection_y_px",
+            "corner_offset_x_px",
+            "corner_offset_y_px",
+            "corner_machine_move_x",
+            "corner_machine_move_y",
+            "corner_outgoing_x",
+            "corner_outgoing_y",
+            "corner_cooldown_active",
+            "corner_cooldown_steps",
+            "corner_cooldown_limit",
+            "corner_clear_frames",
+            "corner_clear_frame_limit",
             "duration_ms",
         )
 
@@ -915,6 +1004,18 @@ class CameraCalibrationDialog(tk.Toplevel):
             "corner_candidate": bool(line.corner_candidate),
             "corner_angle_degrees": f"{float(line.corner_angle_degrees):.3f}",
             "corner_strength": f"{float(line.corner_strength):.3f}",
+            "corner_hough_segment_count": int(line.corner_hough_segment_count),
+            "corner_cluster_count": int(line.corner_cluster_count),
+            "corner_primary_angle_degrees": f"{float(line.corner_primary_angle_degrees):.3f}",
+            "corner_secondary_angle_degrees": f"{float(line.corner_secondary_angle_degrees):.3f}",
+            "corner_third_angle_degrees": f"{float(line.corner_third_angle_degrees):.3f}",
+            "corner_primary_length_px": f"{float(line.corner_primary_length_px):.3f}",
+            "corner_secondary_length_px": f"{float(line.corner_secondary_length_px):.3f}",
+            "corner_third_length_px": f"{float(line.corner_third_length_px):.3f}",
+            "corner_reject_reason": line.corner_reject_reason,
+            "corner_intersection_valid": bool(line.corner_intersection_valid),
+            "corner_intersection_x_px": f"{float(line.corner_intersection_x):.3f}",
+            "corner_intersection_y_px": f"{float(line.corner_intersection_y):.3f}",
         }
 
     def _current_frame_age_s(self) -> Optional[float]:
@@ -972,6 +1073,44 @@ class CameraCalibrationDialog(tk.Toplevel):
             fresh_frame=bool(refreshed),
         )
 
+    def _line_detection_retry_reason(self, line: LineDetection) -> Optional[str]:
+        """Return a reason to retry an obviously transient/bad detection.
+
+        This is deliberately narrower than accepting a bad frame. The retry only
+        asks for a newer camera frame before the normal confidence/sanity/progress
+        checks run. If the retry still looks bad, the normal refusal path remains.
+        """
+
+        if not line.found:
+            return line.message or "line/edge not found"
+
+        min_confidence = self._get_follow_min_confidence()
+        search_px = max(1.0, float(line.search_px or self._get_line_search_px()))
+        span_px = max(0.0, float(line.span_px))
+        points = max(0, int(line.point_count))
+        confidence = max(0.0, float(line.confidence))
+
+        tiny_span = span_px < max(12.0, search_px * 0.06)
+        sparse_points = points < 18
+        very_low_confidence = confidence < min(35.0, max(10.0, min_confidence - 10.0))
+
+        previous = self.current_line
+        sudden_span_collapse = False
+        sudden_point_collapse = False
+        if previous is not None and previous.found:
+            prev_span = max(0.0, float(previous.span_px))
+            prev_points = max(0, int(previous.point_count))
+            sudden_span_collapse = prev_span > 80.0 and span_px < (prev_span * 0.25)
+            sudden_point_collapse = prev_points > 40 and points < max(12, int(prev_points * 0.25))
+
+        if tiny_span and (sparse_points or very_low_confidence or sudden_span_collapse):
+            return f"garbage detection: tiny span {span_px:.1f}px, points {points}, confidence {confidence:.0f}%"
+        if sparse_points and (very_low_confidence or sudden_point_collapse):
+            return f"garbage detection: sparse points {points}, span {span_px:.1f}px, confidence {confidence:.0f}%"
+        if very_low_confidence and (sudden_span_collapse or sudden_point_collapse):
+            return f"garbage detection: sudden quality collapse, confidence {confidence:.0f}%"
+        return None
+
     def _detect_line_for_follow_with_retries(
         self,
         *,
@@ -980,12 +1119,11 @@ class CameraCalibrationDialog(tk.Toplevel):
         phase: str,
         base_event: str,
     ) -> tuple[LineDetection, float]:
-        """Detect a line/edge and retry transient not-found frames safely.
+        """Detect a line/edge and retry transient not-found/garbage frames safely.
 
-        v0.5.3.3 intentionally retries only complete not-found detections. It
-        does not bypass confidence, sanity, progress lock, or motion limits. The
-        retry waits for a newer camera frame first, so it can recover from a bad
-        frame without re-processing the same failed image over and over.
+        This does not bypass confidence, sanity, progress lock, or motion limits.
+        It only waits for a newer camera frame and re-runs detection before those
+        checks decide whether the step is safe.
         """
 
         attempts = max(0, int(self._follow_not_found_retry_count))
@@ -994,21 +1132,23 @@ class CameraCalibrationDialog(tk.Toplevel):
         line = self.detect_line()
         detection_ms = (time.monotonic() - detection_start) * 1000.0
         total_detection_ms += detection_ms
+        retry_reason = self._line_detection_retry_reason(line)
         self._timeline_log(
             base_event,
             step_id=step_id,
             step_label=step_label,
             result="found" if line.found else "not_found",
             reason=line.message,
+            garbage_retry_reason=retry_reason or "",
             detection_phase=phase,
             retry_attempt=0,
             duration_ms=f"{detection_ms:.3f}",
             **self._timeline_line_fields(line),
         )
 
-        if line.found:
+        if retry_reason is None:
             self._last_follow_detection_sequence = int(getattr(self, "current_frame_sequence", 0) or 0)
-            self._last_follow_detection_result = "found"
+            self._last_follow_detection_result = "found" if line.found else "not_found"
             return line, total_detection_ms
 
         for attempt in range(1, attempts + 1):
@@ -1022,7 +1162,7 @@ class CameraCalibrationDialog(tk.Toplevel):
                 step_id=step_id,
                 step_label=step_label,
                 result="fresh" if refreshed else "timeout",
-                reason=line.message,
+                reason=retry_reason,
                 detection_phase=phase,
                 retry_attempt=attempt,
                 retry_wait_ms=f"{waited_s * 1000.0:.3f}",
@@ -1035,25 +1175,27 @@ class CameraCalibrationDialog(tk.Toplevel):
             retry_line = self.detect_line()
             retry_ms = (time.monotonic() - retry_start) * 1000.0
             total_detection_ms += retry_ms
+            retry_reason = self._line_detection_retry_reason(retry_line)
             self._timeline_log(
                 f"{base_event}_RETRY",
                 step_id=step_id,
                 step_label=step_label,
                 result="found" if retry_line.found else "not_found",
                 reason=retry_line.message,
+                garbage_retry_reason=retry_reason or "",
                 detection_phase=phase,
                 retry_attempt=attempt,
                 duration_ms=f"{retry_ms:.3f}",
                 **self._timeline_line_fields(retry_line),
             )
             line = retry_line
-            if line.found:
+            if retry_reason is None:
                 self._last_follow_detection_sequence = int(getattr(self, "current_frame_sequence", 0) or 0)
-                self._last_follow_detection_result = f"found after retry {attempt}"
+                self._last_follow_detection_result = f"found after retry {attempt}" if line.found else "not_found after retry"
                 return line, total_detection_ms
 
         self._last_follow_detection_sequence = int(getattr(self, "current_frame_sequence", 0) or 0)
-        self._last_follow_detection_result = "not_found"
+        self._last_follow_detection_result = "retry exhausted"
         return line, total_detection_ms
 
     def _timeline_log(self, event: str, **kwargs: Any) -> None:
@@ -1156,9 +1298,140 @@ class CameraCalibrationDialog(tk.Toplevel):
     def _clear_follow_heading(self, *, clear_corner_resume: bool = True) -> None:
         self._follow_heading_unit = None
         self._follow_last_move_unit = None
+        self._follow_recent_turn_degrees = []
+        self._follow_recent_raw_angle_degrees = []
+        self._last_follow_sanity_action = ""
+        self._last_follow_sanity_reason = ""
+        self._last_follow_sanity_change_degrees = None
         self._reset_follow_filter()
         if clear_corner_resume:
             self._follow_corner_resume_once = False
+        self._reset_corner_assist_consumed()
+
+    def _reset_corner_assist_consumed(self) -> None:
+        self._follow_corner_assist_consumed = False
+        self._follow_corner_assist_cooldown_steps = 0
+        self._follow_corner_assist_clear_frames = 0
+
+    def _corner_assist_cooldown_fields(self) -> dict[str, object]:
+        return {
+            "corner_cooldown_active": bool(self._follow_corner_assist_consumed),
+            "corner_cooldown_steps": int(self._follow_corner_assist_cooldown_steps),
+            "corner_cooldown_limit": int(self._follow_corner_assist_clear_frame_limit),
+            "corner_clear_frames": int(self._follow_corner_assist_clear_frames),
+            "corner_clear_frame_limit": int(self._follow_corner_assist_clear_frame_limit),
+        }
+
+    def _arm_corner_assist_consumed(
+        self,
+        *,
+        step_id: int,
+        step_label: str,
+        assist: CornerAssistMove,
+        line: LineDetection,
+    ) -> None:
+        self._follow_corner_assist_consumed = True
+        self._follow_corner_assist_cooldown_steps = 0
+        self._follow_corner_assist_clear_frames = 0
+        self._timeline_log(
+            "CORNER_ASSIST_CONSUMED",
+            step_id=step_id,
+            step_label=step_label,
+            result="armed",
+            reason="successful corner assist; suppressing repeat assists until the corner candidate clears",
+            corner_action="consumed",
+            corner_reason=assist.reason or "assist_ok",
+            **self._corner_timeline_fields(line, assist),
+            **self._corner_assist_cooldown_fields(),
+        )
+
+    def _clear_corner_assist_consumed(
+        self,
+        *,
+        step_id: int,
+        step_label: str,
+        reason: str,
+        line: Optional[LineDetection] = None,
+    ) -> None:
+        if not self._follow_corner_assist_consumed:
+            return
+        prior_steps = self._follow_corner_assist_cooldown_steps
+        self._follow_corner_assist_consumed = False
+        self._follow_corner_assist_cooldown_steps = 0
+        self._follow_corner_assist_clear_frames = 0
+        fields = self._timeline_line_fields(line) if line is not None else {}
+        self._timeline_log(
+            "CORNER_ASSIST_CLEARED",
+            step_id=step_id,
+            step_label=step_label,
+            result="cleared",
+            reason=reason,
+            corner_action="cleared",
+            corner_reason=reason,
+            corner_cooldown_active=False,
+            corner_cooldown_steps=prior_steps,
+            corner_cooldown_limit=int(self._follow_corner_assist_clear_frame_limit),
+            corner_clear_frames=0,
+            corner_clear_frame_limit=int(self._follow_corner_assist_clear_frame_limit),
+            **fields,
+        )
+
+    def _clear_corner_assist_if_corner_zone_cleared(
+        self,
+        line: LineDetection,
+        *,
+        step_id: int,
+        step_label: str,
+        phase: str,
+    ) -> None:
+        if not self._follow_corner_assist_consumed:
+            return
+        if line.found and not line.corner_candidate:
+            self._follow_corner_assist_clear_frames += 1
+            self._timeline_log(
+                "CORNER_ASSIST_CLEAR_FRAME",
+                step_id=step_id,
+                step_label=step_label,
+                result="ok",
+                reason=f"corner candidate clear frame on {phase}",
+                corner_action="clear_frame",
+                corner_reason=phase,
+                **self._corner_assist_cooldown_fields(),
+                **self._timeline_line_fields(line),
+            )
+            if self._follow_corner_assist_clear_frames >= self._follow_corner_assist_clear_frame_limit:
+                self._clear_corner_assist_consumed(
+                    step_id=step_id,
+                    step_label=step_label,
+                    reason=f"corner zone cleared for {self._follow_corner_assist_clear_frames} frames on {phase}",
+                    line=line,
+                )
+        else:
+            # Still seeing the same corner/ambiguous/radius zone, or the frame
+            # was not usable. Keep Corner Assist consumed and do not re-arm.
+            self._follow_corner_assist_clear_frames = 0
+
+    def _record_corner_assist_ordinary_step(
+        self,
+        *,
+        step_id: int,
+        step_label: str,
+        line: LineDetection,
+    ) -> None:
+        if not self._follow_corner_assist_consumed:
+            return
+        self._follow_corner_assist_cooldown_steps += 1
+        self._timeline_log(
+            "CORNER_ASSIST_COOLDOWN_STEP",
+            step_id=step_id,
+            step_label=step_label,
+            result="ok",
+            reason="ordinary follow step while corner assist is consumed; re-arm waits for corner candidate to clear",
+            corner_action="cooldown_step",
+            corner_reason="post_assist_ordinary_step",
+            **self._corner_assist_cooldown_fields(),
+            **self._timeline_line_fields(line),
+        )
 
     def _reset_follow_filter(self) -> None:
         self._follow_filtered_err = None
@@ -1989,6 +2262,16 @@ class CameraCalibrationDialog(tk.Toplevel):
         if bool(self.show_line_preview_var.get()):
             self._draw_line_overlay(draw, scale, source_w, source_h)
 
+        # M6.3 display-only planner overlay. The M6 module supplies this hook;
+        # it draws only already-computed planner/belief data and performs no
+        # extra perception or planning in the preview path.
+        m6_overlay = getattr(self, "_m6_draw_live_overlay", None)
+        if callable(m6_overlay):
+            try:
+                m6_overlay(draw, scale, source_w, source_h)
+            except Exception:
+                pass
+
         source_text = f"Source {source_w}x{source_h}  Threshold {self._get_threshold()}"
         frame_age = self._current_frame_age_s()
         if frame_age is not None:
@@ -2175,17 +2458,17 @@ class CameraCalibrationDialog(tk.Toplevel):
         search_px: int,
         corner_angle_min: float,
     ) -> CornerMetrics:
-        """Detect whether the ROI contains two strong line directions.
+        """Detect Hough line-direction clusters in the search ROI.
 
-        A sharp printed corner makes the current single-line fit average both
-        legs into a rounded/diagonal result. This detector uses Hough line
-        segments in the same search ROI to notice when there is a meaningful
-        secondary direction. v0.5.21 also fits both Hough-direction clusters so
-        the two line equations can be intersected for Corner Assist.
+        The original corner detector only returned candidate/not-candidate. For
+        profile troubleshooting, keep the cluster counts and top cluster details
+        even when the scene is not accepted as a corner. This lets the timeline
+        log show whether a sanity stop happened in a true single-line scene or a
+        multi-line ambiguous scene.
         """
 
         if roi.size <= 0:
-            return CornerMetrics()
+            return CornerMetrics(reject_reason="empty_roi")
 
         edges = cv2.Canny(roi, 50, 150)
         min_line_length = max(18, int(round(search_px * 0.12)))
@@ -2200,7 +2483,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             maxLineGap=max_line_gap,
         )
         if lines is None:
-            return CornerMetrics()
+            return CornerMetrics(reject_reason="no_hough_lines")
 
         segments: list[tuple[float, float, float, float, float, float]] = []
         for line in lines.reshape(-1, 4):
@@ -2210,8 +2493,12 @@ class CameraCalibrationDialog(tk.Toplevel):
                 continue
             angle = math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
             segments.append((angle, length, x1, y1, x2, y2))
-        if len(segments) < 2:
-            return CornerMetrics()
+        hough_segment_count = len(segments)
+        if hough_segment_count < 2:
+            return CornerMetrics(
+                hough_segment_count=hough_segment_count,
+                reject_reason="too_few_hough_segments",
+            )
 
         clusters: list[dict[str, Any]] = []
         for angle, length, sx1, sy1, sx2, sy2 in sorted(segments, key=lambda item: item[1], reverse=True):
@@ -2246,10 +2533,32 @@ class CameraCalibrationDialog(tk.Toplevel):
                     }
                 )
 
-        if len(clusters) < 2:
-            return CornerMetrics()
-
         clusters.sort(key=lambda item: float(item["length"]), reverse=True)
+        cluster_count = len(clusters)
+        top = clusters[:3]
+        primary_angle = float(top[0]["angle"]) if len(top) >= 1 else 0.0
+        secondary_angle = float(top[1]["angle"]) if len(top) >= 2 else 0.0
+        third_angle = float(top[2]["angle"]) if len(top) >= 3 else 0.0
+        primary_length = float(top[0]["length"]) if len(top) >= 1 else 0.0
+        secondary_length = float(top[1]["length"]) if len(top) >= 2 else 0.0
+        third_length = float(top[2]["length"]) if len(top) >= 3 else 0.0
+
+        def base_metrics(**kwargs: Any) -> CornerMetrics:
+            return CornerMetrics(
+                hough_segment_count=hough_segment_count,
+                cluster_count=cluster_count,
+                primary_angle_degrees=primary_angle,
+                secondary_angle_degrees=secondary_angle,
+                third_angle_degrees=third_angle,
+                primary_length_px=primary_length,
+                secondary_length_px=secondary_length,
+                third_length_px=third_length,
+                **kwargs,
+            )
+
+        if cluster_count < 2:
+            return base_metrics(reject_reason="single_hough_cluster")
+
         primary = clusters[0]
         best_secondary: Optional[dict[str, Any]] = None
         best_separation = 0.0
@@ -2260,7 +2569,7 @@ class CameraCalibrationDialog(tk.Toplevel):
                 best_secondary = secondary
 
         if best_secondary is None:
-            return CornerMetrics()
+            return base_metrics(reject_reason="no_secondary_cluster")
 
         def fit_cluster(cluster: dict[str, Any]) -> Optional[tuple[float, float, float, float]]:
             pts = np.asarray(cluster["points"], dtype=np.float32)
@@ -2284,7 +2593,7 @@ class CameraCalibrationDialog(tk.Toplevel):
         primary_fit = fit_cluster(primary)
         secondary_fit = fit_cluster(best_secondary)
         if primary_fit is None or secondary_fit is None:
-            return CornerMetrics()
+            return base_metrics(reject_reason="cluster_fit_failed")
 
         p_x, p_y, p_vx, p_vy = primary_fit
         s_x, s_y, s_vx, s_vy = secondary_fit
@@ -2296,12 +2605,17 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         strength = float(best_secondary["length"]) / max(1.0, float(primary["length"]))
         min_secondary_length = max(24.0, float(search_px) * 0.18)
-        candidate = (
-            best_separation >= corner_angle_min
-            and best_separation <= 135.0
-            and float(best_secondary["length"]) >= min_secondary_length
-            and strength >= 0.25
-        )
+        reject_reasons: list[str] = []
+        if best_separation < corner_angle_min:
+            reject_reasons.append("separation_below_threshold")
+        if best_separation > 135.0:
+            reject_reasons.append("separation_above_limit")
+        if float(best_secondary["length"]) < min_secondary_length:
+            reject_reasons.append("secondary_too_short")
+        if strength < 0.25:
+            reject_reasons.append("secondary_too_weak")
+        candidate = not reject_reasons
+        reject_reason = ";".join(reject_reasons)
         message = (
             f"secondary line {best_separation:.0f}° from primary, strength {strength:.2f}"
             if float(best_secondary["length"]) >= min_secondary_length
@@ -2311,12 +2625,14 @@ class CameraCalibrationDialog(tk.Toplevel):
             message = f"{message}, intersection fitted"
         elif candidate:
             message = f"{message}, no safe intersection"
+            reject_reason = "no_safe_intersection"
 
-        return CornerMetrics(
+        return base_metrics(
             candidate=bool(candidate),
             angle_degrees=float(best_separation),
             strength=float(strength),
             message=message,
+            reject_reason=reject_reason,
             primary_x=float(p_x),
             primary_y=float(p_y),
             primary_vx=float(p_vx),
@@ -2494,6 +2810,15 @@ class CameraCalibrationDialog(tk.Toplevel):
             corner_candidate=corner_metrics.candidate,
             corner_angle_degrees=corner_metrics.angle_degrees,
             corner_strength=corner_metrics.strength,
+            corner_hough_segment_count=corner_metrics.hough_segment_count,
+            corner_cluster_count=corner_metrics.cluster_count,
+            corner_primary_angle_degrees=corner_metrics.primary_angle_degrees,
+            corner_secondary_angle_degrees=corner_metrics.secondary_angle_degrees,
+            corner_third_angle_degrees=corner_metrics.third_angle_degrees,
+            corner_primary_length_px=corner_metrics.primary_length_px,
+            corner_secondary_length_px=corner_metrics.secondary_length_px,
+            corner_third_length_px=corner_metrics.third_length_px,
+            corner_reject_reason=corner_metrics.reject_reason,
             corner_message=corner_metrics.message,
             corner_primary_vx=corner_metrics.primary_vx,
             corner_primary_vy=corner_metrics.primary_vy,
@@ -2684,14 +3009,52 @@ class CameraCalibrationDialog(tk.Toplevel):
         return best
 
     def _follow_detection_sanity_ok(self, line: LineDetection, *, step_label: str) -> bool:
+        """Reject sudden wrong-feature jumps while allowing strong curve/profile turns."""
+
+        self._last_follow_sanity_action = "pass"
+        self._last_follow_sanity_reason = ""
+        self._last_follow_sanity_change_degrees = None
         if not self._get_follow_stabilize_enabled():
+            self._last_follow_sanity_action = "disabled"
             return True
         sanity_angle = self._get_follow_sanity_angle()
         if sanity_angle <= 0.0 or self._follow_heading_unit is None or line.corner_candidate:
+            self._last_follow_sanity_action = "disabled"
             return True
         heading_change = self._heading_change_from_line_to_latch(line)
+        self._last_follow_sanity_change_degrees = heading_change
         if heading_change is None or heading_change <= sanity_angle:
             return True
+
+        max_turn = self._get_follow_max_heading_change()
+        if max_turn <= 0.0:
+            max_turn = 180.0
+        curve_limit = min(180.0, max_turn, max(sanity_angle + 20.0, sanity_angle * 1.75))
+        min_confidence = self._get_follow_min_confidence()
+        search_px = max(1.0, float(line.search_px or self._get_line_search_px()))
+        strong_quality = (
+            line.found
+            and float(line.confidence) >= max(min_confidence, 60.0)
+            and float(line.span_px) >= max(120.0, search_px * 0.60)
+            and int(line.point_count) >= 35
+        )
+        recent_turns = [abs(float(v)) for v in self._follow_recent_turn_degrees[-4:]]
+        recent_avg = sum(recent_turns) / len(recent_turns) if recent_turns else 0.0
+        profile_turn = heading_change <= curve_limit and strong_quality
+
+        if profile_turn:
+            self._last_follow_sanity_action = "curve_allowed"
+            self._last_follow_sanity_reason = (
+                f"strong detection allowed {heading_change:.0f}° profile turn "
+                f"(sanity {sanity_angle:.0f}°, curve limit {curve_limit:.0f}°, recent {recent_avg:.1f}°)"
+            )
+            return True
+
+        self._last_follow_sanity_action = "refused"
+        self._last_follow_sanity_reason = (
+            f"heading jump {heading_change:.0f}° exceeds sanity {sanity_angle:.0f}° "
+            f"without strong curve/profile quality"
+        )
         self.cal_status_var.set(
             f"{step_label} refused: detection heading jumped {heading_change:.0f}° from the latched heading; "
             f"sanity limit is {sanity_angle:.0f}°. Treating this frame as not-found instead of following a possible wrong feature."
@@ -3525,17 +3888,54 @@ class CameraCalibrationDialog(tk.Toplevel):
         follow_step: float,
         direction_preference: str,
     ) -> CornerAssistMove:
-        """Calculate a conservative move to the detected corner intersection.
+        """Calculate a committed move to the detected corner intersection.
 
-        This is the first real corner-follow assist. When the search ROI sees
-        two strong line directions, drive the camera/crosshair to the fitted
-        line intersection instead of asking the user to step through the corner
-        manually. The move is limited to a short lookahead window so a bad
-        intersection cannot command a large blind move.
+        v0.5.3.9 changed Corner Assist from a cautious nudge into a real
+        corner-commit step. If the detected intersection passes the corner-vs-
+        radius gate and is inside the configured lookahead window, command the
+        camera/crosshair directly to that vertex, then latch the outgoing Hough
+        leg.  Rounding was happening because FabScan could see the vertex but
+        kept treating it as a hint while ordinary follow blended through it.
         """
 
+        acceptance_ok, acceptance_reason, stability_fields = self._corner_acceptance_from_heading_history()
+        heading_count = int(stability_fields.get("corner_heading_samples", 0) or 0)
+        try:
+            heading_range = float(stability_fields.get("corner_heading_range_degrees") or 0.0)
+        except (TypeError, ValueError):
+            heading_range = 0.0
+        try:
+            heading_avg_step = float(stability_fields.get("corner_heading_avg_step_degrees") or 0.0)
+        except (TypeError, ValueError):
+            heading_avg_step = 0.0
+
+        base_kwargs = {
+            "classification": "corner" if acceptance_ok else "radius",
+            "classification_reason": acceptance_reason,
+            "heading_sample_count": heading_count,
+            "heading_range_degrees": heading_range,
+            "heading_avg_step_degrees": heading_avg_step,
+            "intersection_x_px": float(line.corner_intersection_x),
+            "intersection_y_px": float(line.corner_intersection_y),
+            "offset_x_px": float(line.corner_intersection_x) - (frame_w / 2.0),
+            "offset_y_px": float(line.corner_intersection_y) - (frame_h / 2.0),
+        }
+
+        if not acceptance_ok:
+            return CornerAssistMove(
+                False,
+                message=acceptance_reason,
+                reason="radius_heading",
+                **base_kwargs,
+            )
+
         if not line.corner_intersection_valid:
-            return CornerAssistMove(False, message="no safe line intersection")
+            return CornerAssistMove(
+                False,
+                message="no safe line intersection",
+                reason="no_safe_intersection",
+                **base_kwargs,
+            )
 
         heading_candidates = self._machine_heading_candidates_from_line(line, include_corner_directions=True)
         outgoing_heading, heading_state = self._choose_latched_follow_heading_from_candidates(
@@ -3544,36 +3944,70 @@ class CameraCalibrationDialog(tk.Toplevel):
             ignore_previous=True,
         )
         if outgoing_heading is None:
-            return CornerAssistMove(False, message="could not latch outgoing corner direction")
+            return CornerAssistMove(
+                False,
+                message="could not latch outgoing corner direction",
+                reason="no_outgoing_heading",
+                **base_kwargs,
+            )
 
-        err_x = line.corner_intersection_x - (frame_w / 2.0)
-        err_y = line.corner_intersection_y - (frame_h / 2.0)
+        err_x = base_kwargs["offset_x_px"]
+        err_y = base_kwargs["offset_y_px"]
         move = self._machine_correction_from_pixel_error(err_x, err_y)
         if move is None:
-            return CornerAssistMove(False, message="saved calibration could not convert corner offset")
+            return CornerAssistMove(
+                False,
+                message="saved calibration could not convert corner offset",
+                reason="bad_calibration",
+                heading=outgoing_heading,
+                heading_state=heading_state,
+                **base_kwargs,
+            )
 
         move_x, move_y = move
         distance = math.hypot(move_x, move_y)
         if not math.isfinite(distance):
-            return CornerAssistMove(False, message="corner move was not finite")
+            return CornerAssistMove(
+                False,
+                message="corner move was not finite",
+                reason="nonfinite_move",
+                heading=outgoing_heading,
+                heading_state=heading_state,
+                **base_kwargs,
+            )
 
         lookahead_steps = self._get_follow_corner_lookahead_steps()
         max_distance = max(follow_step, follow_step * float(lookahead_steps))
+        # v0.5.3.9: keep this field for log continuity, but Corner Commit no
+        # longer waits for the vertex to fall inside Follow Step + Max Correct.
+        # Once a candidate is accepted as a true corner, drive directly to it as
+        # long as it is inside the configured lookahead safety window.
+        engage_distance = max_distance
         if distance > max_distance:
             return CornerAssistMove(
                 False,
-                message=f"corner is {distance:.4f} away; lookahead limit is {max_distance:.4f}",
+                message=(
+                    f"corner is {distance:.4f} away; lookahead limit is {max_distance:.4f}"
+                ),
+                reason="too_far",
                 distance=distance,
                 max_distance=max_distance,
+                engage_distance=engage_distance,
+                heading=outgoing_heading,
+                heading_state=heading_state,
+                **base_kwargs,
             )
         if distance < 0.0005:
             return CornerAssistMove(
                 False,
                 message="already at/too near the calculated corner",
+                reason="too_near",
                 heading=outgoing_heading,
                 heading_state=heading_state,
                 distance=distance,
                 max_distance=max_distance,
+                engage_distance=engage_distance,
+                **base_kwargs,
             )
 
         return CornerAssistMove(
@@ -3583,11 +4017,13 @@ class CameraCalibrationDialog(tk.Toplevel):
             heading=outgoing_heading,
             heading_state=heading_state,
             message=(
-                f"intersection X{line.corner_intersection_x - (frame_w / 2.0):+.0f}px "
-                f"Y{line.corner_intersection_y - (frame_h / 2.0):+.0f}px"
+                f"commit vertex X{err_x:+.0f}px Y{err_y:+.0f}px"
             ),
+            reason="corner_commit",
             distance=distance,
             max_distance=max_distance,
+            engage_distance=engage_distance,
+            **base_kwargs,
         )
 
     @staticmethod
@@ -3607,6 +4043,144 @@ class CameraCalibrationDialog(tk.Toplevel):
         prev_unit = (previous[0] / prev_len, previous[1] / prev_len)
         head_unit = (heading[0] / head_len, heading[1] / head_len)
         return self._angle_between_unit_vectors(prev_unit, head_unit)
+
+    @staticmethod
+    def _signed_angle_between_unit_vectors(a: tuple[float, float], b: tuple[float, float]) -> float:
+        dot = (a[0] * b[0]) + (a[1] * b[1])
+        cross = (a[0] * b[1]) - (a[1] * b[0])
+        return math.degrees(math.atan2(cross, dot))
+
+    def _record_accepted_heading_turn(self, previous: Optional[tuple[float, float]], heading: tuple[float, float]) -> None:
+        if previous is None:
+            return
+        prev_unit = self._normalize_unit_vector(previous[0], previous[1])
+        head_unit = self._normalize_unit_vector(heading[0], heading[1])
+        if prev_unit is None or head_unit is None:
+            return
+        signed_turn = self._signed_angle_between_unit_vectors(prev_unit, head_unit)
+        if math.isfinite(signed_turn):
+            self._follow_recent_turn_degrees.append(signed_turn)
+            self._follow_recent_turn_degrees = self._follow_recent_turn_degrees[-8:]
+
+    def _record_follow_raw_angle(self, line: LineDetection, *, reset: bool = False) -> None:
+        if reset:
+            self._follow_recent_raw_angle_degrees.clear()
+        if not line.found:
+            return
+        angle = float(line.angle_degrees)
+        if math.isfinite(angle):
+            self._follow_recent_raw_angle_degrees.append(angle)
+            self._follow_recent_raw_angle_degrees = self._follow_recent_raw_angle_degrees[-8:]
+
+    @staticmethod
+    def _unwrap_axis_angle_series(angles: list[float]) -> list[float]:
+        if not angles:
+            return []
+        unwrapped = [float(angles[0])]
+        for raw in angles[1:]:
+            candidate = float(raw)
+            previous = unwrapped[-1]
+            # Line-fit angles are axes, so +/- 180 degrees is the same physical
+            # line. Pick the equivalent angle nearest the previous sample.
+            while candidate - previous > 90.0:
+                candidate -= 180.0
+            while candidate - previous < -90.0:
+                candidate += 180.0
+            unwrapped.append(candidate)
+        return unwrapped
+
+    def _corner_heading_stability_fields(self) -> dict[str, object]:
+        samples = self._unwrap_axis_angle_series([float(v) for v in self._follow_recent_raw_angle_degrees[-5:]])
+        if len(samples) < 2:
+            return {
+                "corner_heading_samples": len(samples),
+                "corner_heading_range_degrees": "",
+                "corner_heading_avg_step_degrees": "",
+            }
+        diffs = [abs(samples[i] - samples[i - 1]) for i in range(1, len(samples))]
+        heading_range = max(samples) - min(samples)
+        avg_step = sum(diffs) / len(diffs) if diffs else 0.0
+        return {
+            "corner_heading_samples": len(samples),
+            "corner_heading_range_degrees": f"{heading_range:.3f}",
+            "corner_heading_avg_step_degrees": f"{avg_step:.3f}",
+        }
+
+    def _corner_acceptance_from_heading_history(self) -> tuple[bool, str, dict[str, object]]:
+        """Return whether a corner candidate should be treated as a real vertex.
+
+        A real sharp corner should be approached from a mostly stable incoming
+        heading. A fillet/radius produces several accepted steps where the raw
+        line angle continuously walks.  If the recent incoming angle is already
+        rotating, Corner Assist is suppressed and the normal profile follower
+        keeps tracing the curve.
+        """
+
+        fields = self._corner_heading_stability_fields()
+        count = int(fields.get("corner_heading_samples", 0) or 0)
+        if count < 4:
+            return True, "insufficient_history_allow", fields
+        try:
+            heading_range = float(fields.get("corner_heading_range_degrees") or 0.0)
+            avg_step = float(fields.get("corner_heading_avg_step_degrees") or 0.0)
+        except (TypeError, ValueError):
+            return True, "bad_history_allow", fields
+
+        # First pass thresholds: a stable straight approach should be well under
+        # these values. The G/radius logs that fooled Corner Assist were walking
+        # roughly 3-4 degrees per accepted step with a multi-sample range above
+        # 10 degrees, so they should be classified as radius/profile geometry.
+        if heading_range > 8.0 or avg_step > 2.25:
+            return False, f"incoming heading rotating: range {heading_range:.1f}°, avg {avg_step:.1f}°/step", fields
+        return True, f"incoming heading stable: range {heading_range:.1f}°, avg {avg_step:.1f}°/step", fields
+
+    @staticmethod
+    def _corner_assist_timeline_fields(assist: Optional[CornerAssistMove]) -> dict[str, object]:
+        if assist is None:
+            return {}
+        heading_x = ""
+        heading_y = ""
+        if assist.heading is not None:
+            heading_x = f"{assist.heading[0]:.6f}"
+            heading_y = f"{assist.heading[1]:.6f}"
+        return {
+            "corner_classification": assist.classification,
+            "corner_classification_reason": assist.classification_reason,
+            "corner_heading_samples": int(assist.heading_sample_count),
+            "corner_heading_range_degrees": f"{assist.heading_range_degrees:.3f}" if assist.heading_sample_count >= 2 else "",
+            "corner_heading_avg_step_degrees": f"{assist.heading_avg_step_degrees:.3f}" if assist.heading_sample_count >= 2 else "",
+            "corner_distance": f"{assist.distance:.6f}",
+            "corner_lookahead_limit": f"{assist.max_distance:.6f}",
+            "corner_engage_limit": f"{assist.engage_distance:.6f}",
+            "corner_intersection_x_px": f"{assist.intersection_x_px:.3f}",
+            "corner_intersection_y_px": f"{assist.intersection_y_px:.3f}",
+            "corner_offset_x_px": f"{assist.offset_x_px:.3f}",
+            "corner_offset_y_px": f"{assist.offset_y_px:.3f}",
+            "corner_machine_move_x": f"{assist.move_x:.6f}",
+            "corner_machine_move_y": f"{assist.move_y:.6f}",
+            "corner_outgoing_x": heading_x,
+            "corner_outgoing_y": heading_y,
+        }
+
+    def _corner_timeline_fields(
+        self,
+        line: Optional[LineDetection],
+        assist: Optional[CornerAssistMove] = None,
+    ) -> dict[str, object]:
+        """Merge line and corner-assist fields without duplicate kwargs.
+
+        v0.5.3.9 logged explicit corner-intersection fields in both the
+        ordinary line detection fields and the Corner Assist fields. Passing
+        both dictionaries directly as **kwargs can throw a TypeError before
+        MOVE_PLAN/STEP_REFUSED gets logged, which looks exactly like a silent
+        corner pause. Keep the line fields for general detector state, then let
+        the assist fields override the vertex/commit-specific values when a
+        CornerAssistMove exists.
+        """
+
+        fields: dict[str, object] = dict(self._timeline_line_fields(line))
+        fields.update(self._corner_assist_timeline_fields(assist))
+        return fields
 
     def _begin_follow_run(self, label: str, *, requested_steps: int, reset_latch: bool) -> None:
         self._follow_run_counter += 1
@@ -3629,6 +4203,11 @@ class CameraCalibrationDialog(tk.Toplevel):
             move_len=f"{self._get_follow_step():.6f}",
             min_confidence=f"{self._get_follow_min_confidence():.3f}",
             applied_correct_len=f"{self._get_follow_max_correct():.6f}",
+            corner_cooldown_active=False,
+            corner_cooldown_steps=0,
+            corner_cooldown_limit=int(self._follow_corner_assist_clear_frame_limit),
+            corner_clear_frames=0,
+            corner_clear_frame_limit=int(self._follow_corner_assist_clear_frame_limit),
         )
 
     def follow_line_single_step(self) -> None:
@@ -3809,6 +4388,14 @@ class CameraCalibrationDialog(tk.Toplevel):
                 step_label=step_label,
                 result="refused",
                 reason=self.cal_status_var.get(),
+                sanity_action=self._last_follow_sanity_action,
+                sanity_reason=self._last_follow_sanity_reason,
+                sanity_limit_degrees=f"{self._get_follow_sanity_angle():.3f}",
+                sanity_change_degrees=(
+                    f"{self._last_follow_sanity_change_degrees:.3f}"
+                    if self._last_follow_sanity_change_degrees is not None
+                    else ""
+                ),
                 **self._timeline_line_fields(line),
             )
             self._show_current_frame()
@@ -3835,6 +4422,12 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         follow_step = self._get_follow_step()
         direction_preference = self._get_follow_direction_preference()
+        self._clear_corner_assist_if_corner_zone_cleared(
+            line,
+            step_id=step_id,
+            step_label=step_label,
+            phase="pre_move",
+        )
 
         correction = self._machine_correction_from_pixel_error(line.pixel_error_x, line.pixel_error_y)
         if correction is None:
@@ -3846,34 +4439,122 @@ class CameraCalibrationDialog(tk.Toplevel):
 
         corner_resume = bool(self._follow_corner_resume_once and line.corner_candidate)
         corner_assist: Optional[CornerAssistMove] = None
+        corner_plan_action = ""
+        corner_plan_reason = ""
         if bool(self.follow_corner_pause_var.get()) and line.corner_candidate and not corner_resume:
             if bool(self.follow_corner_assist_var.get()):
-                assist = self._corner_assist_move_from_line(
-                    line,
-                    frame_w=frame_w,
-                    frame_h=frame_h,
-                    follow_step=follow_step,
-                    direction_preference=direction_preference,
-                )
-                if assist.ok:
-                    corner_assist = assist
-                else:
-                    corner_angle = self._get_follow_corner_angle(normalize=True)
-                    self._follow_corner_resume_once = True
-                    self.cal_status_var.set(
-                        f"{step_label} paused: corner seen, but Corner Assist refused "
-                        f"({assist.message}; threshold {corner_angle:.0f}°). "
-                        "Choose/check Start dir, adjust Lookahead/Search if needed, or click Find Line/Edge then Follow Step."
+                if self._follow_corner_assist_consumed:
+                    corner_plan_action = "suppressed_after_assist"
+                    corner_plan_reason = "consumed_wait_clear"
+                    # Corner Assist already fired for this corner/ambiguous zone.
+                    # Do not even try to solve another intersection while the
+                    # camera still sees the same corner candidate; repeated or
+                    # failed assist attempts here are what made tabs/radii get stuck.
+                    self._timeline_log(
+                        "CORNER_ASSIST_SUPPRESSED",
+                        step_id=step_id,
+                        step_label=step_label,
+                        result="suppressed",
+                        reason="corner assist already consumed; waiting for corner candidate to clear",
+                        corner_action="suppressed_after_assist",
+                        corner_reason="consumed_wait_clear",
+                        **self._corner_assist_cooldown_fields(),
+                        **self._timeline_line_fields(line),
                     )
-                    self._show_current_frame()
-                    return False
+                else:
+                    assist = self._corner_assist_move_from_line(
+                        line,
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                        follow_step=follow_step,
+                        direction_preference=direction_preference,
+                    )
+                    if assist.ok:
+                        corner_assist = assist
+                    elif assist.reason == "radius_heading":
+                        corner_plan_action = "suppressed_radius"
+                        corner_plan_reason = assist.reason
+                        # The Hough detector may see two directions while tracing a
+                        # radius/fillet. If the incoming heading has already been
+                        # rotating, classify this as continuous profile geometry and
+                        # keep the normal bounded follower in charge.
+                        self._timeline_log(
+                            "CORNER_ASSIST_SUPPRESSED",
+                            step_id=step_id,
+                            step_label=step_label,
+                            result="suppressed",
+                            reason=assist.message,
+                            corner_action="suppressed_radius",
+                            corner_reason=assist.reason,
+                            **self._corner_timeline_fields(line, assist),
+                            **self._corner_assist_cooldown_fields(),
+                        )
+                    elif assist.reason in ("too_far", "outside_engage"):
+                        corner_plan_action = "deferred"
+                        corner_plan_reason = assist.reason
+                        # The corner detector can see an upcoming vertex outside the
+                        # configured safe lookahead. Treat that as "not yet" rather
+                        # than stopping the whole Follow N run; continue with an
+                        # ordinary bounded follow step toward it.
+                        self._timeline_log(
+                            "CORNER_DEFERRED",
+                            step_id=step_id,
+                            step_label=step_label,
+                            result="deferred",
+                            reason=assist.message,
+                            corner_action="deferred",
+                            corner_reason=assist.reason,
+                            **self._corner_timeline_fields(line, assist),
+                            **self._corner_assist_cooldown_fields(),
+                        )
+                    else:
+                        # Do not let Corner Pause create a dead-end state. If the
+                        # corner solver cannot produce a committed vertex move but
+                        # the ordinary line detection is still strong enough, fall
+                        # back to the normal bounded follower and make that choice
+                        # explicit in the timeline. This preserves the data trail:
+                        # every detected frame now either commits, follows normally,
+                        # or refuses with a logged reason.
+                        corner_plan_action = "fallback_normal"
+                        corner_plan_reason = assist.reason
+                        self._timeline_log(
+                            "CORNER_ASSIST_FALLBACK",
+                            step_id=step_id,
+                            step_label=step_label,
+                            result="fallback",
+                            reason=assist.message,
+                            corner_action=corner_plan_action,
+                            corner_reason=corner_plan_reason,
+                            **self._corner_timeline_fields(line, assist),
+                            **self._corner_assist_cooldown_fields(),
+                        )
+                        self.cal_status_var.set(
+                            f"{step_label}: corner seen but assist could not commit "
+                            f"({assist.message}); falling back to ordinary follow."
+                        )
             else:
                 corner_angle = self._get_follow_corner_angle(normalize=True)
                 self._follow_corner_resume_once = True
+                reason = (
+                    f"corner pause triggered with Corner Assist disabled "
+                    f"({line.corner_message}; threshold {corner_angle:.0f}°)"
+                )
+                self._timeline_log(
+                    "STEP_REFUSED",
+                    step_id=step_id,
+                    step_label=step_label,
+                    result="refused",
+                    reason=reason,
+                    corner_action="pause",
+                    corner_reason="assist_disabled",
+                    **self._corner_assist_cooldown_fields(),
+                    **self._timeline_line_fields(line),
+                )
                 self.cal_status_var.set(
                     f"{step_label} paused: possible corner/intersection detected "
                     f"({line.corner_message}; threshold {corner_angle:.0f}°). "
-                    "Choose the next Start dir, then click Find Line/Edge. The next follow move will bypass corner pause once."
+                    "Corner Assist is disabled, so no vertex commit was attempted. "
+                    "Enable Corner Assist, or choose the next Start dir and click Find Line/Edge."
                 )
                 self._show_current_frame()
                 return False
@@ -3893,7 +4574,19 @@ class CameraCalibrationDialog(tk.Toplevel):
         if corner_assist is not None:
             heading = corner_assist.heading
             if heading is None:
-                self.cal_status_var.set(f"{step_label} failed: corner assist had no outgoing heading.")
+                reason = "corner assist had no outgoing heading"
+                self._timeline_log(
+                    "STEP_REFUSED",
+                    step_id=step_id,
+                    step_label=step_label,
+                    result="refused",
+                    reason=reason,
+                    corner_action="refused",
+                    corner_reason="no_outgoing_heading",
+                    **self._corner_timeline_fields(line, corner_assist),
+                    **self._corner_assist_cooldown_fields(),
+                )
+                self.cal_status_var.set(f"{step_label} failed: {reason}.")
                 self._show_current_frame()
                 return False
             heading_state = f"corner assist {corner_assist.heading_state}"
@@ -3902,7 +4595,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             tangent_y = 0.0
             correct_x = 0.0
             correct_y = 0.0
-            correction_state = "corner assist"
+            correction_state = "corner commit"
             raw_correct_len = 0.0
             applied_correct_len = 0.0
             move_x = corner_assist.move_x
@@ -3918,15 +4611,41 @@ class CameraCalibrationDialog(tk.Toplevel):
                 direction_preference,
             )
             if heading is None:
-                self.cal_status_var.set(f"{step_label} failed: detected line direction could not be latched.")
+                reason = "detected line direction could not be latched"
+                self._timeline_log(
+                    "STEP_REFUSED",
+                    step_id=step_id,
+                    step_label=step_label,
+                    result="refused",
+                    reason=reason,
+                    corner_action=corner_plan_action,
+                    corner_reason=corner_plan_reason,
+                    **self._corner_timeline_fields(line, None),
+                    **self._corner_assist_cooldown_fields(),
+                )
+                self.cal_status_var.set(f"{step_label} failed: {reason}.")
                 self._show_current_frame()
                 return False
 
             heading_change = self._follow_heading_change_degrees(heading)
             max_heading_change = self._get_follow_max_heading_change()
             if heading_change is not None and max_heading_change > 0.0 and heading_change > max_heading_change:
+                reason = f"heading changed {heading_change:.0f}°; max turn is {max_heading_change:.0f}°"
+                self._timeline_log(
+                    "STEP_REFUSED",
+                    step_id=step_id,
+                    step_label=step_label,
+                    result="refused",
+                    reason=reason,
+                    heading_state=heading_state,
+                    heading_change_degrees=f"{heading_change:.3f}",
+                    corner_action=corner_plan_action,
+                    corner_reason=corner_plan_reason,
+                    **self._corner_timeline_fields(line, None),
+                    **self._corner_assist_cooldown_fields(),
+                )
                 self.cal_status_var.set(
-                    f"{step_label} stopped: heading changed {heading_change:.0f}°; max turn is {max_heading_change:.0f}°. "
+                    f"{step_label} stopped: {reason}. "
                     "Use Find Line/Edge to reset the latch if this is an intentional corner."
                 )
                 self._show_current_frame()
@@ -3965,24 +4684,47 @@ class CameraCalibrationDialog(tk.Toplevel):
         start_x, start_y, _z = self._active_position(status)
         frame_move_x = move_x
         frame_move_y = move_y
-        target_base_x, target_base_y, delay_fields = self._delayed_position_plan_fields(
-            current_x=start_x,
-            current_y=start_y,
-            frame_move_x=frame_move_x,
-            frame_move_y=frame_move_y,
-        )
-        target_x = target_base_x + frame_move_x
-        target_y = target_base_y + frame_move_y
-        move_x = target_x - start_x
-        move_y = target_y - start_y
-        delay_limited = False
-        max_total_for_delay = max(0.001, follow_step + max_correct)
-        move_x, move_y, delay_limited = self._limit_move_vector(move_x, move_y, max_total_for_delay)
-        if delay_limited:
-            target_x = start_x + move_x
-            target_y = start_y + move_y
-            prior_state = correction_state
-            correction_state = f"{prior_state}; delay command limited" if prior_state else "delay command limited"
+        if corner_assist is not None:
+            # A committed corner is an absolute visual target: drive the camera
+            # directly to the detected vertex from the current machine position.
+            # Do not run it through delayed-position compensation or the normal
+            # Follow Step + Max Correct limiter, or the vertex move gets shortened
+            # back into the rounded, squishy behavior we are trying to remove.
+            target_base_x = start_x
+            target_base_y = start_y
+            target_x = start_x + frame_move_x
+            target_y = start_y + frame_move_y
+            delay_fields = {
+                "use_delayed_position": bool(self.follow_use_delayed_position_var.get()),
+                "position_delay_ms": self._get_follow_position_delay_ms(),
+                "frame_move_x": f"{frame_move_x:.6f}",
+                "frame_move_y": f"{frame_move_y:.6f}",
+                "target_base_x": f"{target_base_x:.6f}",
+                "target_base_y": f"{target_base_y:.6f}",
+                "command_adjust_x": "0.000000",
+                "command_adjust_y": "0.000000",
+                "delayed_position_found": False,
+                "delayed_position_source": "corner_commit_bypass",
+            }
+        else:
+            target_base_x, target_base_y, delay_fields = self._delayed_position_plan_fields(
+                current_x=start_x,
+                current_y=start_y,
+                frame_move_x=frame_move_x,
+                frame_move_y=frame_move_y,
+            )
+            target_x = target_base_x + frame_move_x
+            target_y = target_base_y + frame_move_y
+            move_x = target_x - start_x
+            move_y = target_y - start_y
+            delay_limited = False
+            max_total_for_delay = max(0.001, follow_step + max_correct)
+            move_x, move_y, delay_limited = self._limit_move_vector(move_x, move_y, max_total_for_delay)
+            if delay_limited:
+                target_x = start_x + move_x
+                target_y = start_y + move_y
+                prior_state = correction_state
+                correction_state = f"{prior_state}; delay command limited" if prior_state else "delay command limited"
 
         virtual_fields = self._virtual_target_default_fields()
         if corner_assist is None and self._get_follow_virtual_target_enabled():
@@ -4086,10 +4828,21 @@ class CameraCalibrationDialog(tk.Toplevel):
             heading_state=heading_state,
             heading_change_degrees=f"{heading_change:.3f}" if heading_change is not None else "",
             progress_dot=f"{progress_dot:.6f}" if progress_dot is not None else "",
+            sanity_action=self._last_follow_sanity_action,
+            sanity_reason=self._last_follow_sanity_reason,
+            sanity_limit_degrees=f"{self._get_follow_sanity_angle():.3f}",
+            sanity_change_degrees=(
+                f"{self._last_follow_sanity_change_degrees:.3f}"
+                if self._last_follow_sanity_change_degrees is not None
+                else ""
+            ),
             correction_state=correction_state,
+            corner_action=("commit" if corner_assist is not None else corner_plan_action),
+            corner_reason=(corner_assist.reason if corner_assist is not None else corner_plan_reason),
+            **self._corner_timeline_fields(line, corner_assist),
+            **self._corner_assist_cooldown_fields(),
             **delay_fields,
             **virtual_fields,
-            **self._timeline_line_fields(line),
         )
 
         self._manual_jog_active = True
@@ -4103,11 +4856,16 @@ class CameraCalibrationDialog(tk.Toplevel):
                 limit_bits.append("inside deadband")
             elif correction_state == "corner resume":
                 limit_bits.append("corner resume: side correction skipped")
-            elif correction_state == "corner assist":
+            elif correction_state == "corner commit":
                 lookahead_steps = self._get_follow_corner_lookahead_steps()
-                limit_bits.append(f"corner assist: {corner_assist.distance:.4f}/{corner_assist.max_distance:.4f}, {lookahead_steps} step lookahead")
+                limit_bits.append(
+                    f"corner commit: {corner_assist.distance:.4f}/{corner_assist.max_distance:.4f} lookahead, "
+                    f"{lookahead_steps} step lookahead"
+                )
             if total_limited:
                 limit_bits.append("total move limited")
+            if self._last_follow_sanity_action == "curve_allowed":
+                limit_bits.append("curve/profile sanity allowed")
             if self._get_follow_virtual_target_enabled() and corner_assist is None:
                 state = str(virtual_fields.get("virtual_state", "virtual target"))
                 limit_bits.append(f"virtual target: {state}")
@@ -4115,7 +4873,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             turn_text = ""
             if heading_change is not None and max_heading_change > 0.0:
                 turn_text = f"turn {heading_change:.0f}°/{max_heading_change:.0f}°, "
-            if correction_state == "corner assist":
+            if correction_state == "corner commit":
                 move_detail = (
                     f"corner {corner_assist.message}, move X{move_x:+.4f} Y{move_y:+.4f}."
                     if corner_assist is not None
@@ -4170,7 +4928,27 @@ class CameraCalibrationDialog(tk.Toplevel):
             # Motion succeeded. Latch the machine-space heading used for this
             # step so the next detection cannot flip 180 degrees. For Corner
             # Assist, this is the selected outgoing leg, not the incoming leg.
+            previous_heading = self._follow_heading_unit
+            self._record_accepted_heading_turn(previous_heading, heading)
             self._follow_heading_unit = heading
+            if corner_assist is not None:
+                # Start a fresh incoming-angle history after the committed turn;
+                # the old straight approach should not make the outgoing leg look
+                # unstable.
+                self._follow_recent_raw_angle_degrees = []
+                self._arm_corner_assist_consumed(
+                    step_id=step_id,
+                    step_label=step_label,
+                    assist=corner_assist,
+                    line=line,
+                )
+            else:
+                self._record_follow_raw_angle(line)
+                self._record_corner_assist_ordinary_step(
+                    step_id=step_id,
+                    step_label=step_label,
+                    line=line,
+                )
             move_unit = self._normalize_unit_vector(move_x, move_y)
             if move_unit is not None:
                 self._follow_last_move_unit = move_unit
@@ -4189,12 +4967,18 @@ class CameraCalibrationDialog(tk.Toplevel):
                 phase="post_move",
                 base_event="POST_DETECTION",
             )
-            if correction_state == "corner assist":
+            if correction_state == "corner commit":
                 # The old-leg filter would fight the new outgoing leg. Re-seed
                 # after the corner move if the next leg is visible.
                 self._reset_follow_filter()
             if new_line.found:
                 new_line = self._stabilize_follow_line(new_line, frame_w=frame_w, frame_h=frame_h)
+                self._clear_corner_assist_if_corner_zone_cleared(
+                    new_line,
+                    step_id=step_id,
+                    step_label=step_label,
+                    phase="post_move",
+                )
             self.current_line = new_line
             post_status = self.linuxcnc_reader.read_status()
             self._record_position_history(post_status, source="post_detection")
@@ -4549,3 +5333,23 @@ class CameraCalibrationDialog(tk.Toplevel):
             self.destroy()
         except tk.TclError:
             pass
+
+# BEGIN FabScan Run Recorder Milestone 1
+try:
+    from fabscan.run_recorder import install_recording_support as _install_run_recording_support
+    _install_run_recording_support(CameraCalibrationDialog)
+except Exception:
+    # Recorder failures must never prevent FabScan from starting.
+    import traceback as _fabscan_recorder_traceback
+    _fabscan_recorder_traceback.print_exc()
+# END FabScan Run Recorder Milestone 1
+
+# BEGIN FabScan M6 Real Bounded Belief Follow
+try:
+    from fabscan.real_belief_follow import install_real_belief_follow as _install_m6_real_belief_follow
+    _install_m6_real_belief_follow(CameraCalibrationDialog)
+except Exception:
+    # M6 integration failures must never prevent Camera Calibration from opening.
+    import traceback as _fabscan_m6_traceback
+    _fabscan_m6_traceback.print_exc()
+# END FabScan M6 Real Bounded Belief Follow

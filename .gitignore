@@ -10,4 +10,12 @@ Thumbs.db
 zips/
 exports/
 test/
+replays/
 
+# Development / installer backups
+*.bak*
+*.orig
+*.rej
+
+# Generated simulator output
+simulated_runs/

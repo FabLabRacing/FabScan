@@ -280,6 +280,40 @@ class LinuxCNCStatusReader:
             mdi_command,
         )
 
+    def set_manual_mode(self) -> LinuxCNCMotionResult:
+        """Return LinuxCNC to MANUAL after an MDI-only FabScan move.
+
+        M6.2 uses one coordinated MDI G1 for each bounded X/Y step, but all
+        perception/planning cycles are intentionally entered from MANUAL mode.
+        This helper makes that mode transition explicit and verifiable.
+        """
+        status = self.read_status()
+        if not status.available:
+            return LinuxCNCMotionResult(False, status.error or "LinuxCNC Python module is not available.", status)
+        if not status.connected:
+            return LinuxCNCMotionResult(False, status.error or "FabScan is not connected to LinuxCNC.", status)
+        if status.task_state != "ON":
+            return LinuxCNCMotionResult(False, f"LinuxCNC task state must be ON before returning to MANUAL. Current state: {status.task_state}.", status)
+        if status.interp_state != "IDLE":
+            return LinuxCNCMotionResult(False, f"LinuxCNC interpreter must be IDLE before returning to MANUAL. Current state: {status.interp_state}.", status)
+        if self._linuxcnc is None:
+            return LinuxCNCMotionResult(False, "LinuxCNC Python module is not available.", status)
+
+        try:
+            if self._command is None:
+                self._command = self._linuxcnc.command()
+            self._command.mode(self._linuxcnc.MODE_MANUAL)
+            self._command.wait_complete(1.0)
+        except Exception as exc:  # noqa: BLE001
+            return LinuxCNCMotionResult(False, f"Could not return LinuxCNC to MANUAL mode: {exc}", status)
+
+        post = self.read_status()
+        if not post.connected:
+            return LinuxCNCMotionResult(False, post.error or "LinuxCNC disconnected while returning to MANUAL mode.", post)
+        if post.task_mode != "MANUAL":
+            return LinuxCNCMotionResult(False, f"LinuxCNC did not enter MANUAL mode. Current mode: {post.task_mode}.", post)
+        return LinuxCNCMotionResult(True, "LinuxCNC returned to MANUAL mode.", post)
+
     def abort_motion(self) -> LinuxCNCMotionResult:
         """Abort the currently running LinuxCNC command from FabScan.
 

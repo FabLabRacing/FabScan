@@ -27,8 +27,8 @@ from fabscan.settings import DEFAULT_SETTINGS, get_settings_path, load_settings,
 
 ImagePoint = Tuple[float, float]
 
-APP_VERSION = "0.5.3.3"
-APP_TITLE = f"FabScan v{APP_VERSION} - Stage 2D Virtual Target Lite"
+APP_VERSION = "0.6.0-alpha.1"
+APP_TITLE = f"FabScan v{APP_VERSION}"
 
 
 class FabScanApp(tk.Tk):
@@ -2198,13 +2198,11 @@ class FabScanApp(tk.Tk):
         messagebox.showinfo(
             "About FabScan",
             f"FabScan v{APP_VERSION}\n\n"
-            "Photo/camera/CNC-trace-to-DXF helper for flat plasma parts.\n\n"
-            "Design goal: create usable DXF geometry quickly, then let SheetCam/CAD do final cleanup when needed.\n\n"
-            "v0.5.3.3 adds transient not-found recovery: Follow Step/N waits for fresh camera frames and retries a complete no-line/no-edge detection before refusing. It also marks low preview-rate overlays as sampled so the operator knows follow may be using newer frames than the displayed overlay.\n\n"
-            "v0.5.3.2 adds a Stage 2D-lite virtual-target experiment: optional command shaping keeps delay compensation from canceling most forward progress while still allowing side steering. The old behavior remains the default.\n\n"
-            "v0.5.3.1 adds an experimental position-delay mode for Stage 2 testing: FabScan can keep a short LinuxCNC position history and, when enabled, plan a follow move from the machine position that best matches the camera frame timestamp. The old current-position behavior remains the default.\n\n"
-            "v0.5.22 adds Follow Stabilization: contour continuity scoring, EMA filtering for offset/angle, and a heading sanity reject so one bad frame is less likely to become motion.\n\n"
-            "Corner Assist remains available from v0.5.21, and Follow N still allows large tests up to 9999 steps.\n\n"
+            "LinuxCNC companion utility for image, camera, and CNC-point tracing to DXF.\n\n"
+            "v0.6.0-alpha.1 adds the belief-based connected-path tracing architecture: persistent world-space path belief, connected-path look-ahead planning, bounded physical safety gates, progress plus tuned lateral correction, and one coordinated LinuxCNC X/Y move per real step.\n\n"
+            "The alpha also includes Follow-run recording/replay, deterministic rerun, an exact-SVG ground-truth simulator, measured camera realism, observation-delay and machine-dynamics simulation, layered simulator DXF export, and the live planner overlay.\n\n"
+            "Real belief following is still experimental and step-and-settle. Recommended planner IPM is logged only. Cutting outputs must remain disabled during development tracing tests.\n\n"
+            "Known alpha limitation: a few sharp connected-path vertices can still be turned slightly early.\n\n"
             f"Settings file:\n{get_settings_path()}",
             parent=self,
         )

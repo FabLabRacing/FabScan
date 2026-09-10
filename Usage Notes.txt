@@ -1,274 +1,47 @@
-Machine config:
-  LinuxCNC Launcher
-    [Desktop Entry]
-    Version=1.0
-    Terminal=false
-    Name=YOUR NAME
-    Exec=env RTAPI_CPU_NUMBER=5 linuxcnc /home/jakerson/linuxcnc/configs/FabLabPlasma/FabLabPlasma.ini
-    Type=Application
-    Comment=LinuxCNC
-    Icon=/usr/share/linuxcnc/linuxcncicon.png
-    Path=
-    StartupNotify=false
-
-
-
-  /etc/default/grub
-    GRUB_CMDLINE_LINUX_DEFAULT or GRUB_CMDLINE_LINUX should look like
-    BOOT_IMAGE=/boot/vmlinuz-6.12.86+deb13-rt-amd64 root=UUID=3dc4f3e8-92ea-4385-8e96-eb965dd47eb6 ro quiet usbcore.autosuspend=-1 pcie_aspm=off nmi_watchdog=0 intel_idle.max_cstate=1 processor.max_cstate=1 cpufreq.default_governor=performance isolcpus=5 nohz_full=5 rcu_nocbs=5 irqaffinity=0-4
-    Save and run:
-	sudo update-grub
-    sudo reboot
-	
-	Verify with cat /proc/cmdline you want to see 
-      usbcore.autosuspend=-1
-      pcie_aspm=off
-      nmi_watchdog=0
-      intel_idle.max_cstate=1
-      processor.max_cstate=1
-      cpufreq.default_governor=performance
-      isolcpus=5
-      nohz_full=5
-      rcu_nocbs=5
-      irqaffinity=0-4
-  
-  Verify LinuxCNC realtime thread:
-    ps -T -o psr,comm -p $(pgrep rtapi_app) you want to see
-	  5 rtapi_app:T#0
-  
-  Verify realtime priority:
-  chrt -p $(pgrep -f 'rtapi_app:T#0' || ps -T -p $(pgrep rtapi_app) | grep T#0 | awk '{print $2}') you want to see
-    SCHED_FIFO
-    priority 98
-	
-  Verify FabScan is not on CPU 5:
-  ps -eLo psr,pid,comm,args | grep -E 'fabscan|python3' | grep -v grep you want to see
-    CPU 3 or 4 only
- 
-  
- 
-FabScan Launch Command
-  Do not launch FabScan with taskset including CPU 5.
-  CPU 5 is reserved for LinuxCNC realtime.
-  
-  cd ~/projects/FabScan
-  source venv/bin/activate
-  OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-  taskset -c 3,4 nice -n 15 ionice -c3 python3 fabscan.py
-  
-  
-Min Conf means minimum detection confidence.
-
-Before every Follow Step, FabScan looks at the camera image and tries to detect the line/edge inside the search box. It then gives that detection a confidence score from:
-
-0% = terrible / not trustworthy
-100% = very strong / clean detection
-
-Then FabScan compares that score to your Min Conf setting.
-
-For example, with:
-
-Min Conf = 50
-
-FabScan will allow the follow move if the detected line confidence is 50% or higher.
-
-If the confidence is below 50%, it refuses/stops the follow step.
-
-So in plain shop terms:
-
-Min Conf is the "how sure does FabScan need to be before it moves?" setting.
-
-Lower number = more willing to keep going.
-
-Higher number = more cautious.
-
-Important detail
-
-The confidence is not a true accuracy percentage.
-
-It does not mean:
-
-50% confidence = 50% position accuracy
-
-It is more of a detection-quality score. Right now FabScan scores things like:
-
-Is there enough visible line/edge span?
-Does the detected shape look long and skinny enough to be a line?
-Are there enough detected points?
-Is the detected line reasonably near the camera center/search area?
-Did it find a real contour/edge candidate?
-
-So Min Conf is a filter to prevent FabScan from chasing weak/noisy detections.
-
-What happens during Follow N
-
-For Follow N, FabScan does this repeatedly:
-
-Detect line/edge
-Calculate confidence
-If confidence < Min Conf: stop
-If confidence >= Min Conf: make the X/Y move
-Detect again
-Repeat
-
-So if you set:
-
-Count = 50
-Min Conf = 50
-
-FabScan is allowed to take up to 50 steps, but it should stop early if the detected line gets too weak.
-
-How I would think about the setting
-
-For clean printed lines like your laser-printer test:
-
-Min Conf 50 = reasonable / somewhat permissive
-Min Conf 60 = better normal test value
-Min Conf 70 = cautious
-
-For early tests, I would probably use:
-
-Min Conf: 60
-
-For pushing corners or seeing what the algorithm can do:
-
-Min Conf: 50
-
-For real part edges where the background may be messy:
-
-Min Conf: 60-70
-One catch with square corners
-
-Min Conf helps prevent following a bad/weak line, but it does not fully solve corner behavior.
-
-At a square corner, FabScan may still see a very strong, confident line — but it may be the wrong side of the corner, or the intersection may confuse the fitted line direction.
-
-That is why I think the next app improvement should probably be:
-
-Stop Follow N if heading changes more than X degrees in one step.
-
-Maybe default it around:
-
-Max heading change: 70°
-
-That would have caught or at least flagged the square-corner behavior better than confidence alone. The radius test had a max heading change around 62°, while the square test hit around 82°, so that lines up pretty nicely with what we are seeing.
-
-One more note: your step was 0.03", but the exported segment lengths averaged around 0.032". That is fine. The move is not just the forward step; it can include side correction too, so the actual point-to-point distance can be slightly longer than the requested step.
-
-
-For Line center mode, best practice is:
-
-Put the yellow crosshair roughly on the center of the line before starting.
-
-It does not need to be dead-nuts perfect. As long as the line is inside the search box, FabScan can usually find it. But if the line is off-center, FabScan sees that as an offset and tries to correct back toward the crosshair.
-
-So if you start with the crosshair way off the line, the first few moves may include side correction until it gets centered.
-
-The key limit is this setting:
-
-Max correct = 0.015"
-
-That means each step can only correct sideways by up to 0.015". So if the line is 0.060" away from the crosshair, FabScan cannot fix that in one step. It will either take several steps to walk back onto the line, or it may follow slightly biased/off-center for a while.
-
-So the practical answer is:
-
-Line inside search box = FabScan can detect it.
-Line near yellow crosshair = FabScan follows it cleaner.
-
-For starting a trace, I would put the crosshair as close to the desired line/edge as reasonably possible.
-
-Does search box size matter?
-
-Yes, quite a bit.
-
-The search box is the area FabScan looks inside when trying to find the line/edge. Anything outside the box is mostly ignored.
-
-Bigger search box
-
-Good:
-
-More forgiving if the line is not centered
-Can see more of the line
-Can handle small drift better
-Better for straight/simple lines
-
-Bad:
-
-More likely to see unwanted marks
-More likely to see both sides of a corner
-More likely to get confused at intersections
-More likely to pick the wrong tangent
-Smaller search box
-
-Good:
-
-Better isolates the feature you want
-Less clutter
-Less corner/intersection confusion
-More predictable near square corners
-
-Bad:
-
-Easier to lose the line
-Less forgiving if calibration/correction is off
-May not see enough line length to get good confidence
-For your printed square tests
-
-For the radius-corner square, a bigger search box is probably okay because the tangent changes gradually.
-
-For the sharp square-corner square, I would try a smaller search box, because near the corner a big search box may see both legs of the corner at the same time. Then the algorithm has to decide which one is “the line,” and that is where it can get goofy.
-
-I would try something like:
-
-Step:        0.025" to 0.030"
-Max correct: 0.010" to 0.015"
-Min Conf:    55 to 65
-Search px:   smaller than your straight-line setting
-
-If you were using something like Search px = 220, I would try:
-
-Search px: 120 to 160
-
-especially for square corners.
-
-My rule of thumb
-
-For line-follow testing:
-
-Straight line:       larger search box is fine
-Radius corner:       medium search box
-Sharp square corner: smaller search box
-Messy real edge:     smallest box that still detects reliably
-
-And start with the yellow crosshair close to the line/edge. It does not need to be perfect, but the closer it starts, the less corrective “hunting” FabScan has to do.
-
-Settings (V0.5.25
-Step = 0.03
-Feed = 100
-Settle ms = 50
-Max turn = 70
-Corner pause = Off
-Corner Deg = 55
-Corner assist = Off
-Lookahead = 5
-Max correct = 0.003
-Deadband = .003
-Gain = .35
-Stabilize = On
-Err a = .25
-Ang a = .08
-Sanity = 25
-Min Conf = 45
-Count = 100
-Search px = 400
-Camera distance to Paper = ~2 inches
-
-
-
-
-Camera controls
-v4l2-ctl -d /dev/video0 --list-ctrls-menu
-v4l2-ctl -d /dev/video0 --set-ctrl=power_line_frequency=2
-v4l2-ctl -d /dev/video0 --set-ctrl=white_balance_automatic=0
-v4l2-ctl -d /dev/video0 --set-ctrl=white_balance_temperature=6500
-v4l2-ctl -d /dev/video0 --set-ctrl=backlight_compensation=0
+FabScan Development-Machine Notes
+=================================
+
+These notes describe the FabLabPlasma development PC. They are examples, not
+universal FabScan requirements.
+
+LinuxCNC realtime CPU on this machine
+-------------------------------------
+CPU 5 is reserved for LinuxCNC realtime work. FabScan must not be pinned to CPU 5.
+
+Verify the LinuxCNC realtime thread with tools appropriate to your installation.
+The development machine has historically used rtapi_app on CPU 5 with realtime
+priority configured by LinuxCNC.
+
+FabScan launch command used for current development/testing
+-----------------------------------------------------------
+
+cd ~/projects/FabScan
+source venv/bin/activate
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+taskset -c 3,4 nice -n 15 ionice -c3 python3 fabscan.py
+
+Why this launch is used here:
+- keeps BLAS/OpenMP helper libraries single-threaded
+- pins FabScan away from the LinuxCNC realtime CPU
+- lowers normal scheduler priority
+- gives FabScan idle-class disk I/O priority
+
+Do not copy the CPU numbers blindly. Use CPU affinity that matches your own
+LinuxCNC realtime configuration.
+
+Current v0.6 alpha tracing notes
+--------------------------------
+- Real belief following is bounded step-and-settle, not continuous velocity jog.
+- Planner recommended IPM is diagnostic/logged only for real motion.
+- Physical M6 runs force recording ON.
+- Current development-machine M6 safety defaults:
+    Hard max move     0.035 in
+    Min planner conf  45 %
+    Min look-ahead    0.045 in
+- Proven conservative lateral correction starting point on this machine:
+    Follow Step  0.030 in
+    Deadband     0.003 in
+    Gain         0.35
+    Max Correct  0.003 in
+
+These are development-machine values, not universal recommendations.

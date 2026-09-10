@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "source": "FabScan golden real-camera recordings A-G",
+  "frames_measured": 840,
+  "background_gray": 145.706,
+  "line_gray": 25.399,
+  "frame_brightness_sigma": 1.599,
+  "illumination_std": 6.559445381164551,
+  "illumination_min": -20.887266159057617,
+  "illumination_max": 10.182984352111816,
+  "high_frequency_sigma": 1.31,
+  "low_frequency_texture_sigma": 1.5,
+  "edge_10_90_px": 3.0,
+  "synthetic_edge_10_90_px": 2.5,
+  "extra_blur_sigma_px": 0.65,
+  "notes": "Appearance model only; position-delay and machine dynamics remain separate. 100% uses measured photometric levels; >100% scales imperfection amplitudes for robustness testing.",
+  "texture_ppi": 635.0,
+  "low_frequency_texture_scale_px": 60.0
+}
