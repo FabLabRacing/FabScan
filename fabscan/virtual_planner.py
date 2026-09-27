@@ -349,10 +349,10 @@ class ConnectedPathPlanner:
         the camera image a filled dark region. Skeletonizing that region produces a
         medial-axis tree inside the table/background instead of the physical edge.
 
-        For a large/deep filled component, use the contour nearest the measured
-        profile seed as the path representation. This keeps the local detector and
-        belief in charge of *which* edge matters while preserving the existing
-        centerline path for stroke-like components.
+        For a large/deep filled component *whose boundary is also close to the
+        measured profile seed*, use that boundary as the path representation. The
+        seed-distance check prevents a genuinely wide dark stripe from being
+        mistaken for a physical edge when the detector is actually on its center.
         """
         h, w = component.shape
         area_px = int(np.count_nonzero(component))
@@ -369,24 +369,36 @@ class ConnectedPathPlanner:
         # unchanged. At 800x600, a ~40 px regression stroke has an interior radius
         # near 20 px; a filled tabletop/part region is normally far deeper/larger.
         deep_region_limit_px = max(28.0, 0.06 * float(min(h, w)))
-        use_boundary = (
+        region_like = (
             area_fraction >= 0.12
             or max_interior_radius_px >= deep_region_limit_px
         )
 
-        if use_boundary:
+        if region_like:
             contours, _hierarchy = cv2.findContours(
                 component.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE
             )
+            px_per_in = max(
+                20.0,
+                0.5 * (
+                    np.linalg.norm(self.machine_to_pixel[:, 0])
+                    + np.linalg.norm(self.machine_to_pixel[:, 1])
+                ),
+            )
+            min_contour_perimeter_px = max(20.0, 0.06 * px_per_in)
             chosen = None
             chosen_distance = math.inf
             chosen_length = 0
             sx, sy = float(seed_px[0]), float(seed_px[1])
+            seed_point = np.asarray([sx, sy], dtype=float)
+
             for contour in contours:
                 pts = contour.reshape(-1, 2)
                 if len(pts) < 8:
                     continue
-                delta = pts.astype(float) - np.asarray([sx, sy], dtype=float)
+                if float(cv2.arcLength(contour, True)) < min_contour_perimeter_px:
+                    continue
+                delta = pts.astype(float) - seed_point
                 distance = math.sqrt(float(np.min(np.sum(delta * delta, axis=1))))
                 if (
                     distance < chosen_distance - 1e-9
@@ -396,7 +408,8 @@ class ConnectedPathPlanner:
                     chosen_distance = distance
                     chosen_length = len(pts)
 
-            if chosen is not None:
+            boundary_seed_limit_px = max(10.0, 0.025 * float(min(h, w)))
+            if chosen is not None and chosen_distance <= boundary_seed_limit_px:
                 boundary = np.zeros_like(component)
                 cv2.drawContours(boundary, [chosen], -1, 255, 1)
                 return boundary, "boundary", (
@@ -405,10 +418,20 @@ class ConnectedPathPlanner:
                     f"seed-to-boundary {chosen_distance:.2f} px"
                 )
 
+            if chosen is not None:
+                boundary_note = (
+                    f"; nearest substantial boundary {chosen_distance:.2f} px from seed "
+                    f"(limit {boundary_seed_limit_px:.2f} px)"
+                )
+            else:
+                boundary_note = "; no substantial boundary contour near seed"
+        else:
+            boundary_note = ""
+
         skeleton = _skeletonize(component)
         return skeleton, "centerline", (
             f"centerline retained: component {area_fraction * 100.0:.1f}% of frame, "
-            f"max interior radius {max_interior_radius_px:.1f} px"
+            f"max interior radius {max_interior_radius_px:.1f} px{boundary_note}"
         )
 
     def _candidate_paths(
