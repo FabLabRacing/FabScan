@@ -729,11 +729,28 @@ def _execute_coordinated_xy_step(
         executor_start_y = None
 
     start_commanded = getattr(start_status, "commanded_position", (0.0, 0.0, 0.0))
+    start_commanded_work = getattr(start_status, "commanded_work_position", (0.0, 0.0, 0.0))
     start_actual = getattr(start_status, "actual_position", (0.0, 0.0, 0.0))
     start_g5x = getattr(start_status, "g5x_offset", (0.0, 0.0, 0.0))
     start_g92 = getattr(start_status, "g92_offset", (0.0, 0.0, 0.0))
     start_tool = getattr(start_status, "tool_offset", (0.0, 0.0, 0.0))
     start_dtg = getattr(start_status, "dtg", (0.0, 0.0, 0.0))
+
+    # The planner is intentionally anchored to the physical/actual camera
+    # position. LinuxCNC G90 MDI, however, targets the commanded trajectory
+    # coordinate. Preserve the planner's move vector, but apply it from the
+    # commanded coordinate so the resulting *actual* motion lands at target_x/y.
+    coordinate_mode_clean = (coordinate_mode or "Work coordinates").strip()
+    if coordinate_mode_clean == "Machine coordinates":
+        mdi_base_x = float(start_commanded[0])
+        mdi_base_y = float(start_commanded[1])
+    else:
+        mdi_base_x = float(start_commanded_work[0])
+        mdi_base_y = float(start_commanded_work[1])
+    mdi_target_x = mdi_base_x + float(move_x)
+    mdi_target_y = mdi_base_y + float(move_y)
+    mdi_compensation_x = mdi_target_x - float(target_x)
+    mdi_compensation_y = mdi_target_y - float(target_y)
 
     fields: dict[str, Any] = {
         "executor_mode": "coordinated_xy_mdi_g1",
@@ -761,6 +778,12 @@ def _execute_coordinated_xy_step(
         "executor_start_interp_state": str(getattr(start_status, "interp_state", "Unknown")),
         "executor_target_x": f"{target_x:.6f}",
         "executor_target_y": f"{target_y:.6f}",
+        "executor_mdi_base_x": f"{mdi_base_x:.6f}",
+        "executor_mdi_base_y": f"{mdi_base_y:.6f}",
+        "executor_mdi_target_x": f"{mdi_target_x:.6f}",
+        "executor_mdi_target_y": f"{mdi_target_y:.6f}",
+        "executor_mdi_compensation_x": f"{mdi_compensation_x:.6f}",
+        "executor_mdi_compensation_y": f"{mdi_compensation_y:.6f}",
         "executor_move_x": f"{move_x:.6f}",
         "executor_move_y": f"{move_y:.6f}",
         "executor_move_len": f"{move_len:.6f}",
@@ -780,7 +803,7 @@ def _execute_coordinated_xy_step(
         **fields,
     )
     started = time.monotonic()
-    result = dialog.linuxcnc_reader.controlled_xy_move(target_x, target_y, feed, coordinate_mode)
+    result = dialog.linuxcnc_reader.controlled_xy_move(mdi_target_x, mdi_target_y, feed, coordinate_mode)
     fields["executor_mdi_command"] = str(getattr(result, "mdi_command", ""))
     if not result.success:
         fields["executor_result"] = "command_refused"
