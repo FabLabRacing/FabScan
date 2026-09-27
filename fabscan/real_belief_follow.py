@@ -722,11 +722,68 @@ def _execute_coordinated_xy_step(
     """
     move_len = math.hypot(float(move_x), float(move_y))
     start_status = dialog.linuxcnc_reader.read_status()
+    try:
+        executor_start_x, executor_start_y, _executor_start_z = dialog._active_position(start_status)
+    except Exception:  # noqa: BLE001 - diagnostics must never block a move
+        executor_start_x = None
+        executor_start_y = None
+
+    start_commanded = getattr(start_status, "commanded_position", (0.0, 0.0, 0.0))
+    start_commanded_work = getattr(start_status, "commanded_work_position", (0.0, 0.0, 0.0))
+    start_actual = getattr(start_status, "actual_position", (0.0, 0.0, 0.0))
+    start_g5x = getattr(start_status, "g5x_offset", (0.0, 0.0, 0.0))
+    start_g92 = getattr(start_status, "g92_offset", (0.0, 0.0, 0.0))
+    start_tool = getattr(start_status, "tool_offset", (0.0, 0.0, 0.0))
+    start_dtg = getattr(start_status, "dtg", (0.0, 0.0, 0.0))
+
+    # The planner is intentionally anchored to the physical/actual camera
+    # position. LinuxCNC G90 MDI, however, targets the commanded trajectory
+    # coordinate. Preserve the planner's move vector, but apply it from the
+    # commanded coordinate so the resulting *actual* motion lands at target_x/y.
+    coordinate_mode_clean = (coordinate_mode or "Work coordinates").strip()
+    if coordinate_mode_clean == "Machine coordinates":
+        mdi_base_x = float(start_commanded[0])
+        mdi_base_y = float(start_commanded[1])
+    else:
+        mdi_base_x = float(start_commanded_work[0])
+        mdi_base_y = float(start_commanded_work[1])
+    mdi_target_x = mdi_base_x + float(move_x)
+    mdi_target_y = mdi_base_y + float(move_y)
+    mdi_compensation_x = mdi_target_x - float(target_x)
+    mdi_compensation_y = mdi_target_y - float(target_y)
+
     fields: dict[str, Any] = {
         "executor_mode": "coordinated_xy_mdi_g1",
+        "executor_start_x": "" if executor_start_x is None else f"{executor_start_x:.6f}",
+        "executor_start_y": "" if executor_start_y is None else f"{executor_start_y:.6f}",
+        "executor_start_commanded_x": f"{float(start_commanded[0]):.6f}",
+        "executor_start_commanded_y": f"{float(start_commanded[1]):.6f}",
+        "executor_start_actual_x": f"{float(start_actual[0]):.6f}",
+        "executor_start_actual_y": f"{float(start_actual[1]):.6f}",
+        "executor_start_command_minus_actual_x": f"{float(start_commanded[0]) - float(start_actual[0]):.6f}",
+        "executor_start_command_minus_actual_y": f"{float(start_commanded[1]) - float(start_actual[1]):.6f}",
+        "executor_start_g5x_x": f"{float(start_g5x[0]):.6f}",
+        "executor_start_g5x_y": f"{float(start_g5x[1]):.6f}",
+        "executor_start_g92_x": f"{float(start_g92[0]):.6f}",
+        "executor_start_g92_y": f"{float(start_g92[1]):.6f}",
+        "executor_start_tool_x": f"{float(start_tool[0]):.6f}",
+        "executor_start_tool_y": f"{float(start_tool[1]):.6f}",
+        "executor_start_rotation_xy": f"{float(getattr(start_status, 'rotation_xy', 0.0)):.6f}",
+        "executor_start_dtg_x": f"{float(start_dtg[0]):.6f}",
+        "executor_start_dtg_y": f"{float(start_dtg[1]):.6f}",
+        "executor_start_distance_to_go": f"{float(getattr(start_status, 'distance_to_go', 0.0)):.6f}",
+        "executor_start_inpos": bool(getattr(start_status, "inpos", False)),
+        "executor_start_task_state": str(getattr(start_status, "task_state", "Unknown")),
         "executor_start_mode": str(getattr(start_status, "task_mode", "Unknown")),
+        "executor_start_interp_state": str(getattr(start_status, "interp_state", "Unknown")),
         "executor_target_x": f"{target_x:.6f}",
         "executor_target_y": f"{target_y:.6f}",
+        "executor_mdi_base_x": f"{mdi_base_x:.6f}",
+        "executor_mdi_base_y": f"{mdi_base_y:.6f}",
+        "executor_mdi_target_x": f"{mdi_target_x:.6f}",
+        "executor_mdi_target_y": f"{mdi_target_y:.6f}",
+        "executor_mdi_compensation_x": f"{mdi_compensation_x:.6f}",
+        "executor_mdi_compensation_y": f"{mdi_compensation_y:.6f}",
         "executor_move_x": f"{move_x:.6f}",
         "executor_move_y": f"{move_y:.6f}",
         "executor_move_len": f"{move_len:.6f}",
@@ -746,7 +803,7 @@ def _execute_coordinated_xy_step(
         **fields,
     )
     started = time.monotonic()
-    result = dialog.linuxcnc_reader.controlled_xy_move(target_x, target_y, feed, coordinate_mode)
+    result = dialog.linuxcnc_reader.controlled_xy_move(mdi_target_x, mdi_target_y, feed, coordinate_mode)
     fields["executor_mdi_command"] = str(getattr(result, "mdi_command", ""))
     if not result.success:
         fields["executor_result"] = "command_refused"
@@ -764,6 +821,100 @@ def _execute_coordinated_xy_step(
     # short vector, then require interpreter IDLE before changing task mode.
     position_ok = bool(dialog._wait_for_position_near(target_x, target_y, coordinate_mode, move_len))
     fields["executor_position_wait_ok"] = position_ok
+
+    # _wait_for_position_near keeps its existing bool API for all callers, but
+    # publishes diagnostic-only details so the timeline captures what LinuxCNC
+    # actually reported at the endpoint. This is intentionally instrumentation,
+    # not a motion/control change.
+    wait_details = dict(getattr(dialog, "_last_position_wait_details", {}) or {})
+    fields["executor_wait_target_x"] = (
+        "" if wait_details.get("target_x") is None else f"{float(wait_details['target_x']):.6f}"
+    )
+    fields["executor_wait_target_y"] = (
+        "" if wait_details.get("target_y") is None else f"{float(wait_details['target_y']):.6f}"
+    )
+    fields["executor_wait_coordinate_mode_arg"] = str(wait_details.get("coordinate_mode_arg", ""))
+    fields["executor_wait_active_coordinate_mode"] = str(wait_details.get("active_coordinate_mode", ""))
+    fields["executor_wait_timeout_s"] = (
+        "" if wait_details.get("timeout_s") is None else f"{float(wait_details['timeout_s']):.3f}"
+    )
+    fields["executor_wait_tolerance"] = (
+        "" if wait_details.get("tolerance") is None else f"{float(wait_details['tolerance']):.6f}"
+    )
+    fields["executor_wait_final_x"] = (
+        "" if wait_details.get("final_x") is None else f"{float(wait_details['final_x']):.6f}"
+    )
+    fields["executor_wait_final_y"] = (
+        "" if wait_details.get("final_y") is None else f"{float(wait_details['final_y']):.6f}"
+    )
+    fields["executor_wait_final_error"] = (
+        "" if wait_details.get("final_error") is None else f"{float(wait_details['final_error']):.6f}"
+    )
+    fields["executor_wait_final_commanded_x"] = (
+        "" if wait_details.get("final_commanded_x") is None else f"{float(wait_details['final_commanded_x']):.6f}"
+    )
+    fields["executor_wait_final_commanded_y"] = (
+        "" if wait_details.get("final_commanded_y") is None else f"{float(wait_details['final_commanded_y']):.6f}"
+    )
+    fields["executor_wait_final_actual_x"] = (
+        "" if wait_details.get("final_actual_x") is None else f"{float(wait_details['final_actual_x']):.6f}"
+    )
+    fields["executor_wait_final_actual_y"] = (
+        "" if wait_details.get("final_actual_y") is None else f"{float(wait_details['final_actual_y']):.6f}"
+    )
+    fields["executor_wait_final_command_minus_actual_x"] = (
+        "" if wait_details.get("final_command_minus_actual_x") is None
+        else f"{float(wait_details['final_command_minus_actual_x']):.6f}"
+    )
+    fields["executor_wait_final_command_minus_actual_y"] = (
+        "" if wait_details.get("final_command_minus_actual_y") is None
+        else f"{float(wait_details['final_command_minus_actual_y']):.6f}"
+    )
+    fields["executor_wait_final_g5x_x"] = (
+        "" if wait_details.get("final_g5x_x") is None else f"{float(wait_details['final_g5x_x']):.6f}"
+    )
+    fields["executor_wait_final_g5x_y"] = (
+        "" if wait_details.get("final_g5x_y") is None else f"{float(wait_details['final_g5x_y']):.6f}"
+    )
+    fields["executor_wait_final_g92_x"] = (
+        "" if wait_details.get("final_g92_x") is None else f"{float(wait_details['final_g92_x']):.6f}"
+    )
+    fields["executor_wait_final_g92_y"] = (
+        "" if wait_details.get("final_g92_y") is None else f"{float(wait_details['final_g92_y']):.6f}"
+    )
+    fields["executor_wait_final_tool_x"] = (
+        "" if wait_details.get("final_tool_x") is None else f"{float(wait_details['final_tool_x']):.6f}"
+    )
+    fields["executor_wait_final_tool_y"] = (
+        "" if wait_details.get("final_tool_y") is None else f"{float(wait_details['final_tool_y']):.6f}"
+    )
+    fields["executor_wait_final_rotation_xy"] = (
+        "" if wait_details.get("final_rotation_xy") is None else f"{float(wait_details['final_rotation_xy']):.6f}"
+    )
+    fields["executor_wait_final_dtg_x"] = (
+        "" if wait_details.get("final_dtg_x") is None else f"{float(wait_details['final_dtg_x']):.6f}"
+    )
+    fields["executor_wait_final_dtg_y"] = (
+        "" if wait_details.get("final_dtg_y") is None else f"{float(wait_details['final_dtg_y']):.6f}"
+    )
+    fields["executor_wait_final_distance_to_go"] = (
+        "" if wait_details.get("final_distance_to_go") is None
+        else f"{float(wait_details['final_distance_to_go']):.6f}"
+    )
+    fields["executor_wait_final_inpos"] = (
+        "" if wait_details.get("final_inpos") is None else bool(wait_details.get("final_inpos"))
+    )
+    fields["executor_wait_final_task_state"] = str(wait_details.get("final_task_state", ""))
+    fields["executor_wait_final_task_mode"] = str(wait_details.get("final_task_mode", ""))
+    fields["executor_wait_final_interp_state"] = str(wait_details.get("final_interp_state", ""))
+    fields["executor_wait_stable_count"] = int(wait_details.get("stable_count", 0) or 0)
+    fields["executor_wait_elapsed_ms"] = (
+        "" if wait_details.get("elapsed_ms") is None else f"{float(wait_details['elapsed_ms']):.3f}"
+    )
+    fields["executor_wait_last_message"] = str(wait_details.get("last_message", ""))
+    if not position_ok and fields["executor_wait_last_message"]:
+        fields["executor_message"] = fields["executor_wait_last_message"]
+
     idle_ok = bool(dialog._wait_for_idle(6.0))
     fields["executor_idle_wait_ok"] = idle_ok
 

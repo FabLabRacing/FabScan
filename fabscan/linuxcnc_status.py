@@ -26,6 +26,20 @@ class LinuxCNCPositionStatus:
     all_xyz_homed: bool = False
     machine_position: Position3 = (0.0, 0.0, 0.0)
     work_position: Position3 = (0.0, 0.0, 0.0)
+    commanded_work_position: Position3 = (0.0, 0.0, 0.0)
+
+    # Raw LinuxCNC trajectory/status values retained for diagnostics. FabScan's
+    # existing motion and displayed-position behavior still uses machine_position
+    # / work_position exactly as before.
+    commanded_position: Position3 = (0.0, 0.0, 0.0)
+    actual_position: Position3 = (0.0, 0.0, 0.0)
+    g5x_offset: Position3 = (0.0, 0.0, 0.0)
+    g92_offset: Position3 = (0.0, 0.0, 0.0)
+    tool_offset: Position3 = (0.0, 0.0, 0.0)
+    rotation_xy: float = 0.0
+    dtg: Position3 = (0.0, 0.0, 0.0)
+    distance_to_go: float = 0.0
+    inpos: bool = False
 
 
 @dataclass
@@ -121,13 +135,24 @@ class LinuxCNCStatusReader:
             )
 
         try:
-            machine_position = self._position3(getattr(self._stat, "actual_position", (0.0, 0.0, 0.0)))
+            commanded_position = self._position3(getattr(self._stat, "position", (0.0, 0.0, 0.0)))
+            actual_position = self._position3(getattr(self._stat, "actual_position", (0.0, 0.0, 0.0)))
+            machine_position = actual_position
             work_position = self._calculate_work_position(machine_position)
+            commanded_work_position = self._calculate_work_position(commanded_position)
             task_state = self._task_state_text(getattr(self._stat, "task_state", None))
             interp_state = self._interp_state_text(getattr(self._stat, "interp_state", None))
             task_mode = self._task_mode_text(getattr(self._stat, "task_mode", None))
             homed_values = list(getattr(self._stat, "homed", []))
             homed_text, all_xyz_homed = self._homed_text(homed_values)
+
+            g5x_offset = self._position3(getattr(self._stat, "g5x_offset", (0.0, 0.0, 0.0)))
+            g92_offset = self._position3(getattr(self._stat, "g92_offset", (0.0, 0.0, 0.0)))
+            tool_offset = self._position3(getattr(self._stat, "tool_offset", (0.0, 0.0, 0.0)))
+            rotation_xy = float(getattr(self._stat, "rotation_xy", 0.0) or 0.0)
+            dtg = self._position3(getattr(self._stat, "dtg", (0.0, 0.0, 0.0)))
+            distance_to_go = float(getattr(self._stat, "distance_to_go", 0.0) or 0.0)
+            inpos = bool(getattr(self._stat, "inpos", False))
         except Exception as exc:  # noqa: BLE001
             return LinuxCNCPositionStatus(
                 available=True,
@@ -146,6 +171,16 @@ class LinuxCNCStatusReader:
             all_xyz_homed=all_xyz_homed,
             machine_position=machine_position,
             work_position=work_position,
+            commanded_work_position=commanded_work_position,
+            commanded_position=commanded_position,
+            actual_position=actual_position,
+            g5x_offset=g5x_offset,
+            g92_offset=g92_offset,
+            tool_offset=tool_offset,
+            rotation_xy=rotation_xy,
+            dtg=dtg,
+            distance_to_go=distance_to_go,
+            inpos=inpos,
         )
 
     def incremental_jog(
