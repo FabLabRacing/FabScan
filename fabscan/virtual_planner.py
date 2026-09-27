@@ -9,7 +9,7 @@ import numpy as np
 
 from fabscan.path_belief import BeliefState
 
-INTEGRATION_VERSION = "0.6.0-dev-m5.6"
+INTEGRATION_VERSION = "0.6.0-alpha.1-m6.3.2"
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -336,25 +336,123 @@ class ConnectedPathPlanner:
         y = float(np.interp(target_s, s, points[:, 1]))
         return np.asarray([x, y], dtype=float)
 
-    def _candidate_paths(
+    def _path_representation(
         self,
         component: np.ndarray,
+        seed_px: np.ndarray,
+    ) -> tuple[np.ndarray, str, str]:
+        """Choose the connected-path geometry that matches the observed feature.
+
+        Thin dark strokes are represented well by their skeleton centerline, which
+        is the behavior FabScan's A-G regression geometry was developed around.
+        A real template edge is different: thresholding can make one whole side of
+        the camera image a filled dark region. Skeletonizing that region produces a
+        medial-axis tree inside the table/background instead of the physical edge.
+
+        For a large/deep filled component *whose boundary is also close to the
+        measured profile seed*, use that boundary as the path representation. The
+        seed-distance check prevents a genuinely wide dark stripe from being
+        mistaken for a physical edge when the detector is actually on its center.
+        """
+        h, w = component.shape
+        area_px = int(np.count_nonzero(component))
+        frame_area = max(1, int(h) * int(w))
+        area_fraction = float(area_px) / float(frame_area)
+
+        max_interior_radius_px = 0.0
+        if area_px > 0:
+            distance = cv2.distanceTransform(component, cv2.DIST_L2, 3)
+            if distance.size:
+                max_interior_radius_px = float(np.max(distance))
+
+        # Keep this deliberately conservative so the proven thin-stroke path stays
+        # unchanged. At 800x600, a ~40 px regression stroke has an interior radius
+        # near 20 px; a filled tabletop/part region is normally far deeper/larger.
+        deep_region_limit_px = max(28.0, 0.06 * float(min(h, w)))
+        region_like = (
+            area_fraction >= 0.12
+            or max_interior_radius_px >= deep_region_limit_px
+        )
+
+        if region_like:
+            contours, _hierarchy = cv2.findContours(
+                component.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE
+            )
+            px_per_in = max(
+                20.0,
+                0.5 * (
+                    np.linalg.norm(self.machine_to_pixel[:, 0])
+                    + np.linalg.norm(self.machine_to_pixel[:, 1])
+                ),
+            )
+            min_contour_perimeter_px = max(20.0, 0.06 * px_per_in)
+            chosen = None
+            chosen_distance = math.inf
+            chosen_length = 0
+            sx, sy = float(seed_px[0]), float(seed_px[1])
+            seed_point = np.asarray([sx, sy], dtype=float)
+
+            for contour in contours:
+                pts = contour.reshape(-1, 2)
+                if len(pts) < 8:
+                    continue
+                if float(cv2.arcLength(contour, True)) < min_contour_perimeter_px:
+                    continue
+                delta = pts.astype(float) - seed_point
+                distance = math.sqrt(float(np.min(np.sum(delta * delta, axis=1))))
+                if (
+                    distance < chosen_distance - 1e-9
+                    or (abs(distance - chosen_distance) <= 1e-9 and len(pts) > chosen_length)
+                ):
+                    chosen = contour
+                    chosen_distance = distance
+                    chosen_length = len(pts)
+
+            boundary_seed_limit_px = max(10.0, 0.025 * float(min(h, w)))
+            if chosen is not None and chosen_distance <= boundary_seed_limit_px:
+                boundary = np.zeros_like(component)
+                cv2.drawContours(boundary, [chosen], -1, 255, 1)
+                return boundary, "boundary", (
+                    f"boundary auto-selected: component {area_fraction * 100.0:.1f}% of frame, "
+                    f"max interior radius {max_interior_radius_px:.1f} px, "
+                    f"seed-to-boundary {chosen_distance:.2f} px"
+                )
+
+            if chosen is not None:
+                boundary_note = (
+                    f"; nearest substantial boundary {chosen_distance:.2f} px from seed "
+                    f"(limit {boundary_seed_limit_px:.2f} px)"
+                )
+            else:
+                boundary_note = "; no substantial boundary contour near seed"
+        else:
+            boundary_note = ""
+
+        skeleton = _skeletonize(component)
+        return skeleton, "centerline", (
+            f"centerline retained: component {area_fraction * 100.0:.1f}% of frame, "
+            f"max interior radius {max_interior_radius_px:.1f} px{boundary_note}"
+        )
+
+    def _candidate_paths(
+        self,
+        path_mask: np.ndarray,
         camera: np.ndarray,
         seed_px: np.ndarray,
         reference_tangent_world: np.ndarray,
+        path_kind: str,
     ) -> tuple[list[CandidatePath], list[str]]:
-        skeleton = _skeletonize(component)
-        points_px, adjacency = self._adjacency(skeleton)
+        points_px, adjacency = self._adjacency(path_mask)
         rejects: list[str] = []
         if len(points_px) < 8:
-            return [], ["connected component skeleton was too small"]
+            return [], [f"connected {path_kind} path was too small"]
         start = int(np.argmin(np.sum((points_px.astype(float) - seed_px) ** 2, axis=1)))
         # Convert 0.45 in to a conservative pixel/geodesic budget using the two axes.
         px_per_in = max(20.0, 0.5 * (np.linalg.norm(self.machine_to_pixel[:, 0]) + np.linalg.norm(self.machine_to_pixel[:, 1])))
         dist_px, parent = self._dijkstra(points_px, adjacency, start, 0.45 * px_per_in)
         finite = np.flatnonzero(np.isfinite(dist_px))
         if len(finite) < 8:
-            return [], ["not enough connected skeleton ahead"]
+            return [], [f"not enough connected {path_kind} path ahead"]
 
         ref_px = _unit(self._world_to_pixel_delta(reference_tangent_world))
         # Consider endpoints close to the farthest reachable geodesic distance in
@@ -391,7 +489,7 @@ class ConnectedPathPlanner:
                 break
 
         candidates: list[CandidatePath] = []
-        h, w = component.shape
+        h, w = path_mask.shape
         for endpoint in endpoints:
             ids = self._reconstruct(parent, endpoint)
             if len(ids) < 5:
@@ -428,9 +526,9 @@ class ConnectedPathPlanner:
                 end_alignment=end_alignment,
                 turn_degrees=turn,
                 score=float(score),
-                reason=f"connected skeleton path {s[-1]:.3f} in; start alignment {start_alignment:+.2f}; visible turn {turn:.1f}°",
+                reason=f"connected {path_kind} path {s[-1]:.3f} in; start alignment {start_alignment:+.2f}; visible turn {turn:.1f}°",
             ))
-        candidates.sort(key=lambda c: c.score, reverse=True)
+        candidates.sort(key=lambda candidate: candidate.score, reverse=True)
         return candidates, rejects
 
     def plan(
@@ -469,21 +567,22 @@ class ConnectedPathPlanner:
         component, component_reason = self._seed_component(frame_bgr, seed_px)
         if component is None:
             return self._refusal(camera, belief, component_reason, ())
+        path_mask, path_kind, extraction_reason = self._path_representation(component, seed_px)
 
         if self.travel_unit is None:
             # The first camera frame gives an unoriented tangent. Examine both
             # connected directions and use visible path support to pick the initial
             # travel direction. The UI's Reverse option deliberately chooses the
             # other branch when both are available.
-            pos_candidates, pos_rejects = self._candidate_paths(component, frame_camera, seed_px, belief_tangent)
-            neg_candidates, neg_rejects = self._candidate_paths(component, frame_camera, seed_px, -belief_tangent)
+            pos_candidates, pos_rejects = self._candidate_paths(path_mask, frame_camera, seed_px, belief_tangent, path_kind)
+            neg_candidates, neg_rejects = self._candidate_paths(path_mask, frame_camera, seed_px, -belief_tangent, path_kind)
             choices: list[tuple[float, np.ndarray, CandidatePath, list[str]]] = []
             if pos_candidates:
                 choices.append((pos_candidates[0].score, belief_tangent, pos_candidates[0], pos_rejects))
             if neg_candidates:
                 choices.append((neg_candidates[0].score, -belief_tangent, neg_candidates[0], neg_rejects))
             if not choices:
-                return self._refusal(camera, belief, "no connected centerline candidate in either initial direction", tuple((pos_rejects + neg_rejects)[-8:]))
+                return self._refusal(camera, belief, "no connected path candidate in either initial direction", tuple((pos_rejects + neg_rejects)[-8:]))
             choices.sort(key=lambda item: item[0], reverse=True)
             selected = choices[-1] if self.initial_reverse and len(choices) > 1 else choices[0]
             _score, reference, best, rejects = selected
@@ -497,9 +596,9 @@ class ConnectedPathPlanner:
             # Blend memory with the current state estimate. Travel direction wins
             # enough to stop one odd frame from instantly flipping the planner.
             reference = _unit(reference * 0.68 + belief_tangent * 0.32)
-            candidates, rejects = self._candidate_paths(component, frame_camera, seed_px, reference)
+            candidates, rejects = self._candidate_paths(path_mask, frame_camera, seed_px, reference, path_kind)
             if not candidates:
-                return self._refusal(camera, belief, "no forward connected centerline candidate", tuple(rejects[-8:]))
+                return self._refusal(camera, belief, "no forward connected path candidate", tuple(rejects[-8:]))
             best = candidates[0]
         path = np.asarray(best.points_world, dtype=float)
         path, s = self._resample_polyline(path, 0.005)
@@ -586,8 +685,8 @@ class ConnectedPathPlanner:
             return self._refusal(camera, belief, "SAFETY HOLD: proposed move collapsed below 0.003 in", tuple(rejects[-8:]))
 
         reason = (
-            f"selected connected centerline candidate; {best.reason}; "
-            f"dynamic steering look-ahead {steering_lookahead:.3f} in; "
+            f"selected connected {path_kind} candidate; {component_reason}; {extraction_reason}; "
+            f"{best.reason}; dynamic steering look-ahead {steering_lookahead:.3f} in; "
             f"execute first {move_len:.3f} in only; safety {safety_action}"
         )
         return PlannerResult(
