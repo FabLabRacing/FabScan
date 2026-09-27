@@ -141,6 +141,7 @@ def _settings_snapshot(dialog: Any) -> dict[str, Any]:
         "follow_max_correct_var",
         "follow_feed_var",
         "follow_min_confidence_var",
+        "line_mode_var",
         "line_search_px_var",
         "follow_filter_offset_alpha_var",
         "follow_filter_angle_alpha_var",
@@ -156,6 +157,8 @@ def _settings_snapshot(dialog: Any) -> dict[str, Any]:
     out["follow_step"] = float(dialog._get_follow_step())
     out["follow_max_correct"] = float(dialog._get_follow_max_correct())
     out["follow_feed"] = float(dialog._get_follow_feed())
+    out["line_mode"] = str(dialog._get_line_mode())
+    out["line_search_px"] = int(dialog._get_line_search_px(normalize=True))
     out["follow_min_confidence"] = float(dialog._get_follow_min_confidence())
     out["threshold"] = int(dialog._get_threshold())
     return out
