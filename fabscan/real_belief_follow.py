@@ -722,9 +722,18 @@ def _execute_coordinated_xy_step(
     """
     move_len = math.hypot(float(move_x), float(move_y))
     start_status = dialog.linuxcnc_reader.read_status()
+    try:
+        executor_start_x, executor_start_y, _executor_start_z = dialog._active_position(start_status)
+    except Exception:  # noqa: BLE001 - diagnostics must never block a move
+        executor_start_x = None
+        executor_start_y = None
     fields: dict[str, Any] = {
         "executor_mode": "coordinated_xy_mdi_g1",
+        "executor_start_x": "" if executor_start_x is None else f"{executor_start_x:.6f}",
+        "executor_start_y": "" if executor_start_y is None else f"{executor_start_y:.6f}",
+        "executor_start_task_state": str(getattr(start_status, "task_state", "Unknown")),
         "executor_start_mode": str(getattr(start_status, "task_mode", "Unknown")),
+        "executor_start_interp_state": str(getattr(start_status, "interp_state", "Unknown")),
         "executor_target_x": f"{target_x:.6f}",
         "executor_target_y": f"{target_y:.6f}",
         "executor_move_x": f"{move_x:.6f}",
@@ -764,6 +773,46 @@ def _execute_coordinated_xy_step(
     # short vector, then require interpreter IDLE before changing task mode.
     position_ok = bool(dialog._wait_for_position_near(target_x, target_y, coordinate_mode, move_len))
     fields["executor_position_wait_ok"] = position_ok
+
+    # _wait_for_position_near keeps its existing bool API for all callers, but
+    # publishes diagnostic-only details so the timeline captures what LinuxCNC
+    # actually reported at the endpoint. This is intentionally instrumentation,
+    # not a motion/control change.
+    wait_details = dict(getattr(dialog, "_last_position_wait_details", {}) or {})
+    fields["executor_wait_target_x"] = (
+        "" if wait_details.get("target_x") is None else f"{float(wait_details['target_x']):.6f}"
+    )
+    fields["executor_wait_target_y"] = (
+        "" if wait_details.get("target_y") is None else f"{float(wait_details['target_y']):.6f}"
+    )
+    fields["executor_wait_coordinate_mode_arg"] = str(wait_details.get("coordinate_mode_arg", ""))
+    fields["executor_wait_active_coordinate_mode"] = str(wait_details.get("active_coordinate_mode", ""))
+    fields["executor_wait_timeout_s"] = (
+        "" if wait_details.get("timeout_s") is None else f"{float(wait_details['timeout_s']):.3f}"
+    )
+    fields["executor_wait_tolerance"] = (
+        "" if wait_details.get("tolerance") is None else f"{float(wait_details['tolerance']):.6f}"
+    )
+    fields["executor_wait_final_x"] = (
+        "" if wait_details.get("final_x") is None else f"{float(wait_details['final_x']):.6f}"
+    )
+    fields["executor_wait_final_y"] = (
+        "" if wait_details.get("final_y") is None else f"{float(wait_details['final_y']):.6f}"
+    )
+    fields["executor_wait_final_error"] = (
+        "" if wait_details.get("final_error") is None else f"{float(wait_details['final_error']):.6f}"
+    )
+    fields["executor_wait_final_task_state"] = str(wait_details.get("final_task_state", ""))
+    fields["executor_wait_final_task_mode"] = str(wait_details.get("final_task_mode", ""))
+    fields["executor_wait_final_interp_state"] = str(wait_details.get("final_interp_state", ""))
+    fields["executor_wait_stable_count"] = int(wait_details.get("stable_count", 0) or 0)
+    fields["executor_wait_elapsed_ms"] = (
+        "" if wait_details.get("elapsed_ms") is None else f"{float(wait_details['elapsed_ms']):.3f}"
+    )
+    fields["executor_wait_last_message"] = str(wait_details.get("last_message", ""))
+    if not position_ok and fields["executor_wait_last_message"]:
+        fields["executor_message"] = fields["executor_wait_last_message"]
+
     idle_ok = bool(dialog._wait_for_idle(6.0))
     fields["executor_idle_wait_ok"] = idle_ok
 
