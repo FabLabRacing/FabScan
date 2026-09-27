@@ -71,6 +71,19 @@ FabScan is currently in the **v0.6 alpha** phase. The core belief/connected-path
 
 Do not tune FabScan only to make the existing G test look perfect. The current alpha should be tested against geometry it was not specifically developed around.
 
+### Edge / boundary path extraction — validated
+
+- [x] Reproduced the first real cardstock-template failure: the local Edge detector and belief were correct, but the connected-path planner skeletonized a large filled dark region and followed its medial axis instead of the physical boundary.
+- [x] Added boundary-aware connected-path extraction for large/deep filled components when the measured profile seed is close to a substantial boundary.
+- [x] Preserved the existing skeleton-centerline path for thin/stroke-like geometry.
+- [x] Validated the fix on the real cardstock edge with the temporary masking paper removed:
+  - planner path stayed on the physical boundary
+  - a straight edge reported approximately 0° visible turn
+  - normal forward step and useful look-ahead returned
+- [x] Regression-tested the known G / thin-line geometry in **Line** mode; existing centerline behavior remained correct.
+- [x] Keep the existing **Line / Edge** user selection explicit for now. Automatic Line-vs-Edge classification is not required for the current project goals.
+- [ ] Continue the physical cardstock trace and evaluate the exported DXF in SheetCam.
+
 ### FabLab real-use-case tests
 
 - [ ] Select several **real parts/templates from the shop** that represent normal FabScan use.
@@ -264,6 +277,7 @@ The following are already part of the current v0.6 alpha baseline and are listed
 - Bounded real-machine belief following
 - Separate forward progress and lateral correction
 - Nearest qualifying connected-component association
+- Boundary-aware connected-path extraction for real Edge-mode templates/parts
 - Coordinated LinuxCNC XY moves
 - Independent physical safety gates
 - Live planner overlay
