@@ -871,6 +871,41 @@ class CameraCalibrationDialog(tk.Toplevel):
             "move_x",
             "move_y",
             "move_len",
+            "executor_mode",
+            "executor_start_mode",
+            "executor_target_x",
+            "executor_target_y",
+            "executor_move_x",
+            "executor_move_y",
+            "executor_move_len",
+            "executor_feed_ipm",
+            "executor_coordinate_mode",
+            "executor_mdi_command",
+            "executor_position_wait_ok",
+            "executor_idle_wait_ok",
+            "executor_manual_restore_ok",
+            "executor_abort_sent",
+            "executor_abort_message",
+            "executor_idle_wait_ok_after_abort",
+            "executor_manual_restore_message",
+            "executor_end_mode",
+            "executor_result",
+            "executor_message",
+            "executor_wait_target_x",
+            "executor_wait_target_y",
+            "executor_wait_coordinate_mode_arg",
+            "executor_wait_active_coordinate_mode",
+            "executor_wait_timeout_s",
+            "executor_wait_tolerance",
+            "executor_wait_final_x",
+            "executor_wait_final_y",
+            "executor_wait_final_error",
+            "executor_wait_final_task_state",
+            "executor_wait_final_task_mode",
+            "executor_wait_final_interp_state",
+            "executor_wait_stable_count",
+            "executor_wait_elapsed_ms",
+            "executor_wait_last_message",
             "tangent_x",
             "tangent_y",
             "correct_x",
@@ -3627,9 +3662,39 @@ class CameraCalibrationDialog(tk.Toplevel):
     ) -> bool:
         timeout_seconds = max(6.0, (abs(move_distance) / max(0.001, self._get_feed())) * 60.0 * 4.0 + 2.0)
         tolerance = max(0.001, abs(move_distance) * 0.03)
-        end_time = time.monotonic() + timeout_seconds
+        started = time.monotonic()
+        end_time = started + timeout_seconds
         stable_count = 0
         last_message = ""
+        last_x: Optional[float] = None
+        last_y: Optional[float] = None
+        last_error: Optional[float] = None
+        last_task_state = ""
+        last_task_mode = ""
+        last_interp_state = ""
+
+        # Diagnostic-only state for callers such as the M6 coordinated executor.
+        # Do not change move/wait behavior here; preserve the existing bool return.
+        self._last_position_wait_details = {
+            "target_x": float(target_x),
+            "target_y": float(target_y),
+            "coordinate_mode_arg": str(coordinate_mode),
+            "active_coordinate_mode": str(self.coordinate_mode_label),
+            "move_distance": float(move_distance),
+            "timeout_s": float(timeout_seconds),
+            "tolerance": float(tolerance),
+            "final_x": None,
+            "final_y": None,
+            "final_error": None,
+            "final_task_state": "",
+            "final_task_mode": "",
+            "final_interp_state": "",
+            "stable_count": 0,
+            "elapsed_ms": 0.0,
+            "last_message": "",
+            "result": False,
+        }
+
         while time.monotonic() < end_time:
             self.update()
             self._pump_camera_frame()
@@ -3638,13 +3703,31 @@ class CameraCalibrationDialog(tk.Toplevel):
             if status.connected:
                 x, y, _z = self._active_position(status)
                 error = math.hypot(float(x) - float(target_x), float(y) - float(target_y))
+                last_x = float(x)
+                last_y = float(y)
+                last_error = float(error)
+                last_task_state = str(status.task_state)
+                last_task_mode = str(status.task_mode)
+                last_interp_state = str(status.interp_state)
                 last_message = (
                     f"pos X{x:.4f} Y{y:.4f}, target X{target_x:.4f} Y{target_y:.4f}, "
-                    f"error {error:.5f}, mode {status.task_mode}"
+                    f"error {error:.5f}, mode {status.task_mode}, interp {status.interp_state}"
                 )
                 if error <= tolerance:
                     stable_count += 1
                     if stable_count >= 4:
+                        self._last_position_wait_details.update({
+                            "final_x": last_x,
+                            "final_y": last_y,
+                            "final_error": last_error,
+                            "final_task_state": last_task_state,
+                            "final_task_mode": last_task_mode,
+                            "final_interp_state": last_interp_state,
+                            "stable_count": int(stable_count),
+                            "elapsed_ms": (time.monotonic() - started) * 1000.0,
+                            "last_message": last_message,
+                            "result": True,
+                        })
                         return True
                 else:
                     stable_count = 0
@@ -3652,6 +3735,19 @@ class CameraCalibrationDialog(tk.Toplevel):
                 last_message = status.error or "LinuxCNC not connected"
                 stable_count = 0
             time.sleep(0.05)
+
+        self._last_position_wait_details.update({
+            "final_x": last_x,
+            "final_y": last_y,
+            "final_error": last_error,
+            "final_task_state": last_task_state,
+            "final_task_mode": last_task_mode,
+            "final_interp_state": last_interp_state,
+            "stable_count": int(stable_count),
+            "elapsed_ms": (time.monotonic() - started) * 1000.0,
+            "last_message": last_message,
+            "result": False,
+        })
         self.cal_status_var.set(f"Timed out waiting for calibration jog to settle ({last_message}).")
         return False
 
