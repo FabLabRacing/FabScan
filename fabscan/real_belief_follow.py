@@ -727,10 +727,35 @@ def _execute_coordinated_xy_step(
     except Exception:  # noqa: BLE001 - diagnostics must never block a move
         executor_start_x = None
         executor_start_y = None
+
+    start_commanded = getattr(start_status, "commanded_position", (0.0, 0.0, 0.0))
+    start_actual = getattr(start_status, "actual_position", (0.0, 0.0, 0.0))
+    start_g5x = getattr(start_status, "g5x_offset", (0.0, 0.0, 0.0))
+    start_g92 = getattr(start_status, "g92_offset", (0.0, 0.0, 0.0))
+    start_tool = getattr(start_status, "tool_offset", (0.0, 0.0, 0.0))
+    start_dtg = getattr(start_status, "dtg", (0.0, 0.0, 0.0))
+
     fields: dict[str, Any] = {
         "executor_mode": "coordinated_xy_mdi_g1",
         "executor_start_x": "" if executor_start_x is None else f"{executor_start_x:.6f}",
         "executor_start_y": "" if executor_start_y is None else f"{executor_start_y:.6f}",
+        "executor_start_commanded_x": f"{float(start_commanded[0]):.6f}",
+        "executor_start_commanded_y": f"{float(start_commanded[1]):.6f}",
+        "executor_start_actual_x": f"{float(start_actual[0]):.6f}",
+        "executor_start_actual_y": f"{float(start_actual[1]):.6f}",
+        "executor_start_command_minus_actual_x": f"{float(start_commanded[0]) - float(start_actual[0]):.6f}",
+        "executor_start_command_minus_actual_y": f"{float(start_commanded[1]) - float(start_actual[1]):.6f}",
+        "executor_start_g5x_x": f"{float(start_g5x[0]):.6f}",
+        "executor_start_g5x_y": f"{float(start_g5x[1]):.6f}",
+        "executor_start_g92_x": f"{float(start_g92[0]):.6f}",
+        "executor_start_g92_y": f"{float(start_g92[1]):.6f}",
+        "executor_start_tool_x": f"{float(start_tool[0]):.6f}",
+        "executor_start_tool_y": f"{float(start_tool[1]):.6f}",
+        "executor_start_rotation_xy": f"{float(getattr(start_status, 'rotation_xy', 0.0)):.6f}",
+        "executor_start_dtg_x": f"{float(start_dtg[0]):.6f}",
+        "executor_start_dtg_y": f"{float(start_dtg[1]):.6f}",
+        "executor_start_distance_to_go": f"{float(getattr(start_status, 'distance_to_go', 0.0)):.6f}",
+        "executor_start_inpos": bool(getattr(start_status, "inpos", False)),
         "executor_start_task_state": str(getattr(start_status, "task_state", "Unknown")),
         "executor_start_mode": str(getattr(start_status, "task_mode", "Unknown")),
         "executor_start_interp_state": str(getattr(start_status, "interp_state", "Unknown")),
@@ -801,6 +826,60 @@ def _execute_coordinated_xy_step(
     )
     fields["executor_wait_final_error"] = (
         "" if wait_details.get("final_error") is None else f"{float(wait_details['final_error']):.6f}"
+    )
+    fields["executor_wait_final_commanded_x"] = (
+        "" if wait_details.get("final_commanded_x") is None else f"{float(wait_details['final_commanded_x']):.6f}"
+    )
+    fields["executor_wait_final_commanded_y"] = (
+        "" if wait_details.get("final_commanded_y") is None else f"{float(wait_details['final_commanded_y']):.6f}"
+    )
+    fields["executor_wait_final_actual_x"] = (
+        "" if wait_details.get("final_actual_x") is None else f"{float(wait_details['final_actual_x']):.6f}"
+    )
+    fields["executor_wait_final_actual_y"] = (
+        "" if wait_details.get("final_actual_y") is None else f"{float(wait_details['final_actual_y']):.6f}"
+    )
+    fields["executor_wait_final_command_minus_actual_x"] = (
+        "" if wait_details.get("final_command_minus_actual_x") is None
+        else f"{float(wait_details['final_command_minus_actual_x']):.6f}"
+    )
+    fields["executor_wait_final_command_minus_actual_y"] = (
+        "" if wait_details.get("final_command_minus_actual_y") is None
+        else f"{float(wait_details['final_command_minus_actual_y']):.6f}"
+    )
+    fields["executor_wait_final_g5x_x"] = (
+        "" if wait_details.get("final_g5x_x") is None else f"{float(wait_details['final_g5x_x']):.6f}"
+    )
+    fields["executor_wait_final_g5x_y"] = (
+        "" if wait_details.get("final_g5x_y") is None else f"{float(wait_details['final_g5x_y']):.6f}"
+    )
+    fields["executor_wait_final_g92_x"] = (
+        "" if wait_details.get("final_g92_x") is None else f"{float(wait_details['final_g92_x']):.6f}"
+    )
+    fields["executor_wait_final_g92_y"] = (
+        "" if wait_details.get("final_g92_y") is None else f"{float(wait_details['final_g92_y']):.6f}"
+    )
+    fields["executor_wait_final_tool_x"] = (
+        "" if wait_details.get("final_tool_x") is None else f"{float(wait_details['final_tool_x']):.6f}"
+    )
+    fields["executor_wait_final_tool_y"] = (
+        "" if wait_details.get("final_tool_y") is None else f"{float(wait_details['final_tool_y']):.6f}"
+    )
+    fields["executor_wait_final_rotation_xy"] = (
+        "" if wait_details.get("final_rotation_xy") is None else f"{float(wait_details['final_rotation_xy']):.6f}"
+    )
+    fields["executor_wait_final_dtg_x"] = (
+        "" if wait_details.get("final_dtg_x") is None else f"{float(wait_details['final_dtg_x']):.6f}"
+    )
+    fields["executor_wait_final_dtg_y"] = (
+        "" if wait_details.get("final_dtg_y") is None else f"{float(wait_details['final_dtg_y']):.6f}"
+    )
+    fields["executor_wait_final_distance_to_go"] = (
+        "" if wait_details.get("final_distance_to_go") is None
+        else f"{float(wait_details['final_distance_to_go']):.6f}"
+    )
+    fields["executor_wait_final_inpos"] = (
+        "" if wait_details.get("final_inpos") is None else bool(wait_details.get("final_inpos"))
     )
     fields["executor_wait_final_task_state"] = str(wait_details.get("final_task_state", ""))
     fields["executor_wait_final_task_mode"] = str(wait_details.get("final_task_mode", ""))
