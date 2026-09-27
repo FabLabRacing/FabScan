@@ -26,6 +26,7 @@ class LinuxCNCPositionStatus:
     all_xyz_homed: bool = False
     machine_position: Position3 = (0.0, 0.0, 0.0)
     work_position: Position3 = (0.0, 0.0, 0.0)
+    commanded_work_position: Position3 = (0.0, 0.0, 0.0)
 
     # Raw LinuxCNC trajectory/status values retained for diagnostics. FabScan's
     # existing motion and displayed-position behavior still uses machine_position
@@ -138,6 +139,7 @@ class LinuxCNCStatusReader:
             actual_position = self._position3(getattr(self._stat, "actual_position", (0.0, 0.0, 0.0)))
             machine_position = actual_position
             work_position = self._calculate_work_position(machine_position)
+            commanded_work_position = self._calculate_work_position(commanded_position)
             task_state = self._task_state_text(getattr(self._stat, "task_state", None))
             interp_state = self._interp_state_text(getattr(self._stat, "interp_state", None))
             task_mode = self._task_mode_text(getattr(self._stat, "task_mode", None))
@@ -169,6 +171,7 @@ class LinuxCNCStatusReader:
             all_xyz_homed=all_xyz_homed,
             machine_position=machine_position,
             work_position=work_position,
+            commanded_work_position=commanded_work_position,
             commanded_position=commanded_position,
             actual_position=actual_position,
             g5x_offset=g5x_offset,
