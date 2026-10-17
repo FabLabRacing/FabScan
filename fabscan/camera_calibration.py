@@ -26,6 +26,7 @@ from fabscan.camera_device import (
     size_to_preset_label,
 )
 from fabscan.linuxcnc_status import LinuxCNCPositionStatus, LinuxCNCStatusReader
+from fabscan.sharp_vertex import VERTEX_FIELDS
 
 
 ROTATE_VALUES = (0, 90, 180, 270)
@@ -1011,7 +1012,16 @@ class CameraCalibrationDialog(tk.Toplevel):
             "corner_clear_frames",
             "corner_clear_frame_limit",
             "duration_ms",
-        )
+            "planner_version", "motion_mode", "planner_type",
+            "planner_confidence", "planner_safety_action", "physical_safety_action",
+            "planner_proposed_x", "planner_proposed_y", "planner_approved_x", "planner_approved_y",
+            "usable_lookahead", "steering_lookahead", "path_turn_degrees", "candidate_count",
+            "forward_step", "cross_track_correction", "recommended_velocity",
+            "controller_mode", "controller_forward_x", "controller_forward_y", "controller_forward_len",
+            "controller_correct_len", "controller_correction_state",
+            "measurement_x", "measurement_y", "belief_confidence", "belief_measurement_source", "belief_history_reset",
+            "hard_max_move", "min_planner_confidence", "min_lookahead", "start_direction",
+        ) + VERTEX_FIELDS
 
     def _open_timeline_log(self) -> Optional[Path]:
         if self._timeline_csv is not None and self._timeline_log_path is not None:

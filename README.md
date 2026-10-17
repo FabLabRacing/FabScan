@@ -8,7 +8,7 @@ FabScan remains deliberately limited to X/Y tracing. It does not command Z motio
 
 ## Alpha status
 
-`v0.6.0-alpha.1` is an early real-machine alpha. The new planner has completed full simulated traces and long physical traces on the development plasma table, but it is still under active development. In particular, sharp connected-path vertices can still be turned slightly early and are the next major planner target.
+`v0.6.0-alpha.1` is an early real-machine alpha. The new planner has completed full simulated traces and long physical traces on the development plasma table, but it is still under active development. The M6.4 branch adds explicit sharp-vertex commitment for Edge-mode boundary paths. Its headless tests pass; validation on the physical table is still pending. See [sharp-vertex behavior and diagnostics](docs/sharp-vertex.md).
 
 Use the real-machine follower cautiously, start with **Dry Plan**, use conservative bounded steps, keep the cutting process disabled, and remain at the machine while testing.
 

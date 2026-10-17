@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -105,6 +105,8 @@ class BeliefState:
     recent_measurements: tuple[tuple[float, float], ...]
     predicted_points: tuple[tuple[float, float], ...]
     reason: str
+    measurement_source: str = "detector"
+    history_reset: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -112,6 +114,17 @@ class BeliefState:
         data["recent_measurements"] = [list(point) for point in self.recent_measurements]
         data["predicted_points"] = [list(point) for point in self.predicted_points]
         return data
+
+
+@dataclass(frozen=True)
+class BoundaryObservation:
+    """One fresh boundary observation, admitted by the committed geometry gates."""
+    point: tuple[float, float]
+    tangent: tuple[float, float]
+    confidence: float
+    context: ContextResult
+    leg_id: tuple[int, str]
+    source: str
 
 
 @dataclass
@@ -149,7 +162,23 @@ class PathBeliefEstimator:
         self._states: list[BeliefState] = []
         self._last_machine_position: Optional[np.ndarray] = None
         self._travel_s = 0.0
+        self._leg_id: Any = None
+        self._reset_pending = False
         self._filtered_curvature_history: list[tuple[float, float]] = []
+
+    def begin_leg(self, leg_id: tuple[int, str]) -> None:
+        """Retire the old filter history, preserving diagnostic state records.
+
+        The caller owns the physical phase transition. This never declares
+        arrival or creates a measurement/confidence from a planned endpoint.
+        """
+        if leg_id == self._leg_id:
+            return
+        self._leg_id = leg_id
+        self._measurements.clear()
+        self._filtered_curvature_history.clear()
+        self._last_machine_position = None
+        self._reset_pending = True
 
     @property
     def states(self) -> tuple[BeliefState, ...]:
@@ -342,9 +371,21 @@ class PathBeliefEstimator:
             points.append((px, py))
         return tuple(points)
 
-    def update(self, step: dict[str, Any], frame_bgr: np.ndarray, step_index: int) -> BeliefState:
+    def update(self, step: dict[str, Any], frame_bgr: np.ndarray, step_index: int,
+               *, observation: Optional[BoundaryObservation] = None) -> BeliefState:
         frame_h, frame_w = frame_bgr.shape[:2]
         measurement = self._measurement_from_step(step, (frame_h, frame_w))
+        if observation is not None:
+            point = np.asarray(observation.point, dtype=float)
+            tangent = np.asarray(observation.tangent, dtype=float)
+            if (np.all(np.isfinite(point)) and np.all(np.isfinite(tangent))
+                    and np.linalg.norm(tangent) > 1e-9 and math.isfinite(observation.confidence)
+                    and observation.context.found):
+                self.begin_leg(observation.leg_id)
+                measurement = (point, math.atan2(tangent[1], tangent[0]), observation.confidence,
+                               np.array([observation.context.seed_x_px, observation.context.seed_y_px]))
+            else:
+                measurement = None
         step_id = _int(step.get("step_id"), step_index + 1)
         machine_position = self._machine_base(step)
         if self._last_machine_position is not None:
@@ -413,6 +454,10 @@ class PathBeliefEstimator:
                     predicted_points=(),
                     reason="no initial profile measurement",
                 )
+            if step.get("measurement_rejection_reason"):
+                state = replace(state, reason=step["measurement_rejection_reason"],
+                                measurement_source=("committed_boundary_rejected" if step.get("committed_measurement_required")
+                                                    else "detector_rejected"))
             self._states.append(state)
             return state
 
@@ -429,7 +474,8 @@ class PathBeliefEstimator:
         )
         raw_curvature = self._raw_curvature()
 
-        if not self._states or not self._states[-1].measurement_valid:
+        history_reset = self._reset_pending
+        if self._reset_pending or not self._states or not self._states[-1].measurement_valid:
             estimate = measured_point.copy()
             estimate_heading = measured_heading
             filtered_curvature = raw_curvature
@@ -459,8 +505,9 @@ class PathBeliefEstimator:
             estimate_heading = pred_heading + heading_innovation * heading_gain
             filtered_curvature = previous.curvature + (raw_curvature - previous.curvature) * curvature_gain
 
+        self._reset_pending = False
         tangent = np.asarray([math.cos(estimate_heading), math.sin(estimate_heading)], dtype=float)
-        context = self._context_from_frame(frame_bgr, seed, tangent)
+        context = observation.context if observation is not None else self._context_from_frame(frame_bgr, seed, tangent)
         usable_lookahead = context.usable_lookahead if context.found else 0.0
 
         # Dynamic prediction horizon: visible connected support is the hard upper
@@ -531,7 +578,9 @@ class PathBeliefEstimator:
             context=context,
             recent_measurements=self._recent_points(),
             predicted_points=predicted_points,
-            reason="; ".join(reason_parts),
+            reason=(f"{observation.source}: fresh committed boundary observation; " if observation is not None else "") + "; ".join(reason_parts),
+            measurement_source=observation.source if observation is not None else "detector",
+            history_reset=history_reset,
         )
         self._states.append(state)
         return state

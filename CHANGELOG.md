@@ -1,5 +1,35 @@
 # FabScan Changelog
 
+## Unreleased — M6.4 sharp-vertex commitment
+
+### M6.4.3 — estimator handoff at committed corners
+
+- Feed the live estimator a fresh, gated observation of the committed straight leg during APPROACH/OUTGOING, using the observed contour offset and frame pose instead of the generic detector's blend of both legs.
+- Retire incoming filter histories on executed outgoing latch; reinitialize from the next valid observation while preserving diagnostic states. Ordinary observations resume after outgoing release.
+- Preserve detector confidence and geometry gates; invalid support produces an invalid belief. Log observation source and history-reset flags.
+- Exercise the real estimator in physical-step integration tests. Sequential estimator/planner replay passes all 135 saved decisions across three recordings; at the latest HOLD frame planner confidence is 66.32% with the outgoing heading at 93.34 degrees. Physical validation beyond the recordings remains pending.
+
+### M6.4.2 — connected corner-tip support
+
+- Keep committed coordinates fixed. Check the central fitted-corner neighborhood as an observed connected transition inside a 0.018-inch radius, with endpoints 0.015 inch along each leg and within 4 pixels of the contour. Do not fill gaps or retarget.
+- Preserve the 4-pixel residual bound outside that central neighborhood. This explicitly tolerates a localized tip irregularity around the ideal line intersection; it does not require the ideal intersection itself to be a contour pixel.
+- Log corner connectivity, radius and Euclidean tip distance. Replay all 17 saved committed decisions from both October 17 frame packages, including the latest first-corner HOLD. Physical validation beyond the recorded frames remains pending.
+
+### M6.4.1 — committed boundary association and remaining support
+
+- Anchor committed boundary association to the frozen leg using the camera frame pose; retain the existing seed-distance and confidence gates.
+- Revalidate the entire remaining approach and outgoing support. Retire traversed support using actual position with a 0.003-inch overlap, retaining the 4-pixel residual limit and a check at the vertex.
+- Log association source, support ranges and maximum residuals, including the committed motion mode on HOLD.
+- Replay the October 17 second-corner failure through the final recorded frame; it now plans the remaining 0.027077-inch move to the unchanged vertex. Physical confirmation beyond that frame remains pending.
+
+### M6.4.0
+
+- Confirm sharp Edge-mode vertices from two distinct observations of the original connected boundary, using two supported straight legs to reject smooth radii and small defects.
+- Freeze the vertex and outgoing leg in machine coordinates; approach the vertex with bounded moves, latch the outgoing leg only after executed-pose arrival, then resume ordinary following.
+- Let the physical controller honor these fixed targets without ordinary heading/correction blending. The existing boundary gate, physical move cap, confidence checks and coordinated executor remain in force.
+- Add `M6_VERTEX_STATE` and `M6_VERTEX_TRANSITION` events, persist planner/vertex fields in timeline CSV, and show the committed vertex and outgoing leg in the live overlay.
+- Add headless geometry, connected-boundary, controller and physical-step integration tests. Physical-machine validation remains pending.
+
 ## v0.6.0-alpha.1 — Belief-Based Connected-Path Alpha
 
 Major architectural change from the v0.5 follower experiments.
