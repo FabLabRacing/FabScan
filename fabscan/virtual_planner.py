@@ -148,6 +148,11 @@ class ConnectedPathPlanner:
         self.max_correct = max(0.0, _float(settings.get("follow_max_correct_var", settings.get("follow_max_correct", 0.012)), 0.012))
         self.base_feed = max(1.0, _float(settings.get("follow_feed_var", settings.get("follow_feed", 100.0)), 100.0))
         self.min_confidence = _float(settings.get("follow_min_confidence_var", settings.get("follow_min_confidence", 45.0)), 45.0)
+        line_mode = str(settings.get("line_mode_var", settings.get("line_mode", "Line center")) or "Line center").strip()
+        self.line_mode = line_mode if line_mode in {"Line center", "Edge near center"} else "Line center"
+        self.line_search_px = max(40, min(1000, int(round(_float(
+            settings.get("line_search_px_var", settings.get("line_search_px", 220)), 220
+        )))))
         self.travel_unit: Optional[np.ndarray] = None
         self.initial_reverse = False
         self.camera_history: list[tuple[float, float]] = []
@@ -341,18 +346,12 @@ class ConnectedPathPlanner:
         component: np.ndarray,
         seed_px: np.ndarray,
     ) -> tuple[np.ndarray, str, str]:
-        """Choose the connected-path geometry that matches the observed feature.
+        """Choose connected-path geometry without changing the user's Line/Edge intent.
 
-        Thin dark strokes are represented well by their skeleton centerline, which
-        is the behavior FabScan's A-G regression geometry was developed around.
-        A real template edge is different: thresholding can make one whole side of
-        the camera image a filled dark region. Skeletonizing that region produces a
-        medial-axis tree inside the table/background instead of the physical edge.
-
-        For a large/deep filled component *whose boundary is also close to the
-        measured profile seed*, use that boundary as the path representation. The
-        seed-distance check prevents a genuinely wide dark stripe from being
-        mistaken for a physical edge when the detector is actually on its center.
+        Line mode keeps the established skeleton-centerline behavior. In Edge mode,
+        a large/deep filled component is always treated as a boundary problem:
+        use a substantial nearby contour, or HOLD rather than silently falling back
+        to the filled region's medial-axis skeleton.
         """
         h, w = component.shape
         area_px = int(np.count_nonzero(component))
@@ -365,16 +364,16 @@ class ConnectedPathPlanner:
             if distance.size:
                 max_interior_radius_px = float(np.max(distance))
 
-        # Keep this deliberately conservative so the proven thin-stroke path stays
-        # unchanged. At 800x600, a ~40 px regression stroke has an interior radius
-        # near 20 px; a filled tabletop/part region is normally far deeper/larger.
+        # At 800x600, a ~40 px regression stroke has an interior radius near
+        # 20 px. Filled tabletop/part regions are normally much deeper/larger.
         deep_region_limit_px = max(28.0, 0.06 * float(min(h, w)))
         region_like = (
             area_fraction >= 0.12
             or max_interior_radius_px >= deep_region_limit_px
         )
+        edge_mode = self.line_mode == "Edge near center"
 
-        if region_like:
+        if region_like and edge_mode:
             contours, _hierarchy = cv2.findContours(
                 component.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE
             )
@@ -408,30 +407,49 @@ class ConnectedPathPlanner:
                     chosen_distance = distance
                     chosen_length = len(pts)
 
-            boundary_seed_limit_px = max(10.0, 0.025 * float(min(h, w)))
+            # Edge mode may legitimately put the measured seed farther from the
+            # threshold contour at a sharp vertex. Give it a bounded portion of the
+            # user's search window, but never reinterpret the filled region as a
+            # centerline if the boundary is not credible.
+            boundary_seed_limit_px = max(
+                15.0,
+                min(80.0, 0.10 * float(self.line_search_px)),
+            )
             if chosen is not None and chosen_distance <= boundary_seed_limit_px:
                 boundary = np.zeros_like(component)
                 cv2.drawContours(boundary, [chosen], -1, 255, 1)
                 return boundary, "boundary", (
-                    f"boundary auto-selected: component {area_fraction * 100.0:.1f}% of frame, "
+                    f"Edge mode boundary selected: component {area_fraction * 100.0:.1f}% of frame, "
                     f"max interior radius {max_interior_radius_px:.1f} px, "
-                    f"seed-to-boundary {chosen_distance:.2f} px"
-                )
-
-            if chosen is not None:
-                boundary_note = (
-                    f"; nearest substantial boundary {chosen_distance:.2f} px from seed "
+                    f"seed-to-boundary {chosen_distance:.2f} px "
                     f"(limit {boundary_seed_limit_px:.2f} px)"
                 )
+
+            if chosen is None:
+                reason = (
+                    f"Edge mode requires a boundary for region-like component "
+                    f"({area_fraction * 100.0:.1f}% of frame, max interior radius "
+                    f"{max_interior_radius_px:.1f} px), but no substantial contour was found; "
+                    f"centerline fallback disabled"
+                )
             else:
-                boundary_note = "; no substantial boundary contour near seed"
-        else:
-            boundary_note = ""
+                reason = (
+                    f"Edge mode requires a boundary for region-like component; nearest substantial "
+                    f"boundary is {chosen_distance:.2f} px from seed, beyond "
+                    f"{boundary_seed_limit_px:.2f} px limit; centerline fallback disabled"
+                )
+            return np.zeros_like(component), "boundary", reason
 
         skeleton = _skeletonize(component)
+        if region_like and not edge_mode:
+            mode_note = "; Line mode keeps centerline representation"
+        elif edge_mode:
+            mode_note = "; Edge mode component is not region-like, retaining existing centerline path"
+        else:
+            mode_note = ""
         return skeleton, "centerline", (
             f"centerline retained: component {area_fraction * 100.0:.1f}% of frame, "
-            f"max interior radius {max_interior_radius_px:.1f} px{boundary_note}"
+            f"max interior radius {max_interior_radius_px:.1f} px{mode_note}"
         )
 
     def _candidate_paths(
@@ -568,6 +586,8 @@ class ConnectedPathPlanner:
         if component is None:
             return self._refusal(camera, belief, component_reason, ())
         path_mask, path_kind, extraction_reason = self._path_representation(component, seed_px)
+        if not np.any(path_mask):
+            return self._refusal(camera, belief, extraction_reason, ())
 
         if self.travel_unit is None:
             # The first camera frame gives an unoriented tangent. Examine both

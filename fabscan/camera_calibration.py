@@ -871,6 +871,85 @@ class CameraCalibrationDialog(tk.Toplevel):
             "move_x",
             "move_y",
             "move_len",
+            "executor_mode",
+            "executor_start_x",
+            "executor_start_y",
+            "executor_start_commanded_x",
+            "executor_start_commanded_y",
+            "executor_start_actual_x",
+            "executor_start_actual_y",
+            "executor_start_command_minus_actual_x",
+            "executor_start_command_minus_actual_y",
+            "executor_start_g5x_x",
+            "executor_start_g5x_y",
+            "executor_start_g92_x",
+            "executor_start_g92_y",
+            "executor_start_tool_x",
+            "executor_start_tool_y",
+            "executor_start_rotation_xy",
+            "executor_start_dtg_x",
+            "executor_start_dtg_y",
+            "executor_start_distance_to_go",
+            "executor_start_inpos",
+            "executor_start_task_state",
+            "executor_start_mode",
+            "executor_start_interp_state",
+            "executor_target_x",
+            "executor_target_y",
+            "executor_mdi_base_x",
+            "executor_mdi_base_y",
+            "executor_mdi_target_x",
+            "executor_mdi_target_y",
+            "executor_mdi_compensation_x",
+            "executor_mdi_compensation_y",
+            "executor_move_x",
+            "executor_move_y",
+            "executor_move_len",
+            "executor_feed_ipm",
+            "executor_coordinate_mode",
+            "executor_mdi_command",
+            "executor_position_wait_ok",
+            "executor_idle_wait_ok",
+            "executor_manual_restore_ok",
+            "executor_abort_sent",
+            "executor_abort_message",
+            "executor_idle_wait_ok_after_abort",
+            "executor_manual_restore_message",
+            "executor_end_mode",
+            "executor_result",
+            "executor_message",
+            "executor_wait_target_x",
+            "executor_wait_target_y",
+            "executor_wait_coordinate_mode_arg",
+            "executor_wait_active_coordinate_mode",
+            "executor_wait_timeout_s",
+            "executor_wait_tolerance",
+            "executor_wait_final_x",
+            "executor_wait_final_y",
+            "executor_wait_final_error",
+            "executor_wait_final_commanded_x",
+            "executor_wait_final_commanded_y",
+            "executor_wait_final_actual_x",
+            "executor_wait_final_actual_y",
+            "executor_wait_final_command_minus_actual_x",
+            "executor_wait_final_command_minus_actual_y",
+            "executor_wait_final_g5x_x",
+            "executor_wait_final_g5x_y",
+            "executor_wait_final_g92_x",
+            "executor_wait_final_g92_y",
+            "executor_wait_final_tool_x",
+            "executor_wait_final_tool_y",
+            "executor_wait_final_rotation_xy",
+            "executor_wait_final_dtg_x",
+            "executor_wait_final_dtg_y",
+            "executor_wait_final_distance_to_go",
+            "executor_wait_final_inpos",
+            "executor_wait_final_task_state",
+            "executor_wait_final_task_mode",
+            "executor_wait_final_interp_state",
+            "executor_wait_stable_count",
+            "executor_wait_elapsed_ms",
+            "executor_wait_last_message",
             "tangent_x",
             "tangent_y",
             "correct_x",
@@ -3627,24 +3706,120 @@ class CameraCalibrationDialog(tk.Toplevel):
     ) -> bool:
         timeout_seconds = max(6.0, (abs(move_distance) / max(0.001, self._get_feed())) * 60.0 * 4.0 + 2.0)
         tolerance = max(0.001, abs(move_distance) * 0.03)
-        end_time = time.monotonic() + timeout_seconds
+        started = time.monotonic()
+        end_time = started + timeout_seconds
         stable_count = 0
         last_message = ""
+        last_x: Optional[float] = None
+        last_y: Optional[float] = None
+        last_error: Optional[float] = None
+        last_task_state = ""
+        last_task_mode = ""
+        last_interp_state = ""
+        last_status: Optional[LinuxCNCPositionStatus] = None
+
+        def raw_status_details(status: Optional[LinuxCNCPositionStatus]) -> dict[str, Any]:
+            if status is None:
+                return {
+                    "final_commanded_x": None,
+                    "final_commanded_y": None,
+                    "final_actual_x": None,
+                    "final_actual_y": None,
+                    "final_command_minus_actual_x": None,
+                    "final_command_minus_actual_y": None,
+                    "final_g5x_x": None,
+                    "final_g5x_y": None,
+                    "final_g92_x": None,
+                    "final_g92_y": None,
+                    "final_tool_x": None,
+                    "final_tool_y": None,
+                    "final_rotation_xy": None,
+                    "final_dtg_x": None,
+                    "final_dtg_y": None,
+                    "final_distance_to_go": None,
+                    "final_inpos": None,
+                }
+            commanded = status.commanded_position
+            actual = status.actual_position
+            return {
+                "final_commanded_x": float(commanded[0]),
+                "final_commanded_y": float(commanded[1]),
+                "final_actual_x": float(actual[0]),
+                "final_actual_y": float(actual[1]),
+                "final_command_minus_actual_x": float(commanded[0]) - float(actual[0]),
+                "final_command_minus_actual_y": float(commanded[1]) - float(actual[1]),
+                "final_g5x_x": float(status.g5x_offset[0]),
+                "final_g5x_y": float(status.g5x_offset[1]),
+                "final_g92_x": float(status.g92_offset[0]),
+                "final_g92_y": float(status.g92_offset[1]),
+                "final_tool_x": float(status.tool_offset[0]),
+                "final_tool_y": float(status.tool_offset[1]),
+                "final_rotation_xy": float(status.rotation_xy),
+                "final_dtg_x": float(status.dtg[0]),
+                "final_dtg_y": float(status.dtg[1]),
+                "final_distance_to_go": float(status.distance_to_go),
+                "final_inpos": bool(status.inpos),
+            }
+
+        # Diagnostic-only state for callers such as the M6 coordinated executor.
+        # Do not change move/wait behavior here; preserve the existing bool return.
+        self._last_position_wait_details = {
+            "target_x": float(target_x),
+            "target_y": float(target_y),
+            "coordinate_mode_arg": str(coordinate_mode),
+            "active_coordinate_mode": str(self.coordinate_mode_label),
+            "move_distance": float(move_distance),
+            "timeout_s": float(timeout_seconds),
+            "tolerance": float(tolerance),
+            "final_x": None,
+            "final_y": None,
+            "final_error": None,
+            "final_task_state": "",
+            "final_task_mode": "",
+            "final_interp_state": "",
+            "stable_count": 0,
+            "elapsed_ms": 0.0,
+            "last_message": "",
+            "result": False,
+        }
+        self._last_position_wait_details.update(raw_status_details(None))
+
         while time.monotonic() < end_time:
             self.update()
             self._pump_camera_frame()
             status = self.linuxcnc_reader.read_status()
             self._record_position_history(status, source="wait_position")
             if status.connected:
+                last_status = status
                 x, y, _z = self._active_position(status)
                 error = math.hypot(float(x) - float(target_x), float(y) - float(target_y))
+                last_x = float(x)
+                last_y = float(y)
+                last_error = float(error)
+                last_task_state = str(status.task_state)
+                last_task_mode = str(status.task_mode)
+                last_interp_state = str(status.interp_state)
                 last_message = (
                     f"pos X{x:.4f} Y{y:.4f}, target X{target_x:.4f} Y{target_y:.4f}, "
-                    f"error {error:.5f}, mode {status.task_mode}"
+                    f"error {error:.5f}, mode {status.task_mode}, interp {status.interp_state}"
                 )
                 if error <= tolerance:
                     stable_count += 1
                     if stable_count >= 4:
+                        success_details = {
+                            "final_x": last_x,
+                            "final_y": last_y,
+                            "final_error": last_error,
+                            "final_task_state": last_task_state,
+                            "final_task_mode": last_task_mode,
+                            "final_interp_state": last_interp_state,
+                            "stable_count": int(stable_count),
+                            "elapsed_ms": (time.monotonic() - started) * 1000.0,
+                            "last_message": last_message,
+                            "result": True,
+                        }
+                        success_details.update(raw_status_details(last_status))
+                        self._last_position_wait_details.update(success_details)
                         return True
                 else:
                     stable_count = 0
@@ -3652,6 +3827,21 @@ class CameraCalibrationDialog(tk.Toplevel):
                 last_message = status.error or "LinuxCNC not connected"
                 stable_count = 0
             time.sleep(0.05)
+
+        failure_details = {
+            "final_x": last_x,
+            "final_y": last_y,
+            "final_error": last_error,
+            "final_task_state": last_task_state,
+            "final_task_mode": last_task_mode,
+            "final_interp_state": last_interp_state,
+            "stable_count": int(stable_count),
+            "elapsed_ms": (time.monotonic() - started) * 1000.0,
+            "last_message": last_message,
+            "result": False,
+        }
+        failure_details.update(raw_status_details(last_status))
+        self._last_position_wait_details.update(failure_details)
         self.cal_status_var.set(f"Timed out waiting for calibration jog to settle ({last_message}).")
         return False
 
