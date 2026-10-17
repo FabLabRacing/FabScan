@@ -2,6 +2,12 @@
 
 ## Unreleased — M6.4 sharp-vertex commitment
 
+### M6.4.2 — connected corner-tip support
+
+- Keep committed coordinates fixed. Check the central fitted-corner neighborhood as an observed connected transition inside a 0.018-inch radius, with endpoints 0.015 inch along each leg and within 4 pixels of the contour. Do not fill gaps or retarget.
+- Preserve the 4-pixel residual bound outside that central neighborhood. This explicitly tolerates a localized tip irregularity around the ideal line intersection; it does not require the ideal intersection itself to be a contour pixel.
+- Log corner connectivity, radius and Euclidean tip distance. Replay all 17 saved committed decisions from both October 17 frame packages, including the latest first-corner HOLD. Physical validation beyond the recorded frames remains pending.
+
 ### M6.4.1 — committed boundary association and remaining support
 
 - Anchor committed boundary association to the frozen leg using the camera frame pose; retain the existing seed-distance and confidence gates.

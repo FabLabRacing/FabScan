@@ -1,6 +1,6 @@
 # M6.4 sharp-vertex commitment
 
-Implementation identifier: `0.6.0-alpha.1-m6.4.1`. The camera controls and overlay show **M6.4**.
+Implementation identifier: `0.6.0-alpha.1-m6.4.2`. The camera controls and overlay show **M6.4**.
 
 This addresses the Edge-mode failure where a visible ~90° turn shortens each step but the camera continues along the incoming leg until the boundary seed gate stops the run. It applies only to connected **boundary** paths; ordinary Line-mode centerlines retain their existing behavior.
 
@@ -28,8 +28,10 @@ These are internal geometry constants, not new UI settings:
 - Commit only with the vertex forward and within **0.220 inch**, and camera distance from the incoming line no greater than Max Correct + **0.015 inch**.
 - Executed-pose arrival tolerance: **0.003 inch**, matching the existing minimum useful move scale. Planned final steps aim at the vertex itself; the tolerance does not authorize crossing it.
 - Outgoing exit target: **0.060 inch** beyond the vertex.
-- Every committed step rechecks the frozen vertex and the untraversed boundary, with the same maximum **4-pixel** residual. APPROACH checks the entire remaining incoming leg (not just 0.080 inch), with a 0.003-inch overlap behind the actual camera position, plus 0.080 inch of outgoing support. OUTGOING retires incoming support and checks the outgoing segment from actual progress minus that overlap through 0.080 inch beyond the vertex. Samples are at most 0.005 inch apart. The vertex itself remains checked in both states.
+- Every committed step rechecks the frozen corner transition and the untraversed straight boundary, with a maximum **4-pixel** residual outside the central **0.015 inch**. APPROACH checks the entire remaining incoming leg (not just 0.080 inch), with a 0.003-inch overlap behind the actual camera position, plus 0.080 inch of outgoing support. OUTGOING retires incoming support and checks the outgoing segment from actual progress minus that overlap through 0.080 inch beyond the vertex. Samples are at most 0.005 inch apart. The corner transition remains checked in both states using the bounded connected-region check below.
 - Support retirement follows the actual controller pose, never a proposed endpoint. A defect behind that overlap cannot veto the next move; missing support on the remaining path still produces HOLD.
+- Inside the central 0.015 inch, the fixed target is an **ideal fitted intersection**, not necessarily a literal contour pixel. The current observed boundary must connect the two predicted leg endpoints (each within 4 pixels) **entirely inside a 0.018-inch radius** of that intersection. Use the actual one-pixel contour with eight-neighbor connectivity: no dilation, filling or gap bridging. The radius uses calibrated machine distance, including skew/unequal pixel scales.
+- This explicitly permits a small localized tip irregularity relative to the ideal corner. It does **not** guarantee that motion through the fitted intersection stays on every raw contour pixel. The endpoint and target are never moved to chase that irregularity. Larger changes, disconnected support, shifted legs and a neighborhood outside the view still HOLD. Initial two-frame sharp-vertex credibility checks remain unchanged; this does not enable initial commitment to general rounded contours.
 - During commitment, boundary association uses the frame-pose projection onto the frozen incoming/outgoing leg. It does not use the detector's blended corner location or change the frozen target. The current camera must stay within the original commitment corridor and leg extent.
 
 The seed-to-boundary gate is unchanged: 10% of Search px, bounded to 15–80 pixels (**40 pixels at Search 400**). There is no centerline fallback for a region-like Edge-mode component. Detector confidence, planner confidence, physical move cap, and the LinuxCNC endpoint executor remain active. Feed remains the configured Follow Feed; recommended velocity remains diagnostic only.
@@ -64,7 +66,7 @@ python -m unittest discover -s tests -v
 
 Tests cover sharp turns in both directions and rotated views, concave boundaries, smooth radii, small edge defects, fixed-target persistence, fresh-frame confirmation, delayed-frame poses, four successive corners with a smaller physical step cap, boundary loss, the unchanged 40-pixel gate, Line mode, reset, CSV field retention, and the physical step loop with a mock executor (success and failure).
 
-The October 17 timeline establishes the prior failure but contains no camera frames, so it cannot by itself validate the new geometry fitting. Physical-table validation remains pending.
+The supplied frame packages permit saved-decision replay. They end at their respective HOLDs, so they cannot establish successful physical execution beyond those points. Physical-table validation of the latest patch remains pending.
 
 After pulling this branch, restart FabScan and verify **M6.4** in the controls. Keep the previous test settings and shape for comparison. Use Dry Plan, then test the same first and second corners. A successful transition should show `COMMITTED → VERTEX_REACHED → OUTGOING_LATCHED → RESUMED`. Send the timeline; if geometry is rejected or support is lost, also preserve the automatically recorded frame package for diagnosis.
 
@@ -73,3 +75,11 @@ After pulling this branch, restart FabScan and verify **M6.4** in the controls. 
 The October 17 13:45:35 recording stops at step 93 in M6.4.0: detector seed distance 40.42 pixels. Replaying saved steps 88–93 with the recorded calibration and fine rotation reproduces that HOLD. M6.4.1 accepts all six saved approach decisions, with step 93 targeting the original vertex in a 0.027077-inch move. Its committed anchor is 1.68 pixels from the boundary; required incoming/outgoing residuals are 2.87/2.32 pixels. The old 4.65-pixel incoming sample is behind the actual camera and outside the retained overlap.
 
 This is a saved-frame planning regression, not evidence of a completed second corner on the machine: the recording ends before that move. Automated tests also cover detector drift with delayed frame pose, displaced boundaries, defects ahead versus behind, outgoing support loss, and CSV persistence of association source, support ranges and residuals.
+
+## M6.4.2 tip support regression
+
+The 14:57:37 recording confirms a sharp corner at step 14, then holds at step 18, 0.042477 inch short of the target. The committed boundary association is only 0.50 pixels from the contour. The maximum 6.43-pixel distance-transform residual is at the ideal intersection, not a traversed incoming defect. Samples farther along the two straight legs remain within the 4-pixel bound. Leg analysis does not establish a coherent translation that would justify moving the frozen target; the mismatch is concentrated at the tip.
+
+M6.4.2 checks that tip as the bounded connected transition described above. All 17 committed decisions in both supplied frame packages pass replay using saved calibration, fine rotation and poses: 12 from the earlier recording, 5 from the new one. Step 18 now plans the next bounded 0.030-inch approach move toward the original vertex; required incoming/outgoing straight support residuals are 2.87/0.95 pixels. It does not claim arrival at the vertex from that frame. The earlier step 93 still plans its final 0.027077-inch move.
+
+New timeline columns: `vertex_corner_radius`, `vertex_corner_connected` and `vertex_tip_distance_px` (Euclidean pixel distance, which differs slightly from OpenCV's approximate distance-transform residual). Tests cover a localized changed tip through executed arrival/outgoing release without retargeting, a tip change outside the envelope, a disconnected transition and empty local support. Existing straight-leg loss, boundary gate, delayed-pose, smooth-radius and executor-state tests remain active.

@@ -305,6 +305,52 @@ class PlannerTests(unittest.TestCase):
         self.assertIn('lost boundary support', plan.decision_reason)
         self.assertEqual(p.vertex.vertex.point, original)
 
+    def test_local_tip_change_keeps_fixed_target_and_completes_transition(self):
+        p, camera, _ = self.committed_setup()
+        original = p.vertex.vertex
+        # Replace only the tip after commitment; its observed boundary no longer
+        # passes through the ideal intersection, but joins the same straight legs.
+        polygon = np.array([[-1,0],[-.012,0],[0,.012],[0,1],[-1,1]])
+        saw_large_tip_distance = False
+        for step in range(3, 20):
+            plan = p.plan(render(camera, polygon), camera_x=camera[0], camera_y=camera[1],
+                          belief=belief(camera, step, measurement=camera+[0,.08]))
+            self.assertTrue(plan.accepted, plan.decision_reason)
+            self.assertEqual(p.vertex.vertex, original)
+            self.assertTrue(plan.vertex_diagnostics['vertex_corner_connected'])
+            saw_large_tip_distance |= plan.vertex_diagnostics['vertex_tip_distance_px'] > 4.0
+            camera = np.array([plan.approved_x, plan.approved_y])
+            p.record_executed_pose(*camera)
+            if p.vertex.state == 'FOLLOW':
+                self.assertTrue(saw_large_tip_distance)
+                return
+        self.fail('local tip transition did not finish')
+
+    def test_tip_change_outside_corner_envelope_holds(self):
+        p, camera, _ = self.committed_setup()
+        original = p.vertex.vertex
+        polygon = np.array([[-1,0],[-.04,0],[0,.04],[0,1],[-1,1]])
+        plan = p.plan(render(camera, polygon), camera_x=camera[0], camera_y=camera[1],
+                      belief=belief(camera, 3))
+        self.assertFalse(plan.accepted)
+        self.assertEqual(p.vertex.vertex, original)
+        self.assertEqual(p.vertex.state, 'APPROACH')
+
+    def test_corner_requires_observed_connectivity_without_gap_bridging(self):
+        p, camera, _ = self.committed_setup()
+        point = np.array(p.vertex.vertex.point)
+        samples = np.array([point-[.04,0], point, point+[0,.04]])
+        pixels = np.rint((samples-camera)*PPI+[400,300]).astype(np.int32)
+        mask = np.zeros((600,800), np.uint8)
+        cv2.polylines(mask, [pixels], False, 255, 1)
+        self.assertEqual(p._committed_corner_support(mask, camera), '')
+        x, y = pixels[1]
+        mask[y-1:y+2, x-1:x+2] = 0
+        self.assertIn('disconnected', p._committed_corner_support(mask, camera))
+        self.assertFalse(p._association_diagnostics['vertex_corner_connected'])
+        mask[:] = 0
+        self.assertIn('lost', p._committed_corner_support(mask, camera))
+
     def test_failed_execution_does_not_latch_and_reset_clears_state(self):
         p, camera, polygon = self.committed_setup()
         for step in range(3, 6):
@@ -361,6 +407,9 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(row['vertex_association_source'], 'committed_incoming')
         self.assertLessEqual(float(row['vertex_incoming_support_max_px']), 4.0)
         self.assertGreater(float(row['vertex_incoming_support_span']), .08)
+        self.assertEqual(row['vertex_corner_connected'], 'True')
+        self.assertAlmostEqual(float(row['vertex_corner_radius']), .018)
+        self.assertLess(float(row['vertex_tip_distance_px']), 2.0)
 
 
 

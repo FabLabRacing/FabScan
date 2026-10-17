@@ -15,7 +15,12 @@ import numpy as np
 ARRIVAL_TOLERANCE = 0.003
 EXIT_DISTANCE = 0.060
 LEG_SUPPORT = 0.080
+# The line fit already excludes the central .015 inch. Its intersection is an
+# ideal vertex; local tip irregularity must remain in this observed envelope.
+CORNER_LEG_START = 0.015
+CORNER_RADIUS = 0.018
 VERTEX_FIELDS = (
+    "vertex_corner_radius", "vertex_corner_connected", "vertex_tip_distance_px",
     "vertex_association_source", "vertex_association_x", "vertex_association_y", "vertex_association_reason",
     "vertex_incoming_support_span", "vertex_outgoing_support_start",
     "vertex_incoming_support_max_px", "vertex_outgoing_support_max_px",

@@ -9,10 +9,11 @@ import numpy as np
 
 from fabscan.path_belief import BeliefState
 from fabscan.sharp_vertex import (
-    ARRIVAL_TOLERANCE, EXIT_DISTANCE, LEG_SUPPORT, VertexCommitment, find_sharp_vertex,
+    ARRIVAL_TOLERANCE, EXIT_DISTANCE, LEG_SUPPORT, CORNER_LEG_START, CORNER_RADIUS,
+    VertexCommitment, find_sharp_vertex,
 )
 
-INTEGRATION_VERSION = "0.6.0-alpha.1-m6.4.1"
+INTEGRATION_VERSION = "0.6.0-alpha.1-m6.4.2"
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -593,13 +594,56 @@ class ConnectedPathPlanner:
                        motion_mode=("vertex_approach" if self.vertex.state == "APPROACH" else
                                     "vertex_outgoing" if self.vertex.state == "OUTGOING" else plan.motion_mode))
 
+    def _committed_corner_support(self, path_mask: np.ndarray, frame_camera: np.ndarray) -> str:
+        """Validate a local connected transition, not an exact tip pixel.
+
+        The fitting model excludes the central .015 inch of each straight leg.
+        Require those leg endpoints to be joined by observed boundary INSIDE a
+        .018-inch world-space disk. No dilation, gap bridging or target update.
+        """
+        vertex = self.vertex.vertex
+        assert vertex is not None
+        point = np.asarray(vertex.point)
+        h, w = path_mask.shape
+        center = np.asarray([w / 2, h / 2]) - self.machine_to_pixel @ (point - frame_camera)
+        radius_px = int(np.ceil(np.linalg.norm(self.machine_to_pixel, ord=2) * CORNER_RADIUS)) + 2
+        x0, y0 = np.floor(center - radius_px).astype(int)
+        x1, y1 = np.ceil(center + radius_px).astype(int) + 1
+        if x0 < 1 or y0 < 1 or x1 >= w or y1 >= h:
+            return "committed corner neighborhood left the camera view"
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        pixels = np.stack((xx, yy), axis=-1)
+        world = frame_camera - (pixels - [w / 2, h / 2]) @ self.pixel_to_machine.T
+        local = ((np.linalg.norm(world - point, axis=-1) <= CORNER_RADIUS)
+                 & (path_mask[y0:y1, x0:x1] > 0)).astype(np.uint8)
+        self._association_diagnostics.update(vertex_corner_radius=CORNER_RADIUS, vertex_corner_connected=False)
+        if not np.any(local):
+            return "committed corner lost its local boundary transition"
+        ys, xs = np.nonzero(local)
+        boundary_px = np.column_stack((xs + x0, ys + y0))
+        self._association_diagnostics["vertex_tip_distance_px"] = float(np.min(np.linalg.norm(boundary_px-center, axis=1)))
+        _, labels = cv2.connectedComponents(local, connectivity=8)
+        endpoint_labels = []
+        for direction, sign in ((vertex.incoming, -1), (vertex.outgoing, 1)):
+            endpoint = point + sign * CORNER_LEG_START * np.asarray(direction)
+            endpoint_px = np.asarray([w / 2, h / 2]) - self.machine_to_pixel @ (endpoint - frame_camera)
+            distances = np.linalg.norm(boundary_px - endpoint_px, axis=1)
+            nearest = int(np.argmin(distances))
+            if distances[nearest] > 4.0:
+                return "committed corner lost boundary support at a transition endpoint"
+            endpoint_labels.append(labels[ys[nearest], xs[nearest]])
+        if endpoint_labels[0] != endpoint_labels[1]:
+            return "committed corner boundary transition is disconnected"
+        self._association_diagnostics["vertex_corner_connected"] = True
+        return ""
+
     def _committed_plan(self, camera: np.ndarray, frame_camera: np.ndarray,
                         belief: BeliefState, path_mask: np.ndarray) -> PlannerResult:
         """Consume one bounded segment of a fixed vertex/exit target.
 
         Revalidate the untraversed approach and outgoing support on this frame's
         gated boundary. Executed position, not detector drift or planned motion,
-        retires incoming support. The frozen vertex is always checked.
+        retires incoming support. The frozen corner transition is always checked.
         """
         vertex = self.vertex.vertex
         assert vertex is not None
@@ -627,11 +671,14 @@ class ConnectedPathPlanner:
             vertex_incoming_support_span=incoming_span,
             vertex_outgoing_support_start=outgoing_start,
         )
-        ranges = (("incoming", incoming, -1, 0.0, incoming_span),
-                  ("outgoing", outgoing, 1, outgoing_start, LEG_SUPPORT))
+        ranges = (("incoming", incoming, -1, CORNER_LEG_START, max(CORNER_LEG_START, incoming_span)),
+                  ("outgoing", outgoing, 1, max(CORNER_LEG_START, outgoing_start), LEG_SUPPORT))
         for name, leg, sign, low, high in ranges:
-            # Include the vertex even after outgoing progress retires its tail.
-            offsets = np.unique(np.r_[0.0, np.linspace(low, high, max(2, int(np.ceil((high-low)/0.005))+1))])
+            # The central corner is validated as a connected transition below;
+            # the 4-pixel straight-leg bound starts outside that neighborhood.
+            if name == "incoming" and not approaching:
+                continue
+            offsets = np.linspace(low, high, max(2, int(np.ceil((high-low)/0.005))+1))
             samples = point + sign * offsets[:, None] * leg
             pixels = np.asarray([w / 2, h / 2]) - (self.machine_to_pixel @ (samples - frame_camera).T).T
             pixels = np.rint(pixels).astype(int)
@@ -643,6 +690,10 @@ class ConnectedPathPlanner:
             if residual > 4.0:
                 return self._refusal(camera, belief,
                     f"committed vertex lost boundary support ({name} remaining support residual {residual:.2f} px)", ())
+
+        corner_reason = self._committed_corner_support(path_mask, frame_camera)
+        if corner_reason:
+            return self._refusal(camera, belief, corner_reason, ())
 
         target = point if approaching else exit_point
         direction = incoming if approaching else outgoing
