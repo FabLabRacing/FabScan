@@ -16,6 +16,9 @@ ARRIVAL_TOLERANCE = 0.003
 EXIT_DISTANCE = 0.060
 LEG_SUPPORT = 0.080
 VERTEX_FIELDS = (
+    "vertex_association_source", "vertex_association_x", "vertex_association_y", "vertex_association_reason",
+    "vertex_incoming_support_span", "vertex_outgoing_support_start",
+    "vertex_incoming_support_max_px", "vertex_outgoing_support_max_px",
     "vertex_state", "vertex_id", "vertex_event", "vertex_previous_state",
     "vertex_reason", "vertex_x", "vertex_y", "vertex_distance",
     "vertex_incoming_x", "vertex_incoming_y", "vertex_outgoing_x", "vertex_outgoing_y",

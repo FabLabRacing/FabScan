@@ -12,7 +12,7 @@ from fabscan.sharp_vertex import (
     ARRIVAL_TOLERANCE, EXIT_DISTANCE, LEG_SUPPORT, VertexCommitment, find_sharp_vertex,
 )
 
-INTEGRATION_VERSION = "0.6.0-alpha.1-m6.4.0"
+INTEGRATION_VERSION = "0.6.0-alpha.1-m6.4.1"
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -580,6 +580,7 @@ class ConnectedPathPlanner:
         frame_camera_y: Optional[float] = None,
         observation_id: Any = None,
     ) -> PlannerResult:
+        self._association_diagnostics = {}
         self._observation_id = belief.step_id if observation_id is None else observation_id
         plan = self._plan(
             frame_bgr, camera_x=camera_x, camera_y=camera_y, belief=belief,
@@ -588,15 +589,17 @@ class ConnectedPathPlanner:
         camera = np.asarray([camera_x, camera_y], dtype=float)
         if not plan.accepted:
             self.vertex.hold(plan.decision_reason, camera)
-        return replace(plan, vertex_diagnostics=self.vertex.fields(camera))
+        return replace(plan, vertex_diagnostics={**self.vertex.fields(camera), **self._association_diagnostics},
+                       motion_mode=("vertex_approach" if self.vertex.state == "APPROACH" else
+                                    "vertex_outgoing" if self.vertex.state == "OUTGOING" else plan.motion_mode))
 
     def _committed_plan(self, camera: np.ndarray, frame_camera: np.ndarray,
                         belief: BeliefState, path_mask: np.ndarray) -> PlannerResult:
         """Consume one bounded segment of a fixed vertex/exit target.
 
-        Both legs must still be present on the gated connected boundary in this
-        frame. The detector seed gate has already run, exactly as in ordinary
-        following. A bad frame produces HOLD, never a blind committed move.
+        Revalidate the untraversed approach and outgoing support on this frame's
+        gated boundary. Executed position, not detector drift or planned motion,
+        retires incoming support. The frozen vertex is always checked.
         """
         vertex = self.vertex.vertex
         assert vertex is not None
@@ -606,19 +609,41 @@ class ConnectedPathPlanner:
         exit_point = point + outgoing * EXIT_DISTANCE
         h, w = path_mask.shape
         distance_image = cv2.distanceTransform(255 - path_mask, cv2.DIST_L2, 3)
-        # Validate the same supported corner, not just the nearest isolated pixel.
-        for direction, sign in ((incoming, -1), (outgoing, 1)):
-            samples = point + sign * np.linspace(0.0, LEG_SUPPORT, 17)[:, None] * direction
+        approaching = self.vertex.state == "APPROACH"
+        direction = incoming if approaching else outgoing
+        progress = float(np.dot(camera - point, direction))
+        lateral = float(np.linalg.norm(camera - point - progress * direction))
+        if (approaching and not -0.220 - ARRIVAL_TOLERANCE <= progress <= ARRIVAL_TOLERANCE) or (
+                not approaching and not -ARRIVAL_TOLERANCE <= progress <= EXIT_DISTANCE + ARRIVAL_TOLERANCE):
+            return self._refusal(camera, belief, "camera outside committed leg extent", ())
+        if lateral > self.max_correct + 0.015:
+            return self._refusal(camera, belief, "camera left committed leg corridor", ())
+        # Retire only support behind the actual controller pose, keeping one
+        # arrival-tolerance overlap. Check the ENTIRE remaining approach (which
+        # can exceed LEG_SUPPORT), then the outgoing leg. Sample at <= .005 in.
+        incoming_span = max(ARRIVAL_TOLERANCE, -progress + ARRIVAL_TOLERANCE) if approaching else 0.0
+        outgoing_start = 0.0 if approaching else max(0.0, progress - ARRIVAL_TOLERANCE)
+        self._association_diagnostics.update(
+            vertex_incoming_support_span=incoming_span,
+            vertex_outgoing_support_start=outgoing_start,
+        )
+        ranges = (("incoming", incoming, -1, 0.0, incoming_span),
+                  ("outgoing", outgoing, 1, outgoing_start, LEG_SUPPORT))
+        for name, leg, sign, low, high in ranges:
+            # Include the vertex even after outgoing progress retires its tail.
+            offsets = np.unique(np.r_[0.0, np.linspace(low, high, max(2, int(np.ceil((high-low)/0.005))+1))])
+            samples = point + sign * offsets[:, None] * leg
             pixels = np.asarray([w / 2, h / 2]) - (self.machine_to_pixel @ (samples - frame_camera).T).T
             pixels = np.rint(pixels).astype(int)
             if np.any(pixels < 1) or np.any(pixels[:, 0] >= w-1) or np.any(pixels[:, 1] >= h-1):
                 return self._refusal(camera, belief, "committed vertex legs left the camera view", ())
             support = distance_image[pixels[:, 1], pixels[:, 0]]
-            if float(np.max(support)) > 4.0:
+            residual = float(np.max(support))
+            self._association_diagnostics[f"vertex_{name}_support_max_px"] = residual
+            if residual > 4.0:
                 return self._refusal(camera, belief,
-                    f"committed vertex lost boundary support (maximum leg residual {np.max(support):.2f} px)", ())
+                    f"committed vertex lost boundary support ({name} remaining support residual {residual:.2f} px)", ())
 
-        approaching = self.vertex.state == "APPROACH"
         target = point if approaching else exit_point
         direction = incoming if approaching else outgoing
         delta = target - camera
@@ -638,7 +663,7 @@ class ConnectedPathPlanner:
         mode = "vertex_approach" if approaching else "vertex_outgoing"
         reason = (
             f"{mode}: fixed vertex X{point[0]:.6f} Y{point[1]:.6f}; "
-            f"remaining target distance {distance:.6f} in; both boundary legs revalidated"
+            f"remaining target distance {distance:.6f} in; remaining approach and outgoing boundary support revalidated"
         )
         return PlannerResult(
             accepted=True, safety_action="PASS", camera_x=float(camera[0]), camera_y=float(camera[1]),
@@ -686,12 +711,26 @@ class ConnectedPathPlanner:
         # profile location. The persistent estimate supplies memory/heading, but is
         # deliberately not allowed to drag the connected-path seed behind a curve.
         seed_world = np.asarray([belief.measurement_x, belief.measurement_y], dtype=float)
+        source = "detector"
+        if self.vertex.active:
+            vertex = self.vertex.vertex
+            point = np.asarray(vertex.point)
+            approaching = self.vertex.state == "APPROACH"
+            leg = np.asarray(vertex.incoming if approaching else vertex.outgoing)
+            # Associate in the frame's coordinate system, not the possibly newer
+            # execution pose. This selects a component, never a new target.
+            low, high = (-0.220, 0.0) if approaching else (0.0, EXIT_DISTANCE)
+            seed_world = point + np.clip(np.dot(frame_camera - point, leg), low, high) * leg
+            source = "committed_incoming" if approaching else "committed_outgoing"
+        self._association_diagnostics.update(vertex_association_source=source,
+            vertex_association_x=float(seed_world[0]), vertex_association_y=float(seed_world[1]))
         seed_delta_px = self._world_to_pixel_delta(seed_world - frame_camera)
         seed_px = np.asarray([w / 2.0 + seed_delta_px[0], h / 2.0 + seed_delta_px[1]], dtype=float)
         component, component_reason = self._seed_component(frame_bgr, seed_px)
         if component is None:
             return self._refusal(camera, belief, component_reason, ())
         path_mask, path_kind, extraction_reason = self._path_representation(component, seed_px)
+        self._association_diagnostics["vertex_association_reason"] = extraction_reason
         if not np.any(path_mask):
             return self._refusal(camera, belief, extraction_reason, ())
 

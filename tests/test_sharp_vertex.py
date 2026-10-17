@@ -18,7 +18,7 @@ from fabscan.path_belief import BeliefState, ContextResult
 from fabscan.real_belief_follow import _controller_move_from_plan, _log_vertex_events
 from fabscan.real_belief_follow import _m6_step_impl, RealBeliefSession
 from fabscan.sharp_vertex import SharpVertex, VertexCommitment, find_sharp_vertex, EXIT_DISTANCE
-from fabscan.virtual_planner import ConnectedPathPlanner
+from fabscan.virtual_planner import ConnectedPathPlanner, INTEGRATION_VERSION
 
 
 PPI = 800.0
@@ -235,14 +235,66 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan.motion_mode, 'vertex_approach')
         return p, camera, polygon
 
+    def test_detector_drift_does_not_retarget_committed_corner(self):
+        p, camera, polygon = self.committed_setup()
+        original = p.vertex.vertex
+        frame_camera = camera - [.01, 0]
+        plan = p.plan(render(frame_camera, polygon), camera_x=camera[0], camera_y=camera[1],
+                      frame_camera_x=frame_camera[0], frame_camera_y=frame_camera[1],
+                      belief=belief(camera, 3, measurement=camera + [0, .08]))
+        self.assertTrue(plan.accepted, plan.decision_reason)
+        self.assertEqual(p.vertex.vertex, original)
+        self.assertEqual(plan.vertex_diagnostics['vertex_association_source'], 'committed_incoming')
+        np.testing.assert_allclose([plan.vertex_diagnostics['vertex_association_x'],
+                                    plan.vertex_diagnostics['vertex_association_y']], frame_camera, atol=.002)
+
     def test_boundary_gate_remains_in_force_during_commitment(self):
         p, camera, polygon = self.committed_setup()
-        plan = p.plan(render(camera, polygon), camera_x=camera[0], camera_y=camera[1],
-                      belief=belief(camera, 3, measurement=camera + [0, .08]))
+        plan = p.plan(render(camera, polygon + [0, .08]), camera_x=camera[0], camera_y=camera[1],
+                      belief=belief(camera, 3))
         self.assertFalse(plan.accepted)
         self.assertIn('beyond 40.00 px limit', plan.decision_reason)
+        self.assertEqual(plan.motion_mode, 'vertex_approach')
         self.assertEqual(p.vertex.state, 'APPROACH')
         self.assertEqual(p.vertex.drain_events()[-1]['vertex_event'], 'HOLD')
+
+    def test_retire_only_traversed_incoming_support(self):
+        # The same notch is ignored behind the executed camera, but stops a
+        # move when it lies ahead. Also cover an approach longer than .080 in.
+        for camera_x, notch_x, accepted in ((-.027, -.08, True),
+                                           (-.027, -.015, False),
+                                           (-.15, -.12, False)):
+            with self.subTest(camera_x=camera_x, notch_x=notch_x):
+                p, _, polygon = self.committed_setup()
+                camera = np.array([camera_x, 0.])
+                p.record_executed_pose(*camera)
+                frame = render(camera, polygon)
+                left = int(round((notch_x-.009-camera_x)*PPI+400))
+                right = int(round((notch_x+.009-camera_x)*PPI+400))
+                cv2.rectangle(frame, (left, 299), (right, 311), (255,255,255), -1)
+                plan = p.plan(frame, camera_x=camera[0], camera_y=camera[1], belief=belief(camera, 3))
+                self.assertEqual(plan.accepted, accepted, plan.decision_reason)
+                if not accepted:
+                    self.assertIn('lost boundary support', plan.decision_reason)
+
+    def test_outgoing_association_ignores_detector_and_retired_incoming(self):
+        p, _, polygon = self.committed_setup()
+        p.record_executed_pose(*p.vertex.vertex.point)
+        camera = np.array(p.vertex.vertex.point) + np.array(p.vertex.vertex.outgoing)*.03
+        p.record_executed_pose(*camera)
+        frame = render(camera, polygon)
+        # Remove incoming boundary well behind the reached vertex.
+        cv2.rectangle(frame, (320, 275), (360, 287), (255,255,255), -1)
+        plan = p.plan(frame, camera_x=camera[0], camera_y=camera[1],
+                      belief=belief(camera, 3, measurement=camera+[.08,0]))
+        self.assertTrue(plan.accepted, plan.decision_reason)
+        self.assertEqual(plan.motion_mode, 'vertex_outgoing')
+        self.assertEqual(plan.vertex_diagnostics['vertex_association_source'], 'committed_outgoing')
+        # Losing the untraversed outgoing segment must still stop execution.
+        cv2.rectangle(frame, (389, 307), (401, 323), (255,255,255), -1)
+        plan = p.plan(frame, camera_x=camera[0], camera_y=camera[1], belief=belief(camera, 4))
+        self.assertFalse(plan.accepted)
+        self.assertIn('lost boundary support', plan.decision_reason)
 
     def test_disappearing_outgoing_leg_holds_without_retargeting(self):
         p, camera, polygon = self.committed_setup()
@@ -301,8 +353,15 @@ class PlannerTests(unittest.TestCase):
         rows = list(csv.DictReader(io.StringIO(output.getvalue())))
         self.assertEqual(rows[-1]['vertex_event'], 'COMMITTED')
         self.assertEqual(rows[-1]['vertex_state'], 'APPROACH')
-        self.assertEqual(rows[-1]['planner_version'], '0.6.0-alpha.1-m6.4.0')
+        self.assertEqual(rows[-1]['planner_version'], INTEGRATION_VERSION)
         self.assertAlmostEqual(float(rows[-1]['vertex_x']), 0, delta=.002)
+        plan = p.plan(render(camera, polygon), camera_x=camera[0], camera_y=camera[1], belief=belief(camera, 3))
+        writer.writerow({'event': 'M6_VERTEX_STATE', **plan.vertex_diagnostics})
+        row = list(csv.DictReader(io.StringIO(output.getvalue())))[-1]
+        self.assertEqual(row['vertex_association_source'], 'committed_incoming')
+        self.assertLessEqual(float(row['vertex_incoming_support_max_px']), 4.0)
+        self.assertGreater(float(row['vertex_incoming_support_span']), .08)
+
 
 
 class RuntimeIntegrationTests(unittest.TestCase):

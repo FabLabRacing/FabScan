@@ -2,6 +2,15 @@
 
 ## Unreleased — M6.4 sharp-vertex commitment
 
+### M6.4.1 — committed boundary association and remaining support
+
+- Anchor committed boundary association to the frozen leg using the camera frame pose; retain the existing seed-distance and confidence gates.
+- Revalidate the entire remaining approach and outgoing support. Retire traversed support using actual position with a 0.003-inch overlap, retaining the 4-pixel residual limit and a check at the vertex.
+- Log association source, support ranges and maximum residuals, including the committed motion mode on HOLD.
+- Replay the October 17 second-corner failure through the final recorded frame; it now plans the remaining 0.027077-inch move to the unchanged vertex. Physical confirmation beyond that frame remains pending.
+
+### M6.4.0
+
 - Confirm sharp Edge-mode vertices from two distinct observations of the original connected boundary, using two supported straight legs to reject smooth radii and small defects.
 - Freeze the vertex and outgoing leg in machine coordinates; approach the vertex with bounded moves, latch the outgoing leg only after executed-pose arrival, then resume ordinary following.
 - Let the physical controller honor these fixed targets without ordinary heading/correction blending. The existing boundary gate, physical move cap, confidence checks and coordinated executor remain in force.
