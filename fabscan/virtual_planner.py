@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 import math
 from typing import Any, Optional
 
@@ -8,8 +8,11 @@ import cv2
 import numpy as np
 
 from fabscan.path_belief import BeliefState
+from fabscan.sharp_vertex import (
+    ARRIVAL_TOLERANCE, EXIT_DISTANCE, LEG_SUPPORT, VertexCommitment, find_sharp_vertex,
+)
 
-INTEGRATION_VERSION = "0.6.0-alpha.1-m6.3.2"
+INTEGRATION_VERSION = "0.6.0-alpha.1-m6.4.0"
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -87,6 +90,7 @@ class CandidatePath:
     turn_degrees: float
     score: float
     reason: str
+    boundary_points_world: tuple[tuple[float, float], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -121,6 +125,8 @@ class PlannerResult:
     candidate_count: int
     rejected_candidates: tuple[str, ...]
     decision_reason: str
+    motion_mode: str = "boundary_follow"
+    vertex_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -158,6 +164,8 @@ class ConnectedPathPlanner:
         self.camera_history: list[tuple[float, float]] = []
         self.total_distance = 0.0
         self._last_camera: Optional[np.ndarray] = None
+        self.vertex = VertexCommitment()
+        self.pixel_size = float(np.linalg.norm(self.pixel_to_machine, ord=2))
 
     def reset(self, *, reverse_initial: bool = False) -> None:
         self.travel_unit = None
@@ -165,6 +173,7 @@ class ConnectedPathPlanner:
         self.camera_history.clear()
         self.total_distance = 0.0
         self._last_camera = None
+        self.vertex = VertexCommitment()
 
     def record_executed_pose(self, x: float, y: float) -> None:
         point = np.asarray([float(x), float(y)], dtype=float)
@@ -177,6 +186,15 @@ class ConnectedPathPlanner:
         self.camera_history.append((float(x), float(y)))
         if len(self.camera_history) > 2000:
             self.camera_history = self.camera_history[-2000:]
+
+        previous_vertex_state = self.vertex.state
+        locked_heading = self.vertex.record_executed_pose(point)
+        if locked_heading is not None:
+            self.travel_unit = locked_heading
+            if self.vertex.state != previous_vertex_state:
+                # The incoming trailing chord must not vote on outgoing travel.
+                self.camera_history = [(float(x), float(y))]
+            return
 
         # Established travel is a trailing path chord, not the most recent bump.
         # A correction-heavy move can point mostly sideways and must not become
@@ -514,6 +532,7 @@ class ConnectedPathPlanner:
                 continue
             pixel_path = points_px[ids].astype(float)
             world_path = np.asarray([self._pixel_to_world(camera, p[0], p[1], w, h) for p in pixel_path], dtype=float)
+            boundary_points = tuple(tuple(p) for p in world_path) if path_kind == "boundary" else ()
             world_path, s = self._resample_polyline(world_path, 0.010)
             if len(world_path) < 4 or float(s[-1]) < 0.045:
                 continue
@@ -545,11 +564,98 @@ class ConnectedPathPlanner:
                 turn_degrees=turn,
                 score=float(score),
                 reason=f"connected {path_kind} path {s[-1]:.3f} in; start alignment {start_alignment:+.2f}; visible turn {turn:.1f}°",
+                boundary_points_world=boundary_points,
             ))
         candidates.sort(key=lambda candidate: candidate.score, reverse=True)
         return candidates, rejects
 
     def plan(
+        self,
+        frame_bgr: np.ndarray,
+        *,
+        camera_x: float,
+        camera_y: float,
+        belief: BeliefState,
+        frame_camera_x: Optional[float] = None,
+        frame_camera_y: Optional[float] = None,
+        observation_id: Any = None,
+    ) -> PlannerResult:
+        self._observation_id = belief.step_id if observation_id is None else observation_id
+        plan = self._plan(
+            frame_bgr, camera_x=camera_x, camera_y=camera_y, belief=belief,
+            frame_camera_x=frame_camera_x, frame_camera_y=frame_camera_y,
+        )
+        camera = np.asarray([camera_x, camera_y], dtype=float)
+        if not plan.accepted:
+            self.vertex.hold(plan.decision_reason, camera)
+        return replace(plan, vertex_diagnostics=self.vertex.fields(camera))
+
+    def _committed_plan(self, camera: np.ndarray, frame_camera: np.ndarray,
+                        belief: BeliefState, path_mask: np.ndarray) -> PlannerResult:
+        """Consume one bounded segment of a fixed vertex/exit target.
+
+        Both legs must still be present on the gated connected boundary in this
+        frame. The detector seed gate has already run, exactly as in ordinary
+        following. A bad frame produces HOLD, never a blind committed move.
+        """
+        vertex = self.vertex.vertex
+        assert vertex is not None
+        point = np.asarray(vertex.point)
+        incoming = np.asarray(vertex.incoming)
+        outgoing = np.asarray(vertex.outgoing)
+        exit_point = point + outgoing * EXIT_DISTANCE
+        h, w = path_mask.shape
+        distance_image = cv2.distanceTransform(255 - path_mask, cv2.DIST_L2, 3)
+        # Validate the same supported corner, not just the nearest isolated pixel.
+        for direction, sign in ((incoming, -1), (outgoing, 1)):
+            samples = point + sign * np.linspace(0.0, LEG_SUPPORT, 17)[:, None] * direction
+            pixels = np.asarray([w / 2, h / 2]) - (self.machine_to_pixel @ (samples - frame_camera).T).T
+            pixels = np.rint(pixels).astype(int)
+            if np.any(pixels < 1) or np.any(pixels[:, 0] >= w-1) or np.any(pixels[:, 1] >= h-1):
+                return self._refusal(camera, belief, "committed vertex legs left the camera view", ())
+            support = distance_image[pixels[:, 1], pixels[:, 0]]
+            if float(np.max(support)) > 4.0:
+                return self._refusal(camera, belief,
+                    f"committed vertex lost boundary support (maximum leg residual {np.max(support):.2f} px)", ())
+
+        approaching = self.vertex.state == "APPROACH"
+        target = point if approaching else exit_point
+        direction = incoming if approaching else outgoing
+        delta = target - camera
+        distance = float(np.linalg.norm(delta))
+        if float(np.dot(delta, direction)) < -ARRIVAL_TOLERANCE:
+            return self._refusal(camera, belief, "committed target was passed without confirmed arrival", ())
+        if distance < ARRIVAL_TOLERANCE:
+            return self._refusal(camera, belief, "committed target awaits executed-pose confirmation", ())
+        # Do not leave a sub-minimum final step. A short final move still ends at
+        # the vertex; no step may extend through it onto the outgoing leg.
+        step = min(self.follow_step, distance)
+        if 0.0 < distance - step < ARRIVAL_TOLERANCE and distance >= 2 * ARRIVAL_TOLERANCE:
+            step = distance / 2.0
+        move = delta * (step / distance)
+        approved = camera + move
+        confidence = min(float(belief.measured_confidence), float(belief.belief_confidence))
+        mode = "vertex_approach" if approaching else "vertex_outgoing"
+        reason = (
+            f"{mode}: fixed vertex X{point[0]:.6f} Y{point[1]:.6f}; "
+            f"remaining target distance {distance:.6f} in; both boundary legs revalidated"
+        )
+        return PlannerResult(
+            accepted=True, safety_action="PASS", camera_x=float(camera[0]), camera_y=float(camera[1]),
+            proposed_x=float(approved[0]), proposed_y=float(approved[1]),
+            approved_x=float(approved[0]), approved_y=float(approved[1]),
+            move_x=float(move[0]), move_y=float(move[1]), move_length=step,
+            forward_step=step, cross_track_correction=0.0,
+            local_path_points=tuple(tuple(p) for p in (camera, target)),
+            current_tangent_x=float(direction[0]), current_tangent_y=float(direction[1]),
+            predicted_tangent_x=float(outgoing[0]), predicted_tangent_y=float(outgoing[1]),
+            curvature=0.0, usable_lookahead=LEG_SUPPORT, steering_lookahead=distance,
+            recommended_velocity=self.base_feed * 0.3, planner_confidence=confidence,
+            path_turn_degrees=vertex.turn_degrees, candidate_count=1, rejected_candidates=(),
+            decision_reason=reason, motion_mode=mode,
+        )
+
+    def _plan(
         self,
         frame_bgr: np.ndarray,
         *,
@@ -589,6 +695,11 @@ class ConnectedPathPlanner:
         if not np.any(path_mask):
             return self._refusal(camera, belief, extraction_reason, ())
 
+        if self.vertex.active:
+            if path_kind != "boundary":
+                return self._refusal(camera, belief, "committed vertex requires the same boundary representation", ())
+            return self._committed_plan(camera, frame_camera, belief, path_mask)
+
         if self.travel_unit is None:
             # The first camera frame gives an unoriented tangent. Examine both
             # connected directions and use visible path support to pick the initial
@@ -621,6 +732,22 @@ class ConnectedPathPlanner:
                 return self._refusal(camera, belief, "no forward connected path candidate", tuple(rejects[-8:]))
             best = candidates[0]
         path = np.asarray(best.points_world, dtype=float)
+        if path_kind == "boundary":
+            vertex, vertex_reason = find_sharp_vertex(np.asarray(best.boundary_points_world), pixel_size=self.pixel_size)
+            self.vertex.observe(
+                vertex, camera=camera, observation_id=self._observation_id,
+                pixel_size=self.pixel_size, max_cross_track=self.max_correct + 0.015,
+            )
+            if vertex is None:
+                self.vertex.reason = vertex_reason
+            if self.vertex.active:
+                self.travel_unit = np.asarray(self.vertex.vertex.incoming)
+                return self._committed_plan(camera, frame_camera, belief, path_mask)
+            if self.vertex.state == "CANDIDATE" and self.vertex.vertex is not None:
+                if np.linalg.norm(np.asarray(self.vertex.vertex.point) - camera) < self.follow_step + ARRIVAL_TOLERANCE:
+                    return self._refusal(camera, belief, "sharp vertex too close to cross before fresh-frame confirmation", ())
+        else:
+            self.vertex.reject_candidate("sharp-vertex commitment is limited to boundary paths", camera)
         path, s = self._resample_polyline(path, 0.005)
         usable = min(float(best.arc_length), max(0.0, float(belief.usable_lookahead))) if belief.usable_lookahead > 0 else float(best.arc_length)
         # Dynamic steering look-ahead is a description of what we trust, not a

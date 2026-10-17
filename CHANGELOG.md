@@ -1,5 +1,13 @@
 # FabScan Changelog
 
+## Unreleased — M6.4 sharp-vertex commitment
+
+- Confirm sharp Edge-mode vertices from two distinct observations of the original connected boundary, using two supported straight legs to reject smooth radii and small defects.
+- Freeze the vertex and outgoing leg in machine coordinates; approach the vertex with bounded moves, latch the outgoing leg only after executed-pose arrival, then resume ordinary following.
+- Let the physical controller honor these fixed targets without ordinary heading/correction blending. The existing boundary gate, physical move cap, confidence checks and coordinated executor remain in force.
+- Add `M6_VERTEX_STATE` and `M6_VERTEX_TRANSITION` events, persist planner/vertex fields in timeline CSV, and show the committed vertex and outgoing leg in the live overlay.
+- Add headless geometry, connected-boundary, controller and physical-step integration tests. Physical-machine validation remains pending.
+
 ## v0.6.0-alpha.1 — Belief-Based Connected-Path Alpha
 
 Major architectural change from the v0.5 follower experiments.

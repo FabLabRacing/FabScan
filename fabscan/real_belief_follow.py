@@ -12,9 +12,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from fabscan.path_belief import BeliefState, PathBeliefEstimator
-from fabscan.virtual_planner import ConnectedPathPlanner, PlannerResult
-
-INTEGRATION_VERSION = "0.6.0-alpha.1-m6.3.1"
+from fabscan.virtual_planner import ConnectedPathPlanner, PlannerResult, INTEGRATION_VERSION
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -72,6 +70,18 @@ def _controller_move_from_plan(dialog: Any, plan: PlannerResult, current_x: floa
     """
     path = np.asarray(plan.local_path_points, dtype=float)
     camera = np.asarray([float(current_x), float(current_y)], dtype=float)
+    if plan.motion_mode in {"vertex_approach", "vertex_outgoing"}:
+        # The fixed vertex/exit endpoint is already bounded and boundary-checked.
+        # Reconstructing a path + blended correction here would undo commitment.
+        move = np.asarray([plan.approved_x, plan.approved_y]) - camera
+        return float(move[0]), float(move[1]), {
+            "controller_mode": plan.motion_mode,
+            "controller_forward_x": f"{move[0]:.6f}",
+            "controller_forward_y": f"{move[1]:.6f}",
+            "controller_forward_len": f"{np.linalg.norm(move):.6f}",
+            "controller_correct_len": "0.000000",
+            "controller_correction_state": "fixed committed target; no heading/correction blending",
+        }
     if path.ndim != 2 or path.shape[0] < 2 or path.shape[1] != 2:
         return float(plan.move_x), float(plan.move_y), {
             "controller_mode": "planner_move_fallback",
@@ -232,7 +242,7 @@ def _add_ui(dialog: Any) -> None:
         row=row, column=0, columnspan=2, sticky="ew", pady=(10, 6)
     )
     row += 1
-    ttk.Label(parent, text="M6.3 Real Belief Follow", font=("TkDefaultFont", 9, "bold")).grid(
+    ttk.Label(parent, text="M6.4 Real Belief Follow", font=("TkDefaultFont", 9, "bold")).grid(
         row=row, column=0, columnspan=2, sticky=tk.W
     )
     row += 1
@@ -401,6 +411,7 @@ def _set_live_overlay_state(
             "path_turn_degrees": float(plan.path_turn_degrees),
             "candidate_count": int(plan.candidate_count),
             "safety_action": str(plan.safety_action),
+            "vertex_diagnostics": dict(plan.vertex_diagnostics),
         }
     dialog._m6_live_overlay_state = state
 
@@ -456,6 +467,13 @@ def _m6_draw_live_overlay(dialog: Any, draw: Any, scale: float, source_w: int, s
         except Exception:
             pass
 
+    vertex = plan.get("vertex_diagnostics") or {}
+    if "vertex_x" in vertex:
+        vx, vy = world_to_display(vertex["vertex_x"], vertex["vertex_y"])
+        ex, ey = world_to_display(vertex["vertex_exit_x"], vertex["vertex_exit_y"])
+        draw.rectangle((vx-5, vy-5, vx+5, vy+5), outline=(0,216,255), width=2)
+        draw.line((vx, vy, ex, ey), fill=(0,216,255), width=2)
+
     cx, cy = world_to_display(float(state["camera_x"]), float(state["camera_y"]))
     cf = state.get("controller_fields") or {}
     fx = _float(cf.get("controller_forward_x"), 0.0)
@@ -485,10 +503,12 @@ def _m6_draw_live_overlay(dialog: Any, draw: Any, scale: float, source_w: int, s
     forward = math.hypot(fx, fy)
     turn = _float(plan.get("path_turn_degrees"), 0.0)
     lines = [
-        f"M6.3 {status}   conf {conf:.0f}%   look {look:.3f} in",
+        f"M6.4 {status}   conf {conf:.0f}%   look {look:.3f} in",
         f"move {move_len:.4f}   forward {forward:.4f}   correction {corr:.4f} in",
         f"turn {turn:.1f} deg   rec {rec:.0f} IPM   candidates {int(plan.get('candidate_count', 0) or 0)}",
     ]
+    if vertex.get("vertex_state") not in (None, "FOLLOW"):
+        lines.append(f"Vertex {vertex['vertex_state']}   remaining {_float(vertex.get('vertex_distance')):.4f} in")
     if reason and status.upper().startswith("HOLD"):
         lines.append(reason[:92])
     x0, y0 = 10, 10
@@ -700,7 +720,18 @@ def _plan_payload(plan: PlannerResult, *, current_x: float, current_y: float, mo
         "path_turn_degrees": f"{plan.path_turn_degrees:.3f}",
         "candidate_count": int(plan.candidate_count),
         "rejected_candidates": list(plan.rejected_candidates),
+        "motion_mode": plan.motion_mode,
+        **plan.vertex_diagnostics,
     }
+
+
+def _log_vertex_events(dialog: Any, session: RealBeliefSession, step_id: int, step_label: str) -> None:
+    for fields in session.planner.vertex.drain_events():
+        dialog._timeline_log(
+            "M6_VERTEX_TRANSITION", step_id=step_id, step_label=step_label,
+            planner_version=INTEGRATION_VERSION, result=fields["vertex_event"],
+            reason=fields["vertex_reason"], **fields,
+        )
 
 
 def _execute_coordinated_xy_step(
@@ -1015,6 +1046,8 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
     )
     if not line.found:
         reason = f"M6 HOLD: {line.message} after fresh-frame retry"
+        session.planner.vertex.hold(reason, np.asarray([current_x, current_y]))
+        _log_vertex_events(dialog, session, step_id, step_label)
         dialog.current_line = line
         dialog._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="hold", reason=reason)
         dialog.cal_status_var.set(reason)
@@ -1029,6 +1062,8 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
     min_detector_conf = float(dialog._get_follow_min_confidence())
     if float(line.confidence) < min_detector_conf:
         reason = f"M6 HOLD: detector confidence {line.confidence:.1f}% below {min_detector_conf:.1f}%"
+        session.planner.vertex.hold(reason, np.asarray([current_x, current_y]))
+        _log_vertex_events(dialog, session, step_id, step_label)
         dialog._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="hold", reason=reason, **dialog._timeline_line_fields(line))
         dialog.cal_status_var.set(reason)
         dialog._show_current_frame()
@@ -1056,6 +1091,13 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
         belief=belief,
         frame_camera_x=float(frame_x),
         frame_camera_y=float(frame_y),
+        observation_id=(dialog.current_frame_sequence, dialog.current_frame_timestamp),
+    )
+    _log_vertex_events(dialog, session, step_id, step_label)
+    dialog._timeline_log(
+        "M6_VERTEX_STATE", step_id=step_id, step_label=step_label,
+        planner_version=INTEGRATION_VERSION, result="accepted" if plan.accepted else "hold",
+        reason=plan.decision_reason, motion_mode=plan.motion_mode, **plan.vertex_diagnostics,
     )
     if not plan.accepted:
         reason = f"M6 HOLD: {plan.decision_reason}"
@@ -1072,6 +1114,8 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
     min_lookahead = max(0.0, min(0.50, _float(dialog.m6_real_min_lookahead_var.get(), 0.045)))
     if plan.planner_confidence < min_plan_conf:
         reason = f"M6 HOLD: planner confidence {plan.planner_confidence:.1f}% below {min_plan_conf:.1f}%"
+        session.planner.vertex.hold(reason, np.asarray([current_x, current_y]))
+        _log_vertex_events(dialog, session, step_id, step_label)
         _set_live_overlay_state(dialog, step_label=step_label, current_x=float(current_x), current_y=float(current_y), belief=belief, plan=plan, status="HOLD", reason=reason)
         dialog._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="hold", reason=reason)
         dialog.cal_status_var.set(reason)
@@ -1079,6 +1123,8 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
         return False
     if plan.usable_lookahead < min_lookahead:
         reason = f"M6 HOLD: usable look-ahead {plan.usable_lookahead:.4f} in below {min_lookahead:.4f} in"
+        session.planner.vertex.hold(reason, np.asarray([current_x, current_y]))
+        _log_vertex_events(dialog, session, step_id, step_label)
         _set_live_overlay_state(dialog, step_label=step_label, current_x=float(current_x), current_y=float(current_y), belief=belief, plan=plan, status="HOLD", reason=reason)
         dialog._timeline_log("STEP_REFUSED", step_id=step_id, step_label=step_label, result="hold", reason=reason)
         dialog.cal_status_var.set(reason)
@@ -1114,6 +1160,8 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
         forward_dot = progress_unit[0] * float(established[0]) + progress_unit[1] * float(established[1])
         if forward_dot < -0.20:
             reason = f"M6 PHYSICAL SAFETY HOLD: connected path progress reverses established travel (dot {forward_dot:+.2f})"
+            session.planner.vertex.hold(reason, np.asarray([current_x, current_y]))
+            _log_vertex_events(dialog, session, step_id, step_label)
             _set_live_overlay_state(
                 dialog, step_label=step_label, current_x=float(current_x), current_y=float(current_y),
                 belief=belief, plan=plan, move_x=move_x, move_y=move_y,
@@ -1129,6 +1177,8 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
 
     if move_len < 0.003:
         reason = f"M6 PHYSICAL SAFETY HOLD: approved move collapsed to {move_len:.4f} in"
+        session.planner.vertex.hold(reason, np.asarray([current_x, current_y]))
+        _log_vertex_events(dialog, session, step_id, step_label)
         _set_live_overlay_state(
             dialog, step_label=step_label, current_x=float(current_x), current_y=float(current_y),
             belief=belief, plan=plan, move_x=move_x, move_y=move_y,
@@ -1201,6 +1251,8 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
             coordinate_mode=coordinate_mode,
         )
         if not ok:
+            session.planner.vertex.hold("coordinated execution failed; vertex arrival not confirmed", np.asarray([current_x, current_y]))
+            _log_vertex_events(dialog, session, step_id, step_label)
             dialog._timeline_log(
                 "MOVE_FAILED", step_id=step_id, step_label=step_label,
                 result="failed", reason=dialog.cal_status_var.get(), **executor_fields,
@@ -1244,10 +1296,12 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
         session.last_actual_x = float(post_x)
         session.last_actual_y = float(post_y)
         session.planner.record_executed_pose(float(post_x), float(post_y))
+        _log_vertex_events(dialog, session, step_id, step_label)
         if isinstance(getattr(dialog, "_m6_live_overlay_state", None), dict):
             dialog._m6_live_overlay_state["camera_x"] = float(post_x)
             dialog._m6_live_overlay_state["camera_y"] = float(post_y)
             dialog._m6_live_overlay_state["status"] = "COMPLETE"
+            dialog._m6_live_overlay_state["plan"]["vertex_diagnostics"] = session.planner.vertex.fields(np.asarray([post_x, post_y]))
 
         if bool(dialog.follow_capture_point_var.get()) and dialog.trace_capture_callback is not None:
             dialog.trace_capture_callback()
