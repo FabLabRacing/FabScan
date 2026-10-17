@@ -2,6 +2,13 @@
 
 ## Unreleased — M6.4 sharp-vertex commitment
 
+### M6.4.3 — estimator handoff at committed corners
+
+- Feed the live estimator a fresh, gated observation of the committed straight leg during APPROACH/OUTGOING, using the observed contour offset and frame pose instead of the generic detector's blend of both legs.
+- Retire incoming filter histories on executed outgoing latch; reinitialize from the next valid observation while preserving diagnostic states. Ordinary observations resume after outgoing release.
+- Preserve detector confidence and geometry gates; invalid support produces an invalid belief. Log observation source and history-reset flags.
+- Exercise the real estimator in physical-step integration tests. Sequential estimator/planner replay passes all 135 saved decisions across three recordings; at the latest HOLD frame planner confidence is 66.32% with the outgoing heading at 93.34 degrees. Physical validation beyond the recordings remains pending.
+
 ### M6.4.2 — connected corner-tip support
 
 - Keep committed coordinates fixed. Check the central fitted-corner neighborhood as an observed connected transition inside a 0.018-inch radius, with endpoints 0.015 inch along each leg and within 4 pixels of the contour. Do not fill gaps or retarget.

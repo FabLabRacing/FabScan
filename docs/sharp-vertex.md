@@ -1,6 +1,6 @@
 # M6.4 sharp-vertex commitment
 
-Implementation identifier: `0.6.0-alpha.1-m6.4.2`. The camera controls and overlay show **M6.4**.
+Implementation identifier: `0.6.0-alpha.1-m6.4.3`. The camera controls and overlay show **M6.4**.
 
 This addresses the Edge-mode failure where a visible ~90° turn shortens each step but the camera continues along the incoming leg until the boundary seed gate stops the run. It applies only to connected **boundary** paths; ordinary Line-mode centerlines retain their existing behavior.
 
@@ -83,3 +83,17 @@ The 14:57:37 recording confirms a sharp corner at step 14, then holds at step 18
 M6.4.2 checks that tip as the bounded connected transition described above. All 17 committed decisions in both supplied frame packages pass replay using saved calibration, fine rotation and poses: 12 from the earlier recording, 5 from the new one. Step 18 now plans the next bounded 0.030-inch approach move toward the original vertex; required incoming/outgoing straight support residuals are 2.87/0.95 pixels. It does not claim arrival at the vertex from that frame. The earlier step 93 still plans its final 0.027077-inch move.
 
 New timeline columns: `vertex_corner_radius`, `vertex_corner_connected` and `vertex_tip_distance_px` (Euclidean pixel distance, which differs slightly from OpenCV's approximate distance-transform residual). Tests cover a localized changed tip through executed arrival/outgoing release without retargeting, a tip change outside the envelope, a disconnected transition and empty local support. Existing straight-leg loss, boundary gate, delayed-pose, smooth-radius and executor-state tests remain active.
+
+## M6.4.3 estimator handoff
+
+During APPROACH/OUTGOING, the live estimator now consumes a fresh observation of the same committed boundary used by the planner. Before an observation is admitted, it passes the connected-component, Edge representation, remaining straight-leg support, local corner connectivity, pose corridor and detector-confidence checks. The observation measures the nearest contour's normal offset on a supported straight segment outside the tip neighborhood. Its along-leg station uses the frame pose; its direction uses the confirmed, revalidated leg. It is not a free fit of both legs together.
+
+The first observation on a newly committed incoming leg starts a new filter history. When a successful executed pose transitions APPROACH to OUTGOING, the runtime retires the incoming measurement and curvature histories and marks the filter for reinitialization from the next valid outgoing observation. Diagnostic state records remain available. Planning, Dry Plan and failed execution cannot trigger that physical outgoing handoff. Repeated observations on the same leg do not keep resetting the filter. Once the outgoing exit target is reached, ordinary detector observations resume with the outgoing estimator state as history.
+
+The current detector still has to find a profile and pass its confidence gate. Its confidence is carried into the boundary observation; no confidence floor is added. Invalid geometry produces an invalid belief with zero confidence, rather than falling back to the ambiguous detector point or a stored target. The motion planner independently rechecks the frame before approving motion. Confidence thresholds, fixed targets, support bounds and the LinuxCNC executor remain unchanged.
+
+The 15:16:06 recording reached the first vertex, latched outgoing travel and moved 0.030 inch, then held with ordinary belief confidence 42.895% against the 45% minimum. The belief heading remained near 159 degrees while the outgoing leg was 93.34 degrees. A sequential replay through the real estimator, live belief builder and planner now uses a 93.34-degree outgoing estimate; at the final frame its belief/planner confidence is about 68.37/66.32%. It plans the remaining approximately 0.030006-inch move to the fixed exit target.
+
+All 135 recorded decisions across the three October 17 packages pass the estimator/planner replay (93 + 18 + 24). Replay uses saved images, calibration, fine rotation and actual poses; stabilized detector measurements are reconstructed from the recorded belief measurements and innovations. Actual recorded poses remain the inputs, so this is not a closed-loop simulation of alternate physical motion. No frames after the final HOLDs exist.
+
+Tests now exercise the real estimator through commitment, executed arrival, outgoing travel and return to ordinary following, including delayed poses, rotated views, incoming-biased generic measurements, invalid/lost support, low detector confidence and observed boundary displacement. The physical-step test also runs with the real belief builder/estimator and a mock executor for both success and failure. New CSV fields are `belief_measurement_source` and `belief_history_reset` on `M6_BELIEF` events. `committed_incoming`/`committed_outgoing` identify admitted boundary observations; rejected observations are logged separately. The controls still show M6.4; use the full planner version or commit to distinguish patches.

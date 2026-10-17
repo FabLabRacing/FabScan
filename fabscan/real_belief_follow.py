@@ -623,6 +623,13 @@ def _frame_pose(dialog: Any, current_x: float, current_y: float) -> tuple[float,
     return float(sample.x), float(sample.y), fields
 
 
+def _record_executed_belief_pose(session: RealBeliefSession, x: float, y: float) -> None:
+    previous = session.planner.vertex.state
+    session.planner.record_executed_pose(x, y)
+    if previous == "APPROACH" and session.planner.vertex.state == "OUTGOING":
+        session.estimator.begin_leg((session.planner.vertex.vertex_id, "OUTGOING"))
+
+
 def _build_belief(
     dialog: Any,
     session: RealBeliefSession,
@@ -654,8 +661,23 @@ def _build_belief(
         "delayed_position": {"x": float(frame_x), "y": float(frame_y), "z": 0.0, "source": "M6 live frame pose"},
         "position_after": {"x": float(current_x), "y": float(current_y), "z": 0.0},
         "planner_output": payload,
+        "committed_measurement_required": session.planner.vertex.active,
     }
-    state = session.estimator.update(step, transformed_frame, session.step_index)
+    observation = None
+    if not bool(line.found):
+        step["planner_output"] = {}
+        step["measurement_rejection_reason"] = "no valid profile detection"
+    elif session.planner.vertex.active:
+        observation, rejection = session.planner.committed_observation(
+            transformed_frame, camera=np.array([current_x, current_y]),
+            frame_camera=np.array([frame_x, frame_y]), confidence=float(line.confidence),
+        )
+        if observation is None:
+            # Failed fresh support must not fall back to the blended detector or
+            # seed an estimator state from memory alone.
+            step["planner_output"] = {}
+            step["measurement_rejection_reason"] = rejection
+    state = session.estimator.update(step, transformed_frame, session.step_index, observation=observation)
     session.step_index += 1
     return state
 
@@ -679,6 +701,8 @@ def _log_belief(dialog: Any, *, step_id: int, step_label: str, belief: BeliefSta
         usable_lookahead=f"{belief.usable_lookahead:.6f}",
         prediction_horizon=f"{belief.prediction_horizon:.6f}",
         belief_confidence=f"{belief.belief_confidence:.3f}",
+        belief_measurement_source=belief.measurement_source,
+        belief_history_reset=belief.history_reset,
         position_innovation=f"{belief.position_innovation:.6f}",
         heading_innovation_degrees=f"{belief.heading_innovation_degrees:.3f}",
         reason=belief.reason,
@@ -1295,7 +1319,7 @@ def _m6_step_impl(dialog: Any, *, session: RealBeliefSession, step_label: str, s
         session.last_move_y = actual_dy
         session.last_actual_x = float(post_x)
         session.last_actual_y = float(post_y)
-        session.planner.record_executed_pose(float(post_x), float(post_y))
+        _record_executed_belief_pose(session, float(post_x), float(post_y))
         _log_vertex_events(dialog, session, step_id, step_label)
         if isinstance(getattr(dialog, "_m6_live_overlay_state", None), dict):
             dialog._m6_live_overlay_state["camera_x"] = float(post_x)

@@ -7,13 +7,13 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-from fabscan.path_belief import BeliefState
+from fabscan.path_belief import BeliefState, BoundaryObservation, ContextResult
 from fabscan.sharp_vertex import (
     ARRIVAL_TOLERANCE, EXIT_DISTANCE, LEG_SUPPORT, CORNER_LEG_START, CORNER_RADIUS,
     VertexCommitment, find_sharp_vertex,
 )
 
-INTEGRATION_VERSION = "0.6.0-alpha.1-m6.4.2"
+INTEGRATION_VERSION = "0.6.0-alpha.1-m6.4.3"
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -637,20 +637,13 @@ class ConnectedPathPlanner:
         self._association_diagnostics["vertex_corner_connected"] = True
         return ""
 
-    def _committed_plan(self, camera: np.ndarray, frame_camera: np.ndarray,
-                        belief: BeliefState, path_mask: np.ndarray) -> PlannerResult:
-        """Consume one bounded segment of a fixed vertex/exit target.
-
-        Revalidate the untraversed approach and outgoing support on this frame's
-        gated boundary. Executed position, not detector drift or planned motion,
-        retires incoming support. The frozen corner transition is always checked.
-        """
+    def _validate_committed_boundary(self, camera: np.ndarray, frame_camera: np.ndarray,
+                                     path_mask: np.ndarray) -> str:
         vertex = self.vertex.vertex
         assert vertex is not None
         point = np.asarray(vertex.point)
         incoming = np.asarray(vertex.incoming)
         outgoing = np.asarray(vertex.outgoing)
-        exit_point = point + outgoing * EXIT_DISTANCE
         h, w = path_mask.shape
         distance_image = cv2.distanceTransform(255 - path_mask, cv2.DIST_L2, 3)
         approaching = self.vertex.state == "APPROACH"
@@ -659,9 +652,9 @@ class ConnectedPathPlanner:
         lateral = float(np.linalg.norm(camera - point - progress * direction))
         if (approaching and not -0.220 - ARRIVAL_TOLERANCE <= progress <= ARRIVAL_TOLERANCE) or (
                 not approaching and not -ARRIVAL_TOLERANCE <= progress <= EXIT_DISTANCE + ARRIVAL_TOLERANCE):
-            return self._refusal(camera, belief, "camera outside committed leg extent", ())
+            return "camera outside committed leg extent"
         if lateral > self.max_correct + 0.015:
-            return self._refusal(camera, belief, "camera left committed leg corridor", ())
+            return "camera left committed leg corridor"
         # Retire only support behind the actual controller pose, keeping one
         # arrival-tolerance overlap. Check the ENTIRE remaining approach (which
         # can exceed LEG_SUPPORT), then the outgoing leg. Sample at <= .005 in.
@@ -683,18 +676,81 @@ class ConnectedPathPlanner:
             pixels = np.asarray([w / 2, h / 2]) - (self.machine_to_pixel @ (samples - frame_camera).T).T
             pixels = np.rint(pixels).astype(int)
             if np.any(pixels < 1) or np.any(pixels[:, 0] >= w-1) or np.any(pixels[:, 1] >= h-1):
-                return self._refusal(camera, belief, "committed vertex legs left the camera view", ())
+                return "committed vertex legs left the camera view"
             support = distance_image[pixels[:, 1], pixels[:, 0]]
             residual = float(np.max(support))
             self._association_diagnostics[f"vertex_{name}_support_max_px"] = residual
             if residual > 4.0:
-                return self._refusal(camera, belief,
-                    f"committed vertex lost boundary support ({name} remaining support residual {residual:.2f} px)", ())
+                return f"committed vertex lost boundary support ({name} remaining support residual {residual:.2f} px)"
 
         corner_reason = self._committed_corner_support(path_mask, frame_camera)
         if corner_reason:
-            return self._refusal(camera, belief, corner_reason, ())
+            return corner_reason
 
+        return ""
+
+    def committed_observation(self, frame_bgr: np.ndarray, *, camera: np.ndarray,
+                              frame_camera: np.ndarray, confidence: float) -> tuple[Optional[BoundaryObservation], str]:
+        """Observe the currently confirmed leg only after fresh geometry validation."""
+        self._association_diagnostics = {}
+        if not self.vertex.active:
+            return None, "no committed leg"
+        if not math.isfinite(confidence) or confidence < self.min_confidence:
+            return None, "committed observation has insufficient detector confidence"
+        vertex = self.vertex.vertex
+        point = np.asarray(vertex.point)
+        approaching = self.vertex.state == "APPROACH"
+        leg = np.asarray(vertex.incoming if approaching else vertex.outgoing)
+        h, w = frame_bgr.shape[:2]
+        projection = float(np.dot(frame_camera - point, leg))
+        # Measure on a supported straight segment, outside the uncertain tip.
+        along = np.clip(projection, -0.220, -CORNER_LEG_START) if approaching else np.clip(projection, CORNER_LEG_START, LEG_SUPPORT)
+        anchor = point + along * leg
+        seed_px = np.array([w / 2, h / 2]) - self.machine_to_pixel @ (anchor - frame_camera)
+        component, reason = self._seed_component(frame_bgr, seed_px)
+        if component is None:
+            return None, reason
+        mask, kind, reason = self._path_representation(component, seed_px)
+        if kind != "boundary" or not np.any(mask):
+            return None, reason
+        reason = self._validate_committed_boundary(camera, frame_camera, mask)
+        if reason:
+            return None, reason
+        yy, xx = np.nonzero(mask)
+        pixels = np.column_stack((xx, yy))
+        distances = np.linalg.norm(pixels - seed_px, axis=1)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] > 4.0:
+            return None, "committed observation lost straight-leg support"
+        observed = frame_camera - self.pixel_to_machine @ (pixels[nearest] - [w / 2, h / 2])
+        normal = np.array([-leg[1], leg[0]])
+        # The location comes from the observed boundary's lateral offset. The
+        # confirmed straight-leg model supplies direction and along-leg station.
+        measured = point + projection * leg + np.dot(observed - anchor, normal) * normal
+        source = "committed_incoming" if approaching else "committed_outgoing"
+        context = ContextResult(found=True, usable_lookahead=LEG_SUPPORT,
+                                seed_x_px=float(pixels[nearest, 0]), seed_y_px=float(pixels[nearest, 1]),
+                                reason="fresh committed straight leg and connected corner revalidated")
+        return BoundaryObservation(tuple(measured), tuple(leg), float(confidence), context,
+                                   (self.vertex.vertex_id, self.vertex.state), source), ""
+
+    def _committed_plan(self, camera: np.ndarray, frame_camera: np.ndarray,
+                        belief: BeliefState, path_mask: np.ndarray) -> PlannerResult:
+        """Consume one bounded segment of a fixed vertex/exit target.
+
+        Revalidate the untraversed approach and outgoing support on this frame's
+        gated boundary. Executed position, not detector drift or planned motion,
+        retires incoming support. The frozen corner transition is always checked.
+        """
+        reason = self._validate_committed_boundary(camera, frame_camera, path_mask)
+        if reason:
+            return self._refusal(camera, belief, reason, ())
+        vertex = self.vertex.vertex
+        point = np.asarray(vertex.point)
+        incoming = np.asarray(vertex.incoming)
+        outgoing = np.asarray(vertex.outgoing)
+        exit_point = point + outgoing * EXIT_DISTANCE
+        approaching = self.vertex.state == "APPROACH"
         target = point if approaching else exit_point
         direction = incoming if approaching else outgoing
         delta = target - camera
@@ -751,7 +807,7 @@ class ConnectedPathPlanner:
         ], dtype=float)
         zero = (float(camera_x), float(camera_y))
         if not belief.measurement_valid:
-            return self._refusal(camera, belief, "no valid profile measurement", ())
+            return self._refusal(camera, belief, belief.reason if self.vertex.active else "no valid profile measurement", ())
         if belief.measured_confidence < self.min_confidence:
             return self._refusal(camera, belief, f"measurement confidence {belief.measured_confidence:.1f}% below minimum", ())
 

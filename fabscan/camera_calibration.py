@@ -1019,7 +1019,7 @@ class CameraCalibrationDialog(tk.Toplevel):
             "forward_step", "cross_track_correction", "recommended_velocity",
             "controller_mode", "controller_forward_x", "controller_forward_y", "controller_forward_len",
             "controller_correct_len", "controller_correction_state",
-            "measurement_x", "measurement_y", "belief_confidence",
+            "measurement_x", "measurement_y", "belief_confidence", "belief_measurement_source", "belief_history_reset",
             "hard_max_move", "min_planner_confidence", "min_lookahead", "start_direction",
         ) + VERTEX_FIELDS
 

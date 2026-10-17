@@ -4,6 +4,7 @@ Run: python -m unittest discover -s tests -v
 Synthetic frames exercise the real connected-boundary extractor and planner.
 No LinuxCNC connection or machine commands are used.
 """
+from contextlib import nullcontext
 from dataclasses import replace
 import csv
 import io
@@ -14,9 +15,9 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from fabscan.path_belief import BeliefState, ContextResult
+from fabscan.path_belief import BeliefState, ContextResult, PathBeliefEstimator
 from fabscan.real_belief_follow import _controller_move_from_plan, _log_vertex_events
-from fabscan.real_belief_follow import _m6_step_impl, RealBeliefSession
+from fabscan.real_belief_follow import _m6_step_impl, RealBeliefSession, _build_belief, _record_executed_belief_pose
 from fabscan.sharp_vertex import SharpVertex, VertexCommitment, find_sharp_vertex, EXIT_DISTANCE
 from fabscan.virtual_planner import ConnectedPathPlanner, INTEGRATION_VERSION
 
@@ -413,6 +414,110 @@ class PlannerTests(unittest.TestCase):
 
 
 
+def measured_line(planner, frame_camera, point, tangent, confidence=66.318, found=True):
+    pixel_error = -planner.machine_to_pixel @ (np.asarray(point)-frame_camera)
+    pixel_tangent = -planner.machine_to_pixel @ np.asarray(tangent)
+    return SimpleNamespace(found=found, confidence=confidence, pixel_error_x=pixel_error[0],
+                           pixel_error_y=pixel_error[1],
+                           angle_degrees=np.degrees(np.arctan2(pixel_tangent[1], pixel_tangent[0])))
+
+
+class EstimatorHandoffTests(unittest.TestCase):
+    def build(self, session, camera, frame_camera, frame, line, step):
+        return _build_belief(None, session, step_id=step, step_label='estimator integration',
+                            line=line, transformed_frame=frame, current_x=camera[0], current_y=camera[1],
+                            frame_x=frame_camera[0], frame_y=frame_camera[1])
+
+    def test_real_estimator_through_corner_and_return_to_ordinary_follow(self):
+        for sign, degrees, delay in ((1,0,0), (-1,27,.01), (1,90,.01)):
+            with self.subTest(sign=sign, degrees=degrees, delay=delay):
+                a=np.deg2rad(degrees)
+                rot=np.array([[np.cos(a),-np.sin(a)],[np.sin(a),np.cos(a)]])
+                incoming=np.array([1.,0.]) @ rot.T
+                outgoing=np.array([0.,sign]) @ rot.T
+                polygon=np.array([[-1,0],[0,0],[0,sign],[-1,sign]]) @ rot.T
+                camera=np.array([-.20,0.]) @ rot.T
+                p=ConnectedPathPlanner(CALIBRATION, SETTINGS);p.travel_unit=incoming
+                p.record_executed_pose(*camera)
+                estimator=PathBeliefEstimator(CALIBRATION, SETTINGS)
+                session=RealBeliefSession(estimator,p,CALIBRATION,SETTINGS)
+                saw_outgoing=False;resumed=False
+                for step in range(1,30):
+                    phase=p.vertex.state
+                    travel=incoming if not saw_outgoing else outgoing
+                    frame_camera=camera-delay*travel
+                    frame=render(frame_camera,polygon)
+                    # While locked, the generic detector continues reporting an
+                    # incoming-biased position/heading, as in the physical run.
+                    if p.vertex.active:
+                        point=frame_camera+.055*np.array([-incoming[1],incoming[0]])
+                        tangent=incoming
+                    else:
+                        point=frame_camera
+                        tangent=outgoing if resumed else incoming
+                    line=measured_line(p,frame_camera,point,tangent)
+                    b=self.build(session,camera,frame_camera,frame,line,step)
+                    plan=p.plan(frame,camera_x=camera[0],camera_y=camera[1],
+                                frame_camera_x=frame_camera[0],frame_camera_y=frame_camera[1],belief=b)
+                    self.assertTrue(plan.accepted,plan.decision_reason)
+                    self.assertGreaterEqual(plan.planner_confidence,45)
+                    if phase=='OUTGOING':
+                        self.assertEqual(b.measurement_source,'committed_outgoing')
+                        np.testing.assert_allclose([b.tangent_x,b.tangent_y],outgoing,atol=.003)
+                        self.assertAlmostEqual(b.curvature,0,delta=.001)
+                        if not saw_outgoing:
+                            self.assertTrue(b.history_reset)
+                            self.assertEqual(len(estimator._measurements),1)
+                            self.assertTrue(all(k==0 for _,k in estimator._filtered_curvature_history))
+                        saw_outgoing=True
+                    if resumed:
+                        self.assertEqual(b.measurement_source,'detector')
+                        self.assertFalse(b.history_reset)
+                        self.assertTrue(saw_outgoing)
+                        break
+                    after=np.array([plan.approved_x,plan.approved_y])
+                    session.last_move_x,session.last_move_y=after-camera
+                    camera=after
+                    _record_executed_belief_pose(session,*camera)
+                    resumed=saw_outgoing and p.vertex.state=='FOLLOW'
+                else:
+                    self.fail('estimator/planner did not return to ordinary follow')
+                self.assertGreater(len(estimator.states),len(estimator._measurements))
+
+    def test_committed_measurement_uses_observed_boundary_and_frame_pose(self):
+        p,camera,polygon=PlannerTests().committed_setup()
+        camera=np.array([-.027,0.]);p.record_executed_pose(*camera)
+        frame_camera=camera-[.01,0]
+        session=RealBeliefSession(PathBeliefEstimator(CALIBRATION,SETTINGS),p,CALIBRATION,SETTINGS)
+        # A 2-pixel actual edge offset must be measured, not silently projected
+        # onto the memorized leg. The delayed frame station must also be used.
+        frame=render(frame_camera,polygon+[0,.0025])
+        line=measured_line(p,frame_camera,frame_camera+[0,.06],[1,0])
+        b=self.build(session,camera,frame_camera,frame,line,3)
+        self.assertTrue(b.measurement_valid,b.reason)
+        self.assertAlmostEqual(b.measurement_y,.0025,delta=.001)
+        self.assertAlmostEqual(b.measurement_x,frame_camera[0],delta=.001)
+        self.assertEqual(b.measurement_source,'committed_incoming')
+
+    def test_bad_evidence_cannot_fall_back_to_memory_or_blended_detector(self):
+        for failure in ('empty','shifted','no_detection','low_confidence'):
+            with self.subTest(failure=failure):
+                p,camera,polygon=PlannerTests().committed_setup()
+                session=RealBeliefSession(PathBeliefEstimator(CALIBRATION,SETTINGS),p,CALIBRATION,SETTINGS)
+                frame=render(camera,polygon)
+                if failure=='empty':frame[:]=255
+                if failure=='shifted':frame=render(camera,polygon+[0,.03])
+                line=measured_line(p,camera,camera,[1,0],confidence=20 if failure=='low_confidence' else 85,
+                                   found=failure!='no_detection')
+                b=self.build(session,camera,camera,frame,line,3)
+                self.assertFalse(b.measurement_valid)
+                self.assertEqual(b.belief_confidence,0)
+                self.assertEqual(len(session.estimator._measurements),0)
+                plan=p.plan(frame,camera_x=camera[0],camera_y=camera[1],belief=b)
+                self.assertFalse(plan.accepted)
+                self.assertEqual(p.vertex.state,'APPROACH')
+
+
 class RuntimeIntegrationTests(unittest.TestCase):
     def test_physical_step_loop_logs_confirmed_arrival_only_after_success(self):
         from fabscan.camera_calibration import CameraCalibrationDialog
@@ -424,14 +529,14 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         def ignore(*args, **kwargs): pass
 
-        for fail_execution in (False, True):
-            with self.subTest(fail_execution=fail_execution):
+        for fail_execution, real_estimator in ((False,False),(True,False),(False,True),(True,True)):
+            with self.subTest(fail_execution=fail_execution, real_estimator=real_estimator):
                 camera = np.asarray([-.20, 0])
                 polygon = np.asarray([[-1,0],[0,0],[0,1],[-1,1]])
                 planner = ConnectedPathPlanner(CALIBRATION, SETTINGS)
                 planner.travel_unit = np.asarray([1.,0.])
                 planner.record_executed_pose(*camera)
-                session = RealBeliefSession(SimpleNamespace(states=[]), planner, CALIBRATION, SETTINGS)
+                session = RealBeliefSession(PathBeliefEstimator(CALIBRATION, SETTINGS), planner, CALIBRATION, SETTINGS)
                 logs = []
                 dialog = SimpleNamespace(
                     _timeline_step_counter=0, _active_follow_run_step=0, _follow_stop_requested=False,
@@ -443,7 +548,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     linuxcnc_reader=SimpleNamespace(read_status=lambda: SimpleNamespace(connected=True)),
                     _record_position_history=ignore, _status_ok_for_calibration=lambda status: True,
                     _active_position=lambda status: (*camera, 0),
-                    _detect_line_for_follow_with_retries=lambda **kw: (SimpleNamespace(found=True, confidence=85), 0),
+                    _detect_line_for_follow_with_retries=lambda **kw: (
+                        measured_line(planner,camera,camera+[0,.06] if planner.vertex.active else camera,
+                                      [1,0] if planner.vertex.last_vertex is None else [0,1]),0),
                     get_transformed_frame_bgr=lambda frame: frame,
                     _stabilize_follow_line=lambda line, **kw: line,
                     _get_follow_min_confidence=lambda: 45,
@@ -462,7 +569,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     camera[:] = [kw['target_x'], kw['target_y']]
                     return True, {'executor_mode':'mock_xy_executor'}
 
-                with patch('fabscan.real_belief_follow._build_belief', side_effect=lambda *a, **kw: belief(camera, kw['step_id'])), \
+                belief_context = nullcontext() if real_estimator else patch(
+                    'fabscan.real_belief_follow._build_belief', side_effect=lambda *a, **kw: belief(camera, kw['step_id']))
+                with belief_context, \
                      patch('fabscan.real_belief_follow._frame_pose', side_effect=lambda *a: (*camera, {})), \
                      patch('fabscan.real_belief_follow._execute_coordinated_xy_step', side_effect=execute):
                     for step in range(25):
@@ -476,10 +585,22 @@ class RuntimeIntegrationTests(unittest.TestCase):
                             self.assertIn('COMMITTED', events)
                             self.assertIn('HOLD', events)
                             self.assertNotIn('VERTEX_REACHED', events)
+                            self.assertNotEqual(session.estimator._leg_id, (planner.vertex.vertex_id,'OUTGOING'))
                             break
                         if 'RESUMED' in events:
                             self.assertFalse(fail_execution)
                             self.assertEqual(events, ['CANDIDATE','COMMITTED','VERTEX_REACHED','OUTGOING_LATCHED','RESUMED'])
+                            if real_estimator:
+                                outgoing = [r for r in logs if r['event']=='M6_BELIEF'
+                                            and r.get('belief_measurement_source')=='committed_outgoing']
+                                self.assertTrue(outgoing)
+                                self.assertTrue(outgoing[0]['belief_history_reset'])
+                                self.assertGreaterEqual(float(outgoing[-1]['belief_confidence']),45)
+                                dialog.current_frame_bgr=render(camera,polygon)
+                                dialog.current_frame_sequence+=1
+                                dialog.current_frame_timestamp+=1
+                                self.assertTrue(_m6_step_impl(dialog,session=session,step_label='ordinary return',show_dialogs=False),
+                                                dialog.cal_status_var.get())
                             break
                     else:
                         self.fail('runtime did not finish expected transition')
